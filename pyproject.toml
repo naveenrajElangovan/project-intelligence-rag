@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-intelligence-rag"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "azure-identity==1.25.3",
+  "fastapi==0.141.1",
+  "langchain-core==1.5.5",
+  "langchain-ollama==1.1.0",
+  "langchain-openai==1.5.1",
+  "langgraph==1.2.11",
+  "chromadb==1.5.2",
+  "prometheus-client==0.26.0",
+  "pydantic-settings==2.15.0",
+  "sentence-transformers==5.7.0",
+  "uvicorn[standard]==0.52.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.4,<9"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

@@ -1,0 +1,25 @@
+# A data-only image carrying the two local models, so no developer and no server
+# ever downloads them from Hugging Face again. Built once per model revision,
+# pulled from the registry like any other image, and copied into a shared volume
+# by an init container.
+#
+#   docker build -f Dockerfile.models -t $REG/project-intelligence-models:e5-1.0 .
+#
+# The tag tracks the model revisions, not the application version: rebuild only
+# when PI_RAG_LOCAL_RERANK_REVISION or the embedder revision changes.
+FROM python:3.12-slim-bookworm AS fetch
+
+# huggingface-hub is the only dependency the two download scripts import. The
+# floor matches what sentence-transformers 5.7.0 requires (>=0.23.0); the build
+# resolves the current release, and the model revisions are pinned inside the
+# scripts, so the weights are reproducible even though the client is not.
+RUN pip install --no-cache-dir "huggingface-hub>=0.23.0"
+COPY scripts/download_local_reranker.py scripts/download_local_embedder.py /scripts/
+RUN python /scripts/download_local_reranker.py /models/huggingface/bge-reranker-v2-m3 \
+ && python /scripts/download_local_embedder.py /models/huggingface/multilingual-e5-large
+
+# busybox rather than the python base: it carries the `cp` the init container
+# needs and nothing else, so the shipped image is the weights plus about 4 MB.
+FROM busybox:1.37-uclibc
+COPY --from=fetch /models /models
+CMD ["sh", "-c", "cp -a /models/. /target/ && chown -R 10001:10001 /target && echo seeded"]
