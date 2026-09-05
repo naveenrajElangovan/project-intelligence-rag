@@ -28,3 +28,4 @@ _to_delete/
 
 # Local scratch, never committed
 _to_delete/
+.pi-stage.tar.gz

@@ -637,9 +637,10 @@ class ProjectOverviewReranker(FakeReranker):
         self.queries: list[str] = []
         self.thresholds: list[float | None] = []
 
-    async def rerank(self, query, documents, *, score_threshold=None):
+    async def rerank(self, query, documents, *, score_threshold=None, **options):
         self.queries.append(query)
         self.thresholds.append(score_threshold)
+        self.options = options
         return await super().rerank(query, documents)
 
 

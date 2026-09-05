@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import hashlib
 import math
 from pathlib import Path
 import re
@@ -19,9 +21,61 @@ from app.table_evidence import linearize_tables
 # Chosen so a full 50-candidate rerank is two MPS round trips rather than seven.
 _DEFAULT_BATCH_SIZE = 32
 
+# Cross-encoder scores are deterministic for a (model, length, query, evidence)
+# tuple, and the same tuple recurs constantly: a second retrieval attempt scores
+# the candidates the first one already scored, a repair re-ranks the same
+# evidence, and the project-overview route fuses several queries over one
+# candidate pool. Keyed by content digest, so a chunk whose text changed is a
+# different entry rather than a stale one.
+_SCORE_CACHE: OrderedDict[tuple[str, int, str, str], float] = OrderedDict()
+_SCORE_CACHE_LOCK = threading.Lock()
+_SCORE_CACHE_ENTRIES = 8192
+
 _LOCAL_MODELS: dict[tuple[str, str], Any] = {}
 _LOCAL_MODELS_LOCK = threading.Lock()
 _LOCAL_INFERENCE_LOCK = threading.Lock()
+
+
+def _digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def cached_scores(
+    model_ref: str,
+    max_length: int,
+    pairs: list[tuple[str, str]],
+    compute: Any,
+) -> list[float]:
+    """Score pairs, computing only the ones not already known.
+
+    `compute` receives the uncached pairs in order and returns their scores.
+    """
+
+    keys = [
+        (model_ref, max_length, _digest(query), _digest(evidence))
+        for query, evidence in pairs
+    ]
+    scores: list[float | None] = [None] * len(pairs)
+    pending: list[int] = []
+    with _SCORE_CACHE_LOCK:
+        for index, key in enumerate(keys):
+            if key in _SCORE_CACHE:
+                _SCORE_CACHE.move_to_end(key)
+                scores[index] = _SCORE_CACHE[key]
+            else:
+                pending.append(index)
+    if pending:
+        computed = compute([pairs[index] for index in pending])
+        if len(computed) != len(pending):
+            raise RuntimeError("The scorer returned the wrong number of scores.")
+        with _SCORE_CACHE_LOCK:
+            for index, value in zip(pending, computed, strict=True):
+                scores[index] = float(value)
+                _SCORE_CACHE[keys[index]] = float(value)
+                _SCORE_CACHE.move_to_end(keys[index])
+            while len(_SCORE_CACHE) > _SCORE_CACHE_ENTRIES:
+                _SCORE_CACHE.popitem(last=False)
+    return [value for value in scores if value is not None]
 
 
 def progressive_rerank_candidates(
@@ -105,6 +159,7 @@ class LocalMultilingualReranker:
         exact_code_score_threshold: float,
         exact_code_retrieval_score_floor: float,
         max_chunks_per_source: int,
+        cross_language_score_threshold: float | None = None,
         batch_size: int = _DEFAULT_BATCH_SIZE,
         max_length: int = 1024,
         linearize_table_evidence: bool = True,
@@ -119,10 +174,13 @@ class LocalMultilingualReranker:
         self._threshold = score_threshold
         self._exact_code_threshold = exact_code_score_threshold
         self._exact_code_retrieval_floor = exact_code_retrieval_score_floor
+        self._cross_language_threshold = cross_language_score_threshold
         self._max_chunks_per_source = max_chunks_per_source
         self.last_retry_count = 0
         self.last_capped_by_source_limit = 0
         self.last_source_cap_bypassed = False
+        self.last_threshold_bypassed = False
+        self.last_cross_language_documents = 0
 
     async def rerank(
         self,
@@ -132,6 +190,8 @@ class LocalMultilingualReranker:
         score_threshold: float | None = None,
         top_n: int | None = None,
         max_chunks_per_source: int | None = None,
+        query_language: str = "",
+        allow_threshold_bypass: bool = False,
     ) -> list[Document]:
         if not documents:
             return []
@@ -144,8 +204,11 @@ class LocalMultilingualReranker:
         )
         self.last_capped_by_source_limit = 0
         self.last_source_cap_bypassed = False
+        self.last_threshold_bypassed = False
+        self.last_cross_language_documents = 0
         scores = await asyncio.to_thread(self._predict, query, documents)
         scored: list[tuple[float, Document, str]] = []
+        all_scored: list[tuple[float, Document, str]] = []
         for document, raw_score in zip(documents, scores, strict=True):
             score = normalized_relevance_score(float(raw_score))
             exact_code_match = (
@@ -153,14 +216,36 @@ class LocalMultilingualReranker:
                 and float(document.metadata.get("score") or 0) >= self._exact_code_retrieval_floor
                 and _exact_code_anchor_match(query, document)
             )
-            if score < threshold and not exact_code_match:
-                continue
             source_id = str(
                 document.metadata.get("source_id")
                 or document.metadata.get("reference")
                 or document.metadata.get("chunk_id")
             )
+            all_scored.append((score, document, source_id))
+            applied = threshold
+            if _is_cross_language(query_language, document):
+                # A cross-encoder scores a query against evidence in another
+                # language systematically lower than a same-language pair, so one
+                # absolute floor admits far less evidence for a Spanish question
+                # than for the identical English one. Grounding already carries a
+                # cross-language allowance for the same reason.
+                self.last_cross_language_documents += 1
+                if self._cross_language_threshold is not None:
+                    applied = min(threshold, self._cross_language_threshold)
+            if score < applied and not exact_code_match:
+                continue
             scored.append((score, document, source_id))
+        if allow_threshold_bypass and not scored and all_scored:
+            # Opt-in, and only for routes whose question is broad by nature. A
+            # cross-encoder scores a maximally generic query ("what is this
+            # project about") low against every passage, so an absolute floor
+            # emptied a pool that did contain the overview pages -- 43
+            # candidates in, zero out. Everywhere else an empty result is a
+            # deliberate refusal and must stay one.
+            self.last_threshold_bypassed = True
+            scored = sorted(all_scored, key=lambda item: item[0], reverse=True)[
+                :result_limit
+            ]
 
         ranked: list[Document] = []
         source_counts: dict[str, int] = {}
@@ -191,13 +276,18 @@ class LocalMultilingualReranker:
             )
             for document in documents
         ]
-        return predict_local_scores(
+        return cached_scores(
             self._model_ref,
-            device=self._device,
-            revision=self._revision,
-            pairs=pairs,
-            batch_size=self._batch_size,
-            max_length=self._max_length,
+            self._max_length,
+            pairs,
+            lambda uncached: predict_local_scores(
+                self._model_ref,
+                device=self._device,
+                revision=self._revision,
+                pairs=uncached,
+                batch_size=self._batch_size,
+                max_length=self._max_length,
+            ),
         )
 
 
@@ -230,17 +320,37 @@ class RemoteMultilingualReranker(LocalMultilingualReranker):
             )
             for document in documents
         ]
-        scores = accelerator_scores(
-            self._base_url,
+        scores = cached_scores(
+            self._model_ref,
+            self._max_length,
             pairs,
-            api_key=self._api_key,
-            timeout_seconds=self._timeout_seconds,
-            max_length=self._max_length,
-            attempts=self._attempts,
+            lambda uncached: accelerator_scores(
+                self._base_url,
+                uncached,
+                api_key=self._api_key,
+                timeout_seconds=self._timeout_seconds,
+                max_length=self._max_length,
+                attempts=self._attempts,
+            ),
         )
         if len(scores) != len(documents):
             raise RuntimeError("Local accelerator returned invalid reranker scores.")
         return scores
+
+
+_LANGUAGES = {"en", "es"}
+
+
+def _is_cross_language(query_language: str, document: Document) -> bool:
+    """True only when both sides name a language and they differ."""
+
+    question = str(query_language or "").casefold()
+    evidence = str(document.metadata.get("language") or "").casefold()
+    return (
+        question in _LANGUAGES
+        and evidence in _LANGUAGES
+        and question != evidence
+    )
 
 
 def build_reranker(settings: Settings):
@@ -268,6 +378,7 @@ def build_reranker(settings: Settings):
         score_threshold=settings.rerank_score_threshold,
         exact_code_score_threshold=settings.exact_code_rerank_score_threshold,
         exact_code_retrieval_score_floor=settings.exact_code_retrieval_score_floor,
+        cross_language_score_threshold=settings.rerank_cross_language_score_threshold,
         max_chunks_per_source=settings.max_chunks_per_source,
         batch_size=settings.local_rerank_batch_size,
         max_length=settings.local_rerank_max_length,

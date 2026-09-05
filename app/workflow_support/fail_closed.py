@@ -25,7 +25,18 @@ def clarification_response(
     request: RagRequest, known_entities: tuple[str, ...]
 ) -> RagResponse | None:
     normalized = " ".join(re.findall(r"[a-z0-9]+", request.question.casefold()))
-    overloaded_record = bool(re.search(r"\b(?:tickets?|boletos?)\b", normalized))
+    # Underscores are word separators to the tokenizer above, so an underscored
+    # identifier arrives here as separate words and trips the overloaded-record
+    # guard on whichever of them happens to be an overloaded noun. The identifier
+    # is precisely what makes the question unambiguous, so a question that names
+    # one is never a candidate for clarification -- neither for the overloaded
+    # record below nor for the unresolved reference after it.
+    explicit_identifier = bool(
+        re.search(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", request.question)
+    )
+    overloaded_record = bool(
+        re.search(r"\b(?:tickets?|boletos?)\b", normalized)
+    ) and not explicit_identifier
     delivery_context = bool(
         re.search(
             r"\b(?:jira|issue|bug|sprint|release|priority|status|assignee|backlog|"
@@ -70,6 +81,7 @@ def clarification_response(
     )
     if (
         not needed
+        or explicit_identifier
         or named_entity
         or request.conversation_context.active_subject.strip()
         or request.conversation_history

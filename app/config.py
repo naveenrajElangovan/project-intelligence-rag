@@ -158,6 +158,11 @@ class Settings(BaseSettings):
     # Phase-2 calibration on the two event questions measured relevant pairs at
     # 0.540-0.912 and related-but-wrong pairs at 0.008-0.030.
     rerank_score_threshold: float = 0.10
+    # Cross-encoder scores fall systematically when the question and the evidence
+    # are in different languages, so one absolute floor admits far less evidence
+    # for a Spanish question than for the identical English one. Grounding
+    # already carries the same allowance for the same reason.
+    rerank_cross_language_score_threshold: float = 0.05
     entity_overview_rerank_score_threshold: float = 0.05
     exact_code_rerank_score_threshold: float = 0.65
     exact_code_retrieval_score_floor: float = 0.80
@@ -428,6 +433,11 @@ class Settings(BaseSettings):
         if not 0 <= self.exact_code_rerank_score_threshold <= 1:
             raise ValueError(
                 "PI_RAG_EXACT_CODE_RERANK_SCORE_THRESHOLD must be between 0 and 1"
+            )
+        if not 0 <= self.rerank_cross_language_score_threshold <= self.rerank_score_threshold:
+            raise ValueError(
+                "PI_RAG_RERANK_CROSS_LANGUAGE_SCORE_THRESHOLD must be between 0 "
+                "and the normal rerank threshold"
             )
         if not 0 <= self.entity_overview_rerank_score_threshold <= self.rerank_score_threshold:
             raise ValueError(

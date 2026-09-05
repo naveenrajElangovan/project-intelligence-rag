@@ -166,7 +166,12 @@ def _include_repair_evidence(
     selected = list(ranked)
     selected_ids = {str(document.metadata.get("chunk_id") or id(document)) for document in selected}
     for requirement in requirements:
-        term = requirement.split(":", 1)[1]
+        # Requirements are "kind:term" by convention, but not every producer
+        # follows it, and an unprefixed one crashed the rerank node and failed
+        # the whole request with an IndexError. A requirement with no kind is
+        # its own term.
+        _kind, _, term = requirement.partition(":")
+        term = term or requirement
         match = next(
             (
                 document

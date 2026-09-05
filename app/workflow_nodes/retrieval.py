@@ -818,6 +818,7 @@ class RetrievalNodesMixin:
                 score_threshold=0.0,
                 top_n=len(candidates),
                 max_chunks_per_source=self._settings.feature_inventory_top_n,
+                query_language=state.get("language", ""),
             )
             if inventory_question:
                 # Generic inventories do not have an entity key. The entity-aware
@@ -871,13 +872,19 @@ class RetrievalNodesMixin:
                 candidates,
                 intent_source_limit,
                 rerank_queries=rerank_queries,
+                language=state.get("language", ""),
             )
         elif state.get("query_intent") == "STRUCTURED_INVENTORY":
             documents = await self._rerank_code_assisted(
-                rerank_query, candidates, intent_source_limit
+                rerank_query,
+                candidates,
+                intent_source_limit,
+                language=state.get("language", ""),
             )
         elif state.get("query_intent") == "CROSS_SOURCE":
-            documents = await self._rerank_cross_source(rerank_query, candidates)
+            documents = await self._rerank_cross_source(
+                rerank_query, candidates, state.get("language", "")
+            )
         elif state.get("query_intent") == "ENTITY_OVERVIEW":
             try:
                 documents = await self._reranker.rerank(
@@ -996,6 +1003,21 @@ class RetrievalNodesMixin:
                     *primary[: max(1, result_top_n - len(supporting))],
                     *supporting,
                 ]
+        if not documents and candidates:
+            # The rerank threshold is a cost and quality prefilter, not the truth
+            # gate -- grounding is. When it empties the pool the request fails
+            # with INSUFFICIENT_EVIDENCE while the evidence sits in `candidates`
+            # unseen, which is what happened to two questions whose answers were
+            # in the corpus. Score once more without the floor and let grounding
+            # decide; a question with genuinely no support still refuses there,
+            # one stage later and for the right reason.
+            documents = await self._reranker.rerank(
+                rerank_query,
+                candidates,
+                top_n=result_top_n,
+                query_language=state.get("language", ""),
+                allow_threshold_bypass=True,
+            )
         documents = _merge_ranked_documents(
             documents,
             state.get("prior_documents", []),
@@ -1218,7 +1240,7 @@ class RetrievalNodesMixin:
         return result
 
     async def _rerank_cross_source(
-        self, query: str, candidates: list[Document]
+        self, query: str, candidates: list[Document], language: str = ""
         ) -> list[Document]:
         """Rank documentation and code independently before a bounded merge."""
 
@@ -1242,7 +1264,9 @@ class RetrievalNodesMixin:
                 if not other
                 else min(self._settings.code_assisted_page_top_n, len(scoped))
             )
-            ranked = await self._reranker.rerank(query, scoped, top_n=window)
+            ranked = await self._reranker.rerank(
+                query, scoped, top_n=window, query_language=language
+            )
             groups.append(ranked)
         merged: list[Document] = []
         for rank in range(max((len(group) for group in groups), default=0)):
@@ -1258,6 +1282,7 @@ class RetrievalNodesMixin:
         source_limit: int,
         *,
         rerank_queries: tuple[str, ...] = (),
+        language: str = "",
         ) -> list[Document]:
         """Rank documentation and code together on relevance, with no reserved slots.
 
@@ -1286,6 +1311,7 @@ class RetrievalNodesMixin:
                         scoped,
                         top_n=self._settings.mixed_source_top_n,
                         max_chunks_per_source=source_limit,
+                        query_language=language,
                     )
                     for rerank_query in (rerank_queries or (query,))
                 ]
@@ -1326,11 +1352,22 @@ class RetrievalNodesMixin:
         """Fuse focused reranks so one broad wording cannot suppress all evidence."""
 
         fused: dict[str, Document] = {}
-        for query in state.get("project_rerank_queries", state.get("queries", ())):
+        # Bounded like every other route. This fused one rerank pass per corpus
+        # entity over the whole candidate pool, so a 14-entity vocabulary meant
+        # ~15 passes and 53 seconds of cross-encoder time for a single question.
+        # The retrieval side of this same route already slices its query list to
+        # max_query_variants; the rerank side not doing so was an oversight, not
+        # a design choice.
+        overview_queries = tuple(
+            state.get("project_rerank_queries", state.get("queries", ()))
+        )[: self._settings.max_query_variants]
+        for query in overview_queries:
             ranked = await self._reranker.rerank(
                 query,
                 candidates,
                 score_threshold=self._settings.entity_overview_rerank_score_threshold,
+                query_language=state.get("language", ""),
+                allow_threshold_bypass=True,
             )
             for rank, document in enumerate(ranked, start=1):
                 identity = str(document.metadata.get("chunk_id") or _source_identity(document))

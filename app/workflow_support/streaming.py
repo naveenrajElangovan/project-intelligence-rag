@@ -33,6 +33,13 @@ async def graph_update_events(
     """Reduce private graph patches and expose only safe progress or answer events."""
 
     recursion_limit = 12 + workflow._settings.max_retrieval_attempts * 8
+    # A stream writer exists for the duration of this call, and only for it. The
+    # generator reads this to decide whether to emit prose and verify each
+    # sentence as it completes. Left unset -- as it was -- the streaming endpoint
+    # ran the buffered generator, and the caller saw nothing until generation and
+    # grounding had both finished. It belongs here rather than in the workflow
+    # because this function is what establishes the writer it announces.
+    workflow._incremental_stream_active = True
     began = started()
     try:
         async for update in workflow._graph.astream(
