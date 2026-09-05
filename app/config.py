@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     max_request_body_bytes: int = 262_144
     rate_limit_per_minute: int = 120
     internal_api_key: str = ""
+    openinference_enabled: bool = False
+    openinference_otlp_endpoint: str = "http://127.0.0.1:4318/v1/traces"
     chroma_host: str = "chroma"
     chroma_port: int = 8000
     chroma_collection: str = "project-intelligence"
@@ -42,6 +44,16 @@ class Settings(BaseSettings):
     ollama_keep_alive: str = "5m"
     ollama_reasoning_enabled: bool = False
     local_inference_enabled: bool = True
+    # Docker Desktop cannot expose Apple's Metal backend to Linux containers.
+    # When set, embedding and cross-encoder scoring are delegated to the
+    # authenticated macOS worker while orchestration remains containerized.
+    local_accelerator_url: str = ""
+    local_accelerator_timeout_seconds: float = 120.0
+    # Connection-level retries only. A refused or dropped connection means the
+    # worker never started, so replaying it is free. A timeout means it is
+    # probably still computing, and replaying that is what turned one slow
+    # request into a CPU pile-up in the first place.
+    local_accelerator_retry_attempts: int = 2
     warm_local_models_on_startup: bool = True
     local_max_concurrency: int = 1
     max_inflight_requests: int = 4
@@ -64,14 +76,35 @@ class Settings(BaseSettings):
     max_retrieval_attempts: int = 2
     dependency_retry_attempts: int = 3
     dependency_timeout_seconds: float = 20.0
+    # Query embedding is deliberately outside the Chroma retry loop: local
+    # transformer work runs in a worker thread that a cancelled await cannot
+    # stop, so retrying it multiplied CPU load instead of replacing it. It still
+    # needs a bound of its own. Applied as the accelerator socket timeout rather
+    # than an asyncio.wait_for, so a lapsed attempt actually ends instead of
+    # leaving an orphan behind -- which is the mistake this whole change undoes.
+    query_embedding_timeout_seconds: float = 30.0
     lexical_fallback_enabled: bool = True
     lexical_fallback_max_records: int = 5000
     lexical_fallback_cache_ttl_seconds: int = 300
     warm_lexical_corpus_on_startup: bool = True
+    # Bound each background attempt to warm the authorized lexical corpora and
+    # retry after a downstream outage. Startup never awaits Chroma: /health is
+    # live immediately, while /ready reflects whether the cache has recovered.
+    lexical_corpus_warm_timeout_seconds: float = 20.0
+    lexical_corpus_warm_retry_seconds: float = 10.0
     vocabulary_cache_ttl_seconds: int = 300
     llm_retry_attempts: int = 2
     llm_timeout_seconds: float = 45.0
     llm_stream_idle_timeout_seconds: float = 20.0
+    # An idle timeout cannot see prefill: nothing arrives while the model reads a
+    # long prompt, so a healthy request with a large evidence block looks exactly
+    # like a dead stream. The first chunk therefore gets its own, larger
+    # allowance; every later chunk gets the idle timeout. Size this above the
+    # observed p99 of the `time_to_first_chunk_seconds` field on the generate
+    # stage before lowering it.
+    # Ten six-document, ~3k-input-token live runs measured a 1.874 s p99/max on
+    # 2026-09-04; 30 s keeps roughly 16x headroom and exceeds the 20 s idle bound.
+    llm_stream_first_chunk_timeout_seconds: float = 30.0
     llm_stream_total_timeout_seconds: float = 180.0
     request_timeout_seconds: float = 240.0
     rank_fusion_k: int = 60
@@ -95,6 +128,7 @@ class Settings(BaseSettings):
     local_rerank_device: str = "mps"
     # A 50-candidate pool at batch 8 is seven sequential MPS round trips.
     local_rerank_batch_size: int = 32
+    local_rerank_max_length: int = 1024
     local_models_path: str = ""
     # Raised off 2. Two chunks was a consequence of the 12k context ceiling, not a
     # retrieval finding. Re-measure with evaluation/run_live_acceptance.py after any
@@ -103,6 +137,10 @@ class Settings(BaseSettings):
     # hard-code sentence ranges, which made "answer more fully" unreachable
     # without editing prompts. brief | standard | detailed.
     answer_detail: str = "standard"
+    # Every repair is another full evidence prefill on the single model slot, and
+    # each is retried. Left uncapped, the shaping repairs can chain and exceed
+    # the whole request budget on their own.
+    max_answer_repairs: int = 1
     rerank_top_n: int = 8
     cross_encoder_candidate_limit: int = 16
     # Evidence width for CROSS_SOURCE and CODE_ASSISTED, the default route for
@@ -158,6 +196,24 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @property
+    def first_chunk_timeout_seconds(self) -> float:
+        """The prefill allowance actually applied, clamped to a sane band.
+
+        Clamped rather than validated so that lowering the stream ceilings for a
+        test or a small machine cannot make the configuration unloadable. It is
+        never below the idle timeout (that would be stricter than the bound it
+        replaces) and never above the total ceiling (which already governs).
+        """
+
+        return min(
+            max(
+                self.llm_stream_first_chunk_timeout_seconds,
+                self.llm_stream_idle_timeout_seconds,
+            ),
+            self.llm_stream_total_timeout_seconds,
+        )
 
     @property
     def llm_configured(self) -> bool:
@@ -225,18 +281,37 @@ class Settings(BaseSettings):
                 "PI_RAG_LLM_STREAM_TOTAL_TIMEOUT_SECONDS must exceed "
                 "PI_RAG_LLM_STREAM_IDLE_TIMEOUT_SECONDS"
             )
+        if self.llm_stream_first_chunk_timeout_seconds <= 0:
+            raise ValueError(
+                "PI_RAG_LLM_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS must be greater "
+                "than zero"
+            )
+        if self.query_embedding_timeout_seconds <= 0:
+            raise ValueError(
+                "PI_RAG_QUERY_EMBEDDING_TIMEOUT_SECONDS must be greater than zero"
+            )
+        if not 1 <= self.local_accelerator_retry_attempts <= 3:
+            raise ValueError(
+                "PI_RAG_LOCAL_ACCELERATOR_RETRY_ATTEMPTS must be between 1 and 3"
+            )
+        if not 0 <= self.max_answer_repairs <= 3:
+            raise ValueError("PI_RAG_MAX_ANSWER_REPAIRS must be between 0 and 3")
         if self.request_timeout_seconds <= self.llm_stream_total_timeout_seconds:
             raise ValueError(
                 "PI_RAG_REQUEST_TIMEOUT_SECONDS must exceed "
                 "PI_RAG_LLM_STREAM_TOTAL_TIMEOUT_SECONDS"
             )
+        # One generation call plus every repair it may chain, each retried. The
+        # previous check counted a single call and could not see the repairs.
+        non_streamed_calls = 1 + self.max_answer_repairs
         if (
-            self.llm_timeout_seconds * self.llm_retry_attempts
+            self.llm_timeout_seconds * self.llm_retry_attempts * non_streamed_calls
             >= self.request_timeout_seconds
         ):
             raise ValueError(
                 "PI_RAG_REQUEST_TIMEOUT_SECONDS must exceed the non-streamed LLM "
-                "retry budget"
+                "retry budget for one generation plus PI_RAG_MAX_ANSWER_REPAIRS "
+                "repairs"
             )
         if self.answer_detail not in {"brief", "standard", "detailed"}:
             raise ValueError(
@@ -246,6 +321,14 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_OLLAMA_PRESENCE_PENALTY must be between 0 and 2")
         if not 0.5 <= self.ollama_repeat_penalty <= 2:
             raise ValueError("PI_RAG_OLLAMA_REPEAT_PENALTY must be between 0.5 and 2")
+        if not 1 <= self.lexical_corpus_warm_timeout_seconds <= 300:
+            raise ValueError(
+                "PI_RAG_LEXICAL_CORPUS_WARM_TIMEOUT_SECONDS must be between 1 and 300"
+            )
+        if not 1 <= self.lexical_corpus_warm_retry_seconds <= 300:
+            raise ValueError(
+                "PI_RAG_LEXICAL_CORPUS_WARM_RETRY_SECONDS must be between 1 and 300"
+            )
         if self.prompt_overhead_reserve_tokens < 512:
             raise ValueError("PI_RAG_PROMPT_OVERHEAD_RESERVE_TOKENS must be at least 512")
         fixed_prompt_cost = (
@@ -275,6 +358,10 @@ class Settings(BaseSettings):
             )
         if self.local_max_concurrency < 1 or self.local_max_concurrency > 4:
             raise ValueError("PI_RAG_LOCAL_MAX_CONCURRENCY must be between 1 and 4")
+        if self.local_accelerator_timeout_seconds <= 0:
+            raise ValueError(
+                "PI_RAG_LOCAL_ACCELERATOR_TIMEOUT_SECONDS must be greater than zero"
+            )
         if self.max_inflight_requests < 1 or self.max_inflight_requests > 32:
             raise ValueError("PI_RAG_MAX_INFLIGHT_REQUESTS must be between 1 and 32")
         if self.load_shed_wait_seconds <= 0 or self.load_shed_wait_seconds > 5:
@@ -320,6 +407,10 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_LOCAL_EMBEDDING_BATCH_SIZE must be between 1 and 64")
         if self.local_rerank_batch_size < 1 or self.local_rerank_batch_size > 128:
             raise ValueError("PI_RAG_LOCAL_RERANK_BATCH_SIZE must be between 1 and 128")
+        if self.local_rerank_max_length < 256 or self.local_rerank_max_length > 8192:
+            raise ValueError(
+                "PI_RAG_LOCAL_RERANK_MAX_LENGTH must be between 256 and 8192"
+            )
         if not self.local_embedding_model:
             raise ValueError("PI_RAG_LOCAL_EMBEDDING_MODEL is required for local embedding")
         if not 0 <= self.grounding_score_threshold <= 1:

@@ -6,6 +6,7 @@ import re
 from langchain_core.documents import Document
 
 from app.config import Settings
+from app.accelerator import accelerator_scores
 from app.llm import ClaimRejection, GroundedAnswer, GroundingVerdict, TokenUsage
 from app.reranking import (
     normalized_relevance_score,
@@ -38,8 +39,45 @@ class LocalCitationGroundingVerifier:
         self.last_accepted_scores: list[float] = []
         self.model_name = settings.local_rerank_model
         self._batch_size = settings.local_rerank_batch_size
+        self._max_length = settings.local_rerank_max_length
+        self._accelerator_url = settings.local_accelerator_url
+        self._accelerator_api_key = settings.internal_api_key
+        self._accelerator_timeout_seconds = settings.local_accelerator_timeout_seconds
+        self._accelerator_attempts = settings.local_accelerator_retry_attempts
         self.last_usage = TokenUsage()
         self._pair_score_cache: dict[tuple[str, str], float] = {}
+
+    def _predict_scores(
+        self, pairs: list[tuple[str, str]], batch_size: int
+    ) -> list[float]:
+        if self._accelerator_url:
+            # Batched by the client. A long answer produces more claim/evidence
+            # pairs than one request may carry, and the rejection would fail the
+            # whole verification rather than verify fewer claims.
+            scores = accelerator_scores(
+                self._accelerator_url,
+                pairs,
+                api_key=self._accelerator_api_key,
+                timeout_seconds=self._accelerator_timeout_seconds,
+                max_length=self._max_length,
+                attempts=self._accelerator_attempts,
+            )
+            if len(scores) != len(pairs):
+                raise RuntimeError(
+                    "Local accelerator returned invalid grounding scores."
+                )
+            return scores
+        return [
+            float(value)
+            for value in predict_local_scores(
+                self._model_ref,
+                device=self._device,
+                revision=self._revision,
+                pairs=pairs,
+                batch_size=batch_size,
+                max_length=self._max_length,
+            )
+        ]
 
     def _scored(self, page_content: str) -> str:
         """The exact text the cross-encoder will see for this evidence."""
@@ -73,24 +111,31 @@ class LocalCitationGroundingVerifier:
         if not missing:
             return
         raw_scores = await asyncio.to_thread(
-            predict_local_scores,
-            self._model_ref,
-            device=self._device,
-            revision=self._revision,
-            pairs=missing,
-            batch_size=batch_size or self._batch_size,
+            self._predict_scores,
+            missing,
+            batch_size or self._batch_size,
         )
         for pair, raw_score in zip(missing, raw_scores, strict=True):
             self._pair_score_cache[pair] = normalized_relevance_score(float(raw_score))
 
-    def _verification_score_input(
+    def _verification_score_pairs(
         self,
         structured_claim: object,
         claim: str,
         documents: list[Document],
         cited: list[int],
         literal_evidence: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[tuple[str, str], ...]:
+        """One scoring pair per cited source, best score wins.
+
+        These used to be concatenated into a single pair. The cross-encoder
+        truncates a pair to `local_rerank_max_length`, and truncation drops the
+        tail, so a claim whose support happened to sit in its last cited source
+        scored as if that source were absent and the sentence was removed from
+        the answer. Scoring each source on its own keeps every citation inside
+        the model's window regardless of how many were cited.
+        """
+
         kind = getattr(structured_claim, "kind", None)
         table_header = str(getattr(structured_claim, "table_header", ""))
         score_claim = (
@@ -103,13 +148,17 @@ class LocalCitationGroundingVerifier:
             if kind is AnswerLineKind.TABLE_ROW
             else None
         )
-        return (
-            score_claim,
-            exact_row_evidence
-            or "\n".join(
-                self._scored(documents[number - 1].page_content) for number in cited
-            ),
+        if exact_row_evidence:
+            return ((score_claim, exact_row_evidence),)
+        return tuple(
+            (score_claim, self._scored(documents[number - 1].page_content))
+            for number in cited
         )
+
+    def _best_score(self, pairs: tuple[tuple[str, str], ...]) -> float:
+        """The strongest support among a claim's cited sources."""
+
+        return max(self._pair_score_cache[pair] for pair in pairs)
 
     async def attach_missing_citations(
         self,
@@ -124,7 +173,7 @@ class LocalCitationGroundingVerifier:
         # Scoring per claim inside a loop serialised one cross-encoder forward pass
         # per sentence behind the shared inference lock, which dominated latency on
         # a multi-sentence answer.
-        pending: list[tuple[str, list[tuple[int, tuple[str, str]]]]] = []
+        pending: list[tuple[str, list[tuple[int, tuple[tuple[str, str], ...]]]]] = []
         verification_pairs: list[tuple[str, str]] = []
         for structured_claim in structured_material_claims(answer.answer):
             sentence = structured_claim.text
@@ -145,8 +194,8 @@ class LocalCitationGroundingVerifier:
                 if _exact_anchors_supported(
                     claim, literal_evidence
                 ) and _negation_supported(claim, literal_evidence):
-                    verification_pairs.append(
-                        self._verification_score_input(
+                    verification_pairs.extend(
+                        self._verification_score_pairs(
                             structured_claim,
                             claim,
                             documents,
@@ -155,7 +204,7 @@ class LocalCitationGroundingVerifier:
                         )
                     )
                 continue
-            eligible: list[tuple[int, tuple[str, str]]] = []
+            eligible: list[tuple[int, tuple[tuple[str, str], ...]]] = []
             for index, document in enumerate(documents, start=1):
                 literal_evidence = sanitize_evidence(document.page_content)
                 if not _exact_anchors_supported(
@@ -165,7 +214,7 @@ class LocalCitationGroundingVerifier:
                 eligible.append(
                     (
                         index,
-                        self._verification_score_input(
+                        self._verification_score_pairs(
                             structured_claim,
                             claim,
                             documents,
@@ -177,7 +226,12 @@ class LocalCitationGroundingVerifier:
             if eligible:
                 pending.append((sentence, eligible))
         if pending:
-            flat_pairs = [pair for _sentence, eligible in pending for _index, pair in eligible]
+            flat_pairs = [
+                pair
+                for _sentence, eligible in pending
+                for _index, group in eligible
+                for pair in group
+            ]
             # A citation must be attached under the same bar verify() will apply,
             # or the answer gains a marker that the very next stage rejects.
             flat_thresholds = [
@@ -186,18 +240,18 @@ class LocalCitationGroundingVerifier:
                     table_evidence=contains_table(sanitize_evidence(documents[index - 1].page_content)),
                 )
                 for _sentence, eligible in pending
-                for index, _pair in eligible
+                for index, _group in eligible
             ]
             await self._ensure_scores(flat_pairs + verification_pairs)
             for sentence, eligible in pending:
                 thresholds = flat_thresholds[: len(eligible)]
                 del flat_thresholds[: len(eligible)]
                 supported = [
-                    (self._pair_score_cache[pair], index)
-                    for (index, pair), threshold in zip(
+                    (self._best_score(group), index)
+                    for (index, group), threshold in zip(
                         eligible, thresholds, strict=True
                     )
-                    if self._pair_score_cache[pair] >= threshold
+                    if self._best_score(group) >= threshold
                 ]
                 if not supported:
                     continue
@@ -224,12 +278,11 @@ class LocalCitationGroundingVerifier:
         invalid_claims: list[str] = []
         rejections: list[ClaimRejection] = []
         accepted_scores: list[float] = []
-        score_inputs: list[tuple[str, str]] = []
+        score_groups: list[tuple[tuple[str, str], ...]] = []
         score_claims: list[str] = []
         score_thresholds: list[float] = []
         score_indexes: list[int] = []
         score_table_evidence: list[bool] = []
-        score_values: list[float | None] = []
 
         for position, structured_claim in enumerate(claims, start=1):
             sentence = structured_claim.text
@@ -291,15 +344,15 @@ class LocalCitationGroundingVerifier:
                     )
                 )
                 continue
-            score_input = self._verification_score_input(
-                structured_claim,
-                claim,
-                documents,
-                cited,
-                literal_evidence,
+            score_groups.append(
+                self._verification_score_pairs(
+                    structured_claim,
+                    claim,
+                    documents,
+                    cited,
+                    literal_evidence,
+                )
             )
-            score_inputs.append(score_input)
-            score_values.append(self._pair_score_cache.get(score_input))
             score_claims.append(sentence)
             score_indexes.append(position)
             score_table_evidence.append(table_evidence)
@@ -318,15 +371,13 @@ class LocalCitationGroundingVerifier:
                 )
             )
 
-        missing_pairs = [
-            pair for pair, value in zip(score_inputs, score_values, strict=True)
-            if value is None
-        ]
-        await self._ensure_scores(missing_pairs)
-        resolved_scores = [
-            self._pair_score_cache[pair] if value is None else value
-            for pair, value in zip(score_inputs, score_values, strict=True)
-        ]
+        # _ensure_scores already skips pairs attach_missing_citations cached,
+        # so passing the full set costs nothing and keeps the bookkeeping in one
+        # place.
+        await self._ensure_scores(
+            [pair for group in score_groups for pair in group]
+        )
+        resolved_scores = [self._best_score(group) for group in score_groups]
         for sentence, score, threshold, position, table_evidence in zip(
             score_claims,
             resolved_scores,

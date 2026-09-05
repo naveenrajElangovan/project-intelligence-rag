@@ -58,24 +58,30 @@ def _deterministic_identifier_answer(
 def _deterministic_structured_inventory_answer(
     question: str, documents: list[Document], language: str
 ) -> GroundedAnswer | None:
-    """Render an exact event registry row and named payload assignments as a table."""
+    """Render an exact event registry row and its declared payload model."""
 
     identifiers = re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", question)
     if not identifiers:
         return None
     target = identifiers[0]
     registry: tuple[list[str], int] | None = None
+    aliases = {target}
+    for source_number, document in enumerate(documents, start=1):
+        for line in document.page_content.splitlines():
+            cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 4 or not _registry_identifier_matches(target, cells[:2]):
+                continue
+            registry = (cells, source_number)
+            aliases.update(cells[:2])
+            break
+
+    declared_fields = _declared_entity_fields(documents, aliases)
     best_fields: list[tuple[str, str]] = []
     field_source = 0
     for source_number, document in enumerate(documents, start=1):
         content = document.page_content
-        if target not in content:
+        if not any(alias in content for alias in aliases):
             continue
-        for line in content.splitlines():
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-            if len(cells) >= 4 and cells[0] == target:
-                registry = (cells, source_number)
-                break
         for match in re.finditer(r"\b[A-Z][A-Za-z0-9_]*(?:Event|Payload)\s*\(", content):
             body = _balanced_call_body(content, match.end() - 1)
             fields = [
@@ -87,7 +93,7 @@ def _deterministic_structured_inventory_answer(
             if len(fields) > len(best_fields):
                 best_fields = fields
                 field_source = source_number
-    if len(best_fields) < 3:
+    if registry is None and not declared_fields and len(best_fields) < 3:
         return None
 
     citations: list[int] = []
@@ -104,28 +110,140 @@ def _deterministic_structured_inventory_answer(
                 f"The `{cells[0]}` contract uses wire name `{cells[1]}`, numeric event id "
                 f"{cells[2]}, and version `{cells[3]}` [SOURCE {source_number}]."
             )
+    elif declared_fields:
+        direct = ""
     else:
         direct = (
             f"The indexed implementation declares payload assignments for `{target}` "
             f"[SOURCE {field_source}]."
         )
-    citations.append(field_source)
-    header = "| Field | Type | Required | Description | Source |"
-    separator = "|---|---|---|---|---|"
-    rows = [
-        f"| `{name}` | — | — | `{name} = {value}` | [SOURCE {field_source}] |"
-        for name, value in best_fields
-    ]
-    missing = (
-        ["Field types and required/optional constraints are not present in the selected evidence."]
-        if language != "es"
-        else ["Los tipos y las restricciones obligatorio/opcional no aparecen en la evidencia seleccionada."]
-    )
+    if declared_fields:
+        citations.extend(source for *_values, source in declared_fields)
+        header = "| Serialized field | Code property | Type | Source |"
+        separator = "|---|---|---|---|"
+        rows = [
+            f"| `{serialized}` | `{property_name}` | `{field_type}` | [SOURCE {source}] |"
+            for serialized, property_name, field_type, source in declared_fields
+        ]
+        missing: list[str] = []
+    elif best_fields:
+        citations.append(field_source)
+        header = "| Field | Type | Required | Description | Source |"
+        separator = "|---|---|---|---|---|"
+        rows = [
+            f"| `{name}` | — | — | `{name} = {value}` | [SOURCE {field_source}] |"
+            for name, value in best_fields
+        ]
+        missing = [
+            "The selected evidence contains payload assignments but not the authoritative field types."
+        ]
+    else:
+        header = separator = ""
+        rows = []
+        missing = [
+            "No authoritative payload-field definition was present in the selected evidence."
+        ]
+    table = ("", "### Payload fields", header, separator, *rows) if rows else ()
     return GroundedAnswer(
-        answer="\n".join((direct, "", "### Payload fields", header, separator, *rows)),
+        answer="\n".join(part for part in (direct, *table) if part),
         citations=list(dict.fromkeys(citations)),
         missing_information=missing,
     )
+
+
+def _registry_identifier_matches(target: str, identifiers: list[str]) -> bool:
+    normalized = {value.removesuffix("_EVENT") for value in identifiers}
+    return target in identifiers or target.removesuffix("_EVENT") in normalized
+
+
+def _declared_entity_fields(
+    documents: list[Document], aliases: set[str]
+) -> list[tuple[str, str, str, int]]:
+    """Select the strongest entity-scoped Kotlin payload declaration."""
+
+    target_terms = {
+        part.casefold()
+        for alias in aliases
+        for part in alias.split("_")
+        if part.casefold() not in {"event", "payload"}
+    }
+    candidates: list[tuple[int, list[tuple[str, str, str, int]]]] = []
+    for source_number, document in enumerate(documents, start=1):
+        content = document.page_content
+        searchable = f"{document.metadata.get('title', '')} {content}".casefold()
+        for match in re.finditer(r"\bdata\s+class\s+([A-Za-z_]\w*)\s*\(", content):
+            class_name = match.group(1)
+            if any(alias.endswith("_EVENT") for alias in aliases) and not class_name.endswith(
+                "Event"
+            ):
+                continue
+            body = _balanced_call_body(content, match.end() - 1)
+            fields = [
+                (serialized or property_name, property_name, field_type.strip(), source_number)
+                for serialized, property_name, field_type in re.findall(
+                    r'(?:@SerialName\("([^"]+)"\)\s*)?'
+                    r"(?:override\s+)?val\s+([A-Za-z_]\w*)\s*:\s*([^,\n=]+)",
+                    body,
+                )
+            ]
+            if not fields:
+                continue
+            prelude = content[max(0, match.start() - 180) : match.start()]
+            class_aliases = set(re.findall(r'@SerialName\("([^"]+)"\)', prelude))
+            exact_alias = bool(class_aliases.intersection(aliases))
+            term_matches = sum(term in searchable for term in target_terms)
+            has_registry_alias = len(aliases) > 1
+            if (has_registry_alias and not exact_alias) or (
+                not exact_alias and not term_matches
+            ):
+                continue
+            candidates.append((100 if exact_alias else term_matches, fields))
+    if not candidates:
+        return []
+    return max(candidates, key=lambda candidate: (candidate[0], len(candidate[1])))[1]
+
+
+def structured_entity_field_names(
+    question: str, documents: list[Document]
+) -> tuple[str, ...]:
+    """Return the authoritative serialized field population for one entity."""
+
+    identifiers = re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", question)
+    if not identifiers:
+        return ()
+    target = identifiers[0]
+    aliases = {target}
+    for document in documents:
+        for line in document.page_content.splitlines():
+            cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+            if len(cells) >= 2 and _registry_identifier_matches(target, cells[:2]):
+                aliases.update(cells[:2])
+    return tuple(
+        dict.fromkeys(
+            serialized
+            for serialized, _property_name, _field_type, _source in _declared_entity_fields(
+                documents, aliases
+            )
+        )
+    )
+
+
+def structured_entity_aliases(
+    question: str, documents: list[Document]
+) -> tuple[str, ...]:
+    """Resolve constant and wire aliases without embedding domain-specific names."""
+
+    identifiers = re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", question)
+    if not identifiers:
+        return ()
+    target = identifiers[0]
+    aliases = [target]
+    for document in documents:
+        for line in document.page_content.splitlines():
+            cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+            if len(cells) >= 2 and _registry_identifier_matches(target, cells[:2]):
+                aliases.extend(cells[:2])
+    return tuple(dict.fromkeys(aliases))
 
 
 def _balanced_call_body(value: str, opening_index: int) -> str:

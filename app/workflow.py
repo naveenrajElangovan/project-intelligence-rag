@@ -9,24 +9,11 @@ from collections.abc import AsyncIterator
 from typing import TypedDict
 
 from langchain_core.documents import Document
-
 from app.config import Settings
-from app.llm import (
-    BilingualQueryPlanner,
-    ConversationQueryResolver,
-    GroundedAnswer,
-    LangChainGroundedAnswerGenerator,
-    LangChainSafeResponseGenerator,
-    TokenUsage,
-    insufficient_evidence_answer,
-)
-from app.models import (
-    ConversationContextUpdate,
-    ConversationEntity,
-    RagRequest,
-    RagResponse,
-    SourceReference,
-)
+from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedAnswer,
+                     LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator,
+                     TokenUsage, insufficient_evidence_answer)
+from app.models import ConversationContextUpdate, ConversationEntity, RagRequest, RagResponse, SourceReference
 from app.grounding import LocalCitationGroundingVerifier
 from app.embedding import build_embedder
 from app.reranking import build_reranker
@@ -36,12 +23,10 @@ from app.retrieval_pipeline import ReciprocalRankFusion
 from app.telemetry import request_complete, stage_complete, started
 from app.workflow_support.json_transform import json_transform_response
 from app.workflow_support.execution import invoke_bounded_graph
-from app.workflow_support.streaming import graph_update_events
+from app.workflow_support.streaming import graph_update_events, verified_answer_events
 from app.workflow_graph import compiled_workflow_graph
 from app.workflow_support.citations import (
-    _citations_valid,
-    _remove_unsupported_claims,
-    _normalized_sentence,
+    _citations_valid, _remove_unsupported_claims, _normalized_sentence,
     _material_sentence_count,
     _citation_failure_reason,
     _normalize_citations,
@@ -144,12 +129,13 @@ from app.workflow_nodes.planning import PlanningNodesMixin
 from app.workflow_nodes.retrieval import RetrievalNodesMixin
 from app.workflow_nodes.state import RagState
 from app.workflow_support.conversation import (
+    _conversation_context_subject,
     _conversation_resolution_needed,
-    _deterministic_conversation_rewrite,
     _conversation_subject,
-    _resolved_conversation_subject,
+    _deterministic_conversation_rewrite,
     _safe_conversation_rewrite,
 )
+from app.workflow_support.fail_closed import apply_output_gate, clarification_response, resolved_request_for_state
 
 
 class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
@@ -207,6 +193,11 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
         deterministic = json_transform_response(self._request, began)
         if deterministic is not None:
             return deterministic
+        clarification = clarification_response(
+            self._request, self._vocabulary.entities
+        )
+        if clarification is not None:
+            return clarification
         state = await invoke_bounded_graph(
             self._graph, {"request": self._request, "_workflow": self},
             project_id=self._request.project_id,
@@ -225,28 +216,27 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
         began = started()
         deterministic = json_transform_response(self._request, began)
         if deterministic is not None:
-            yield {"type": "answer_start"}
-            yield {"type": "answer_snapshot", "answer": deterministic.answer}
+            async for event in verified_answer_events(deterministic.answer):
+                yield event
             yield {
                 "type": "complete",
                 "response": deterministic.model_dump(by_alias=True),
             }
             return
+        clarification = clarification_response(self._request, self._vocabulary.entities)
+        if clarification is not None:
+            async for event in verified_answer_events(clarification.answer):
+                yield event
+            yield {"type": "complete", "response": clarification.model_dump(by_alias=True)}
+            return
         state: RagState = {"request": self._request, "_workflow": self}
         stream_status = {"answer_started": False}
-        self._incremental_stream_active = True
-        try:
-            async for event in graph_update_events(self, state, stream_status):
-                yield event
-        finally:
-            self._incremental_stream_active = False
+        async for event in graph_update_events(self, state, stream_status):
+            yield event
         response = await self._response_from_state(state, began)
         if not stream_status["answer_started"]:
-            yield {"type": "answer_start"}
-            # No live model token stream exists on this path. Mark the finished
-            # text as a snapshot instead of simulating streaming by chopping it
-            # into same-frame chunks.
-            yield {"type": "answer_snapshot", "answer": response.answer}
+            async for event in verified_answer_events(response.answer):
+                yield event
         yield {
             "type": "complete",
             "response": response.model_dump(by_alias=True),
@@ -254,8 +244,12 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
 
     async def _response_from_state(self, state: RagState, began: float) -> RagResponse:
         """Convert final graph state into an audited public response."""
-
         documents = state.get("documents", [])
+        generated = state.get("generated")
+        resolved = resolved_request_for_state(
+            state, self._request, self._vocabulary.entities
+        )
+        apply_output_gate(state, self._request, resolved, generated)
         generated = state.get("generated")
         if not documents or generated is None or state.get("grounded") is False:
             language = state.get("language", detect_query_language(self._request.question))
@@ -273,14 +267,38 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
             population_miss = bool(state.get("coverage_expected")) and bool(
                 state.get("population_retrieval_miss")
             )
+            gate_reason = str(state.get("grounding_reason") or "") if state.get("output_gate_applied") else ""
             refusal_reason = (
-                "POPULATION_RETRIEVAL_MISS"
+                "ENTITY_MISMATCH"
+                if state.get("entity_mismatch_requested")
+                else gate_reason
+                if gate_reason in {
+                    "UNRESOLVED_SOURCE_CONFLICT",
+                    "SOURCE_SCOPE_VIOLATION",
+                    "PERMISSIONS_NOT_SATISFIED",
+                    "FRESHNESS_NOT_VERIFIABLE",
+                    "REQUESTED_COVERAGE_INCOMPLETE",
+                    "UNSUPPORTED_CLAIM",
+                    "INVALID_DERIVATION",
+                }
+                else "POPULATION_RETRIEVAL_MISS"
                 if population_miss
                 else "UNVERIFIED_EVIDENCE"
                 if unverified
                 else "INSUFFICIENT_EVIDENCE"
             )
+            if refusal_reason == "ENTITY_MISMATCH":
+                requested = str(state.get("entity_mismatch_requested") or "")
+                suggested = str(state.get("entity_mismatch_suggested") or "")
+                refusal = (
+                    f"¿Quisiste decir {suggested} en lugar de {requested}?"
+                    if language == "es"
+                    else f"Did you mean {suggested} rather than {requested}?"
+                )
+                reason_code = "ENTITY_MISMATCH"
             try:
+                if refusal_reason == "ENTITY_MISMATCH":
+                    raise ValueError("deterministic clarification")
                 responder = LangChainSafeResponseGenerator(
                     self._settings, self._request.model_profile
                 )
@@ -321,9 +339,20 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
                     for document in _dedupe_source_documents(documents[:3])
                 ]
                 if unverified
+                and refusal_reason
+                not in {"PERMISSIONS_NOT_SATISFIED", "SOURCE_SCOPE_VIOLATION"}
                 else []
             )
             response = RagResponse(
+                status=(
+                    "NEEDS_CLARIFICATION"
+                    if refusal_reason == "ENTITY_MISMATCH"
+                    else "SOURCE_CONFLICT"
+                    if refusal_reason == "UNRESOLVED_SOURCE_CONFLICT"
+                    else "ACCESS_DENIED"
+                    if refusal_reason == "PERMISSIONS_NOT_SATISFIED"
+                    else "INSUFFICIENT_EVIDENCE"
+                ),
                 answer=refusal,
                 confidence="NONE",
                 project_id=self._request.project_id,
@@ -335,7 +364,11 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
                 context_completeness=float(state.get("context_completeness", 0.0)),
                 degradation=_degradation_reasons(state, unverified=unverified),
                 refusal_reason=refusal_reason,
-                conversation_context_update=self._conversation_context_update(state),
+                conversation_context_update=None,
+                failureReason=refusal_reason,
+                resolvedIntent=resolved.intent,
+                resolvedEntities=resolved.referenced_entities,
+                coverage="PARTIAL" if documents else "NOT_APPLICABLE",
             )
             request_complete(
                 began=began,
@@ -343,6 +376,7 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
                 confidence="NONE",
                 model_profile=self._request.model_profile,
                 language=language,
+                reason_code=refusal_reason,
             )
             return response
         score = _highest_rerank_score(documents)
@@ -354,6 +388,7 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
             ]
         )
         response = RagResponse(
+            status="ANSWERED",
             answer=_answer_without_source_markers(generated.answer),
             confidence="HIGH" if score >= 0.7 else "MEDIUM",
             project_id=self._request.project_id,
@@ -375,6 +410,10 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
             context_relevance=float(state.get("context_relevance", score)),
             context_completeness=float(state.get("context_completeness", 1.0)),
             conversation_context_update=self._conversation_context_update(state),
+            failureReason=None,
+            resolvedIntent=resolved.intent,
+            resolvedEntities=resolved.referenced_entities,
+            coverage="PARTIAL" if state.get("coverage_partial") or generated.missing_information else "COMPLETE",
         )
         request_complete(
             began=began,
@@ -393,16 +432,12 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
         original = self._request.question
         resolved = state.get("resolved_question", original)
         existing = self._request.conversation_context.active_subject.strip()
-        is_followup = _conversation_resolution_needed(original)
-        explicit_subject = _conversation_subject(original)
-        resolved_subject = _resolved_conversation_subject(resolved)
-        subject = (
-            resolved_subject or _conversation_subject(existing) or existing
-            if is_followup and not explicit_subject
-            else explicit_subject
+        vocabulary = tuple(
+            getattr(getattr(self, "_vocabulary", None), "entities", ()) or ()
         )
-        if not subject:
-            subject = _resolved_conversation_subject(resolved) or existing
+        subject, is_followup = _conversation_context_subject(
+            original, resolved, existing, vocabulary
+        )
         entities = (
             [ConversationEntity(value=subject, canonicalValue=subject)] if subject else []
         )

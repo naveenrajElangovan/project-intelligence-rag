@@ -19,7 +19,13 @@ import unicodedata
 from dataclasses import dataclass, field
 
 from app.llm import TokenUsage
-from app.models import MAX_PAYLOAD_QUESTION_CHARACTERS, RagRequest, RagResponse
+from app.models import (
+    MAX_PAYLOAD_QUESTION_CHARACTERS,
+    AnswerStatus,
+    Coverage,
+    RagRequest,
+    RagResponse,
+)
 from app.telemetry import request_complete, stage_complete
 from app.workflow_support.query_analysis import detect_query_language
 
@@ -372,6 +378,7 @@ def json_transform_response(request: RagRequest, began: float) -> RagResponse | 
         **TokenUsage().model_dump(),
     )
     response = RagResponse(
+        status=AnswerStatus.ANSWERED,
         answer=json_transform_answer(result, language),
         confidence="HIGH" if result.ok else "NONE",
         project_id=request.project_id,
@@ -383,6 +390,7 @@ def json_transform_response(request: RagRequest, began: float) -> RagResponse | 
         context_quality="NOT_APPLICABLE",
         context_relevance=0.0,
         context_completeness=0.0,
+        coverage=Coverage.NOT_APPLICABLE,
         conversation_context_update=None,
     )
     request_complete(

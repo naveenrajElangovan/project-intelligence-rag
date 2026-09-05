@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.accelerator import accelerator_embed
 
 
 _QUERY_PREFIX = "query: "
@@ -123,8 +124,60 @@ class LocalMultilingualEmbedder:
             self._evict_locked()
 
 
+class RemoteMultilingualEmbedder(LocalMultilingualEmbedder):
+    """Preserve the local embedding contract while executing on macOS MPS."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        base_url: str,
+        api_key: str,
+        timeout_seconds: float,
+        dimensions: int,
+        attempts: int = 1,
+    ) -> None:
+        super().__init__(model, device="remote", dimensions=dimensions)
+        self._base_url = base_url
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._attempts = attempts
+
+    def _encode(self, texts: list[str]) -> None:
+        # Batched by the client: the worker caps one request's text count, and a
+        # rejected request would fail retrieval outright rather than embed less.
+        embedded = accelerator_embed(
+            self._base_url,
+            texts,
+            api_key=self._api_key,
+            timeout_seconds=self._timeout_seconds,
+            dimensions=self._dimensions,
+            attempts=self._attempts,
+        )
+        with self._cache_lock:
+            for text, vector in zip(texts, embedded, strict=True):
+                self._cache[text] = vector
+            self._evict_locked()
+
+
 def build_embedder(settings: Settings) -> LocalMultilingualEmbedder:
     """Build the mandatory local query embedder."""
+    if settings.local_accelerator_url:
+        return RemoteMultilingualEmbedder(
+            settings.local_embedding_model,
+            base_url=settings.local_accelerator_url,
+            api_key=settings.internal_api_key,
+            # Embedding gets the tighter of the two bounds. It is one short
+            # forward pass; if it has not answered in that time the worker is
+            # not going to, and retrieval should fail fast rather than hold the
+            # request open for the full accelerator ceiling.
+            timeout_seconds=min(
+                settings.local_accelerator_timeout_seconds,
+                settings.query_embedding_timeout_seconds,
+            ),
+            dimensions=settings.embedding_dimensions,
+            attempts=settings.local_accelerator_retry_attempts,
+        )
     return LocalMultilingualEmbedder(
         settings.local_embedding_model,
         device=settings.local_embedding_device,

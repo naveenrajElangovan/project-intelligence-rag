@@ -352,6 +352,47 @@ def test_dense_retrieval_is_retried_on_the_next_request_after_fallback() -> None
     assert embedder.calls == 2
 
 
+def test_transient_chroma_retries_reuse_one_local_embedding() -> None:
+    class CountingEmbedder(FakeEmbedder):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def embed_query(self, query):
+            self.calls += 1
+            return super().embed_query(query)
+
+    class RecoveringIndex(FakeIndex):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def query(self, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                error = RuntimeError("temporary Chroma connection failure")
+                error.status_code = 503  # type: ignore[attr-defined]
+                raise error
+            return super().query(**kwargs)
+
+    embedder = CountingEmbedder()
+    index = RecoveringIndex()
+    retriever = ChromaAccessRetriever(
+        index=index,
+        collection_name="project-intelligence",
+        embedder=embedder,
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
+        retry_attempts=3,
+    )
+
+    documents = asyncio.run(retriever.ainvoke_scoped("payment", ()))
+
+    assert len(documents) == 1
+    assert embedder.calls == 1
+    assert index.calls == 3
+    assert documents[0].metadata["retrieval_retry_count"] == 2
+
+
 def test_cached_lexical_index_matches_reference_bm25_order() -> None:
     documents = [
         Document(

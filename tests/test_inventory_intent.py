@@ -1,4 +1,7 @@
-from app.workflow_support.inventory_intent import is_inventory_question
+from app.workflow_support.inventory_intent import (
+    is_exhaustive_entity_detail_question,
+    is_inventory_question,
+)
 from app.config import Settings
 from app.workflow_nodes.answering import (
     _evidence_population_members,
@@ -15,6 +18,10 @@ from app.workflow_nodes.answering import (
     _publisher_destination_members,
     _published_population_members,
     _structured_tabular_evidence,
+)
+from app.workflow_support.deterministic_answers import (
+    _deterministic_structured_inventory_answer,
+    structured_entity_field_names,
 )
 from app.table_evidence import normalize_table_dialect
 from app.workflow_support.answer_structure import (
@@ -46,6 +53,83 @@ def test_does_not_convert_single_item_questions_to_inventory() -> None:
     assert not is_inventory_question("Where is the receipt shortcut implemented?")
     assert not is_inventory_question("What version does the API use?")
     assert not is_inventory_question("Which file does this class live in?")
+
+
+def test_distinguishes_exhaustive_fields_from_collection_inventory() -> None:
+    question = "Give me all LOGIN_POS_EVENT parameters"
+
+    assert is_exhaustive_entity_detail_question(question)
+    assert not is_inventory_question(question)
+    assert not is_exhaustive_entity_detail_question("What is LOGIN_POS_EVENT?")
+
+
+def test_named_event_renderer_uses_complete_serialized_payload_declaration() -> None:
+    documents = [
+        Document(
+            page_content=(
+                "data class LoginParams(\n"
+                "  val user: String,\n"
+                "  val password: String,\n"
+                "  val domain: String\n"
+                ")"
+            ),
+            metadata={"title": "LoginUseCase.kt"},
+        ),
+        Document(
+            page_content=(
+                "| `LOGIN_POS_EVENT` | `POS_LOGIN` | 101 | 0,3 | publishes |\n"
+            ),
+            metadata={"title": "Event registry"},
+        ),
+        Document(
+            page_content=(
+                '@SerialName("POS_LOGIN")\n'
+                "data class LoginEvent(\n"
+                '  @SerialName("event_type") override val eventType: String,\n'
+                '  @SerialName("event_id") override val eventId: Int,\n'
+                '  @SerialName("session_id") val sessionId: String\n'
+                ") : BaseEvent"
+            ),
+            metadata={"title": "LoginEvent.kt"},
+        ),
+    ]
+
+    fields = structured_entity_field_names(
+        "Give me all LOGIN_POS_EVENT parameters", documents
+    )
+    generated = _deterministic_structured_inventory_answer(
+        "Give me all LOGIN_POS_EVENT parameters", documents, "en"
+    )
+
+    assert fields == ("event_type", "event_id", "session_id")
+    assert generated is not None
+    assert "version `0,3`" in generated.answer
+    assert "`event_type` | `eventType` | `String`" in generated.answer
+    assert "`session_id` | `sessionId` | `String`" in generated.answer
+    assert "password" not in generated.answer
+    assert generated.missing_information == []
+
+
+def test_named_event_schema_without_registry_does_not_invent_metadata() -> None:
+    model = Document(
+        page_content=(
+            '@SerialName("ORDER_CLOSE")\n'
+            "data class OrderCloseEvent(\n"
+            '  @SerialName("event_id") val eventId: Int,\n'
+            '  @SerialName("amount") val amount: Long\n'
+            ")"
+        ),
+        metadata={"title": "OrderCloseEvent.kt"},
+    )
+
+    generated = _deterministic_structured_inventory_answer(
+        "Show the complete schema for ORDER_CLOSE_EVENT", [model], "en"
+    )
+
+    assert generated is not None
+    assert generated.answer.startswith("### Payload fields")
+    assert "numeric event id" not in generated.answer
+    assert generated.missing_information == []
 
 
 def test_bare_application_token_remains_an_inventory_scope() -> None:

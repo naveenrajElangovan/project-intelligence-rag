@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
 from langgraph.errors import GraphRecursionError
 
-from app.llm import GroundedAnswer
 from app.telemetry import stage_complete, started
-from app.workflow_support.presentation import (
-    _incrementally_verified_events,
-    _stream_progress,
-)
+from app.workflow_support.presentation import _answer_deltas, _stream_progress
+
+
+async def verified_answer_events(
+    answer: str,
+    *,
+    target_characters: int = 48,
+    pacing_seconds: float = 0.012,
+) -> AsyncIterator[dict[str, object]]:
+    """Progressively release text only after the final answer is verified."""
+
+    yield {"type": "answer_start"}
+    for delta in _answer_deltas(answer, target_characters=target_characters):
+        yield {"type": "answer_delta", "delta": delta, "verification": "verified"}
+        if pacing_seconds:
+            await asyncio.sleep(pacing_seconds)
 
 
 async def graph_update_events(
@@ -33,13 +45,8 @@ async def graph_update_events(
                 and len(update) == 2
                 and update[0] == "custom"
             ):
-                event = update[1]
-                if not isinstance(event, dict):
-                    continue
-                if not status["answer_started"]:
-                    yield {"type": "answer_start"}
-                    status["answer_started"] = True
-                yield event
+                # Custom generation events may contain provisional factual text.
+                # Whole-answer validation has not run yet, so none are releasable.
                 continue
             if isinstance(update, tuple) and len(update) == 2:
                 update = update[1]
@@ -53,22 +60,6 @@ async def graph_update_events(
                 )
                 if progress is not None:
                     yield progress
-                if (
-                    workflow._settings.incremental_verified_streaming_enabled
-                    and node_name == "generate"
-                    and not status["answer_started"]
-                    and isinstance(state.get("generated"), GroundedAnswer)
-                ):
-                    yield {"type": "answer_start"}
-                    status["answer_started"] = True
-                    async for event in _incrementally_verified_events(
-                        workflow._grounding_verifier,
-                        question=workflow._request.question,
-                        documents=state.get("documents", []),
-                        generated=state["generated"],
-                        language=state.get("language", ""),
-                    ):
-                        yield event
     except GraphRecursionError:
         stage_complete(
             "graph_error",

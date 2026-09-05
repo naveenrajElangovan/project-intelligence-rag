@@ -24,7 +24,6 @@ from app.workflow_support.deterministic_answers import (
 from app.workflow_support.presentation import _expand_candidate_neighbors
 from app.workflow_support.inventory_intent import is_inventory_question
 from app.workflow_support.identifiers import member_identifiers
-from app.workflow_support.filtering import preserve_non_empty
 from app.workflow_support.procedural_retrieval import (
     balanced_source_candidate_pool,
     is_procedural_question,
@@ -54,6 +53,7 @@ from app.retrieval_pipeline import (
     deduplicate_candidate_bodies,
     validate_authorized_candidates,
 )
+from app.source_policy import SourcePolicyRegistry, deduplicate_authoritative_versions
 
 
 def _exact_identifier_tokens(
@@ -159,6 +159,7 @@ def _prefilter_candidates(
             and float(metadata.get("score") or 0.0) < minimum_dense_score
             and not metadata.get("identifier_anchor")
             and not metadata.get("primary_query_rank")
+            and not metadata.get("query_candidate_ranks")
         )
 
     removable = (
@@ -205,9 +206,10 @@ def _final_evidence_order(
 
 
 def _preserve_primary_query_candidates(
-    ranked: list[Document], *, limit: int, reserve: int = 4
+    ranked: list[Document], *, limit: int, reserve: int = 4,
+    per_query_reserve: int = 8,
 ) -> list[Document]:
-    """Keep a bounded original-query window for the cross-encoder.
+    """Keep a bounded window from every retrieval query for the cross-encoder.
 
     Query translations and decompositions improve recall, but reciprocal-rank
     fusion can reward generic chunks that appear for every expansion and evict
@@ -224,9 +226,33 @@ def _preserve_primary_query_candidates(
         ),
         key=lambda document: int(document.metadata.get("primary_query_rank") or 0),
     )[: min(reserve, limit)]
+    per_query: list[Document] = []
+    query_indexes = sorted(
+        {
+            int(index)
+            for document in ranked
+            for index in (document.metadata.get("query_candidate_ranks") or {})
+        }
+    )
+    for query_index in query_indexes:
+        per_query.extend(
+            sorted(
+                (
+                    document
+                    for document in ranked
+                    if str(query_index)
+                    in (document.metadata.get("query_candidate_ranks") or {})
+                ),
+                key=lambda document: int(
+                    (document.metadata.get("query_candidate_ranks") or {})[
+                        str(query_index)
+                    ]
+                ),
+            )[: min(per_query_reserve, limit)]
+        )
     combined: list[Document] = []
     seen: set[str] = set()
-    for document in [*primary, *ranked]:
+    for document in [*primary, *per_query, *ranked]:
         identity = str(document.metadata.get("chunk_id") or _source_identity(document))
         if identity in seen:
             continue
@@ -281,6 +307,32 @@ def _inventory_identifier_anchors(
         document.metadata["rerank_score"] = 1.0
     return anchors
 
+
+def _fuse_reranked_groups(
+    groups: list[list[Document]], *, top_n: int, rank_fusion_k: int
+) -> list[Document]:
+    """Merge qualifying reranks by maximum relevance plus reciprocal rank."""
+
+    fused: dict[str, tuple[Document, float, float]] = {}
+    for group in groups:
+        for rank, document in enumerate(group, start=1):
+            identity = str(document.metadata.get("chunk_id") or _source_identity(document))
+            score = float(document.metadata.get("rerank_score") or 0.0)
+            existing = fused.get(identity)
+            rrf = (existing[2] if existing else 0.0) + 1 / (rank_fusion_k + rank)
+            fused[identity] = (
+                existing[0] if existing else document,
+                max(existing[1] if existing else 0.0, score),
+                rrf,
+            )
+    ordered = sorted(
+        fused.values(), key=lambda item: (item[1] + item[2], item[1]), reverse=True
+    )[:top_n]
+    for document, score, rrf in ordered:
+        document.metadata["rerank_score"] = score
+        document.metadata["multilingual_rerank_rrf_score"] = rrf
+    return [document for document, _score, _rrf in ordered]
+
 class RetrievalNodesMixin:
     """RetrievalNodes responsibilities."""
 
@@ -320,11 +372,37 @@ class RetrievalNodesMixin:
             )
         )
         resolved_question = state.get("resolved_question", self._request.question)
-        results = await asyncio.gather(
-            *(self._retrieve_scope(query, scope) for query, scope in requests)
-        )
         exact_identifiers = _exact_identifier_tokens(
             resolved_question, self._vocabulary.entities
+        )
+        # Execute deterministic structured/lexical channels before semantic
+        # retrieval. Semantic similarity expands recall inside the selected
+        # scope; it is never proof and never substitutes for an exact match.
+        exact_loader = getattr(self._retriever, "ainvoke_exact_identifiers", None)
+        anchored = (
+            await exact_loader(exact_identifiers, source_types)
+            if exact_loader is not None and exact_identifiers
+            else []
+        )
+        lexical_loader = getattr(self._retriever, "ainvoke_lexical", None)
+        lexical_candidates = (
+            await lexical_loader(resolved_question, source_types)
+            if lexical_loader is not None
+            else None
+        )
+        rare_loader = getattr(self._retriever, "ainvoke_rare_terms", None)
+        rare_terms = (
+            await rare_loader(resolved_question, source_types)
+            if rare_loader is not None
+            else ()
+        )
+        rare_lookups = tuple(
+            value for value in rare_terms if value not in exact_identifiers
+        )
+        if exact_loader is not None and rare_lookups:
+            anchored.extend(await exact_loader(rare_lookups, source_types))
+        results = await asyncio.gather(
+            *(self._retrieve_scope(query, scope) for query, scope in requests)
         )
         unique: dict[str, Document] = {}
         if state.get("preserve_candidates"):
@@ -333,6 +411,7 @@ class RetrievalNodesMixin:
                     (document.page_content + str(document.metadata.get("reference"))).encode()
                 ).hexdigest()
                 unique[identity] = document
+        query_indexes = {query: index for index, query in enumerate(state["queries"])}
         for (query, _scope), group in zip(requests, results, strict=True):
             for rank, document in enumerate(group, start=1):
                 identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
@@ -350,6 +429,13 @@ class RetrievalNodesMixin:
                     float(existing.metadata.get("score", 0)),
                     float(document.metadata.get("score", 0)),
                 )
+                query_ranks = dict(existing.metadata.get("query_candidate_ranks") or {})
+                query_key = str(query_indexes[query])
+                previous_query_rank = int(query_ranks.get(query_key) or 0)
+                query_ranks[query_key] = (
+                    min(previous_query_rank, rank) if previous_query_rank else rank
+                )
+                existing.metadata["query_candidate_ranks"] = query_ranks
                 if query == resolved_question:
                     previous_primary_rank = int(
                         existing.metadata.get("primary_query_rank") or 0
@@ -380,25 +466,10 @@ class RetrievalNodesMixin:
             if not document.metadata.get("retrieval_fallback")
         ]
         fallback_candidates = len(authorized) - len(dense_candidates)
-        lexical_loader = getattr(self._retriever, "ainvoke_lexical", None)
-        lexical_candidates = (
-            await lexical_loader(resolved_question, source_types)
-            if lexical_loader is not None
-            else self._sparse_retriever.rank(resolved_question, authorized)
-        )
-        rare_loader = getattr(self._retriever, "ainvoke_rare_terms", None)
-        rare_terms = (
-            await rare_loader(resolved_question, source_types)
-            if rare_loader is not None
-            else ()
-        )
-        exact_loader = getattr(self._retriever, "ainvoke_exact_identifiers", None)
-        exact_lookups = tuple(dict.fromkeys([*exact_identifiers, *rare_terms]))
-        anchored = (
-            await exact_loader(exact_lookups, source_types)
-            if exact_loader is not None and exact_lookups
-            else []
-        )
+        if lexical_candidates is None:
+            lexical_candidates = self._sparse_retriever.rank(
+                resolved_question, authorized
+            )
         anchored = _retain_explicit_identifier_anchors(
             anchored, _forced_anchor_tokens(resolved_question)
         )
@@ -432,19 +503,22 @@ class RetrievalNodesMixin:
         # RRF can omit an exact original-language match when generic records
         # recur across every translated/decomposed query. Reserve a small,
         # authorized original-query window before any subsequent filtering.
-        primary_authorized = sorted(
-            (
-                document
-                for document in authorized
-                if int(document.metadata.get("primary_query_rank") or 0) > 0
+        primary_authorized = _preserve_primary_query_candidates(
+            authorized,
+            limit=min(
+                len(authorized),
+                max(self._settings.max_candidates, self._settings.retrieval_top_k),
             ),
-            key=lambda document: int(
-                document.metadata.get("primary_query_rank") or 0
-            ),
-        )[:4]
+        )
         fused_candidates = deduplicate_candidate_bodies(
             [*primary_authorized, *fused_candidates]
         )[: max(self._settings.max_candidates, self._settings.retrieval_top_k)]
+        registry = SourcePolicyRegistry.from_categories(
+            _document_source_type(document) for document in fused_candidates
+        )
+        fused_candidates = deduplicate_authoritative_versions(
+            fused_candidates, registry
+        )
         query_terms = _exact_terms(resolved_question)
         source_candidate_counts = Counter(
             _source_identity(document) for document in fused_candidates
@@ -479,6 +553,16 @@ class RetrievalNodesMixin:
         candidates = _preserve_primary_query_candidates(
             ranked_responsive,
             limit=self._settings.max_candidates,
+        )
+        preserved_query_indexes = {
+            str(index)
+            for document in candidates
+            for index, rank in (document.metadata.get("query_candidate_ranks") or {}).items()
+            if int(rank) <= 8
+        }
+        preserved_candidate_count = sum(
+            any(int(rank) <= 8 for rank in (document.metadata.get("query_candidate_ranks") or {}).values())
+            for document in candidates
         )
         usage = self._retriever.drain_usage()
         stage_complete(
@@ -522,6 +606,9 @@ class RetrievalNodesMixin:
                 "fused_candidate_count": len(fused_candidates),
                 "prefiltered_count": len(fused_candidates) - len(responsive),
                 "prefiltered_reasons": prefilter_reasons,
+                "query_variant_count": len(state["queries"]),
+                "queries_with_preserved_candidates": len(preserved_query_indexes),
+                "preserved_candidate_count": preserved_candidate_count,
                 "entity_vocabulary_size": len(self._vocabulary.entities),
                 "entity_capability": (
                     "enabled" if self._vocabulary.entities else "disabled"
@@ -630,6 +717,7 @@ class RetrievalNodesMixin:
         inventory_question = is_inventory_question(self._request.question)
         all_candidates = list(candidates)
         rerank_query = state.get("rerank_query", self._request.question)
+        rerank_queries = state.get("rerank_queries", (rerank_query,))
         # CODE_ASSISTED is the default route -- anything that is not an overview,
         # an inventory, an implementation or a delivery question lands here -- so a
         # hard-coded 4 was the tightest evidence limit in the system and applied to
@@ -766,15 +854,23 @@ class RetrievalNodesMixin:
                 self._request.question,
             )
         elif procedural_question:
-            documents = await rerank_source_families(
-                self._reranker,
-                rerank_query,
-                candidates,
+            ranked_groups = [
+                await rerank_source_families(
+                    self._reranker, query, candidates, top_n=result_top_n
+                )
+                for query in rerank_queries
+            ]
+            documents = _fuse_reranked_groups(
+                ranked_groups,
                 top_n=result_top_n,
+                rank_fusion_k=self._settings.rank_fusion_k,
             )
         elif state.get("query_intent") == "CODE_ASSISTED":
             documents = await self._rerank_code_assisted(
-                rerank_query, candidates, intent_source_limit
+                rerank_query,
+                candidates,
+                intent_source_limit,
+                rerank_queries=rerank_queries,
             )
         elif state.get("query_intent") == "STRUCTURED_INVENTORY":
             documents = await self._rerank_code_assisted(
@@ -935,6 +1031,64 @@ class RetrievalNodesMixin:
             top_n=result_top_n,
             enumeration=inventory_question,
         )
+        pre_reconstruction_count = len(documents)
+        if state.get("reconstruct_parent_records") or state.get("query_intent") in {
+            "STRUCTURED_ENTITY",
+            "STRUCTURED_INVENTORY",
+        }:
+            documents = await self._reconstruct_parent_records(
+                documents, state.get("source_types", ())
+            )
+        else:
+            documents = documents[:result_top_n]
+        post_reconstruction_count = len(documents)
+        requested_entities = {
+            str(entity).casefold()
+            for entity in self._vocabulary.entities
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(str(entity))}(?![A-Za-z0-9_])",
+                state.get("resolved_question", self._request.question),
+                re.IGNORECASE,
+            )
+        }
+        declared_entities: set[str] = set()
+        for document in documents:
+            declared = str(document.metadata.get("entity") or "").casefold().strip()
+            if declared:
+                declared_entities.add(declared)
+                continue
+            identity_text = " ".join(
+                str(document.metadata.get(field) or "")
+                for field in ("title", "path", "reference")
+            )
+            declared_entities.update(
+                str(entity).casefold()
+                for entity in self._vocabulary.entities
+                if re.search(
+                    rf"(?<![A-Za-z0-9_]){re.escape(str(entity))}(?![A-Za-z0-9_])",
+                    identity_text,
+                    re.IGNORECASE,
+                )
+            )
+        uncertain_entity = str(state.get("uncertain_entity_token") or "")
+        entity_mismatch = (
+            len(requested_entities) == 1
+            and len(declared_entities) == 1
+            and requested_entities.isdisjoint(declared_entities)
+            and all(str(document.metadata.get("entity") or "").strip() for document in documents)
+        )
+        uncertain_mismatch = bool(
+            uncertain_entity and len(declared_entities) == 1 and declared_entities
+        )
+        entity_mismatch = entity_mismatch or uncertain_mismatch
+        mismatch_requested = (
+            uncertain_entity
+            if uncertain_mismatch
+            else next(iter(requested_entities), "") if entity_mismatch else ""
+        )
+        mismatch_suggested = next(iter(declared_entities), "") if entity_mismatch else ""
+        if entity_mismatch:
+            documents = []
         stage_complete(
             "rerank",
             self._request.project_id,
@@ -998,9 +1152,70 @@ class RetrievalNodesMixin:
                 "source_type_scope_bypassed": int(
                     getattr(self, "_last_source_type_scope_bypassed", False)
                 ),
+                "pre_reconstruction_count": pre_reconstruction_count,
+                "post_reconstruction_count": post_reconstruction_count,
+                "entity_mismatch_clarification": entity_mismatch,
             },
         )
-        return {"documents": documents}
+        return {
+            "documents": documents,
+            "entity_mismatch_requested": mismatch_requested,
+            "entity_mismatch_suggested": mismatch_suggested,
+        }
+
+    async def _reconstruct_parent_records(
+        self, documents: list[Document], source_types: tuple[str, ...]
+    ) -> list[Document]:
+        """Replace matching chunks with their complete authorized parent version."""
+
+        loader = getattr(self._retriever, "ainvoke_source_siblings", None)
+        parent_ids = {
+            str(document.metadata.get("parent_id") or "")
+            for document in documents
+            if document.metadata.get("parent_id")
+        }
+        if loader is None or not parent_ids:
+            return documents
+        siblings = await loader(
+            tuple(dict.fromkeys(parent_ids)),
+            source_types,
+        )
+        matching = deduplicate_authoritative_versions(
+            [*documents, *siblings],
+            SourcePolicyRegistry.from_categories(
+                _document_source_type(document) for document in [*documents, *siblings]
+            ),
+        )
+        matching = [
+            document
+            for document in matching
+            if str(document.metadata.get("parent_id") or "") in parent_ids
+        ]
+        if not matching:
+            return documents
+        by_parent: dict[str, list[Document]] = {}
+        for document in matching:
+            key = str(document.metadata.get("parent_id") or "")
+            by_parent.setdefault(key, []).append(document)
+        result: list[Document] = []
+        seen_chunks: set[str] = set()
+        emitted_parents: set[str] = set()
+        for anchor in documents:
+            key = str(anchor.metadata.get("parent_id") or "")
+            family = by_parent.get(key, [anchor]) if key else [anchor]
+            if key in emitted_parents:
+                continue
+            emitted_parents.add(key)
+            for document in sorted(
+                family, key=lambda item: int(item.metadata.get("chunk_ordinal") or 0)
+            ):
+                identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
+                    (document.page_content + str(document.metadata.get("reference") or "")).encode()
+                ).hexdigest()
+                if identity not in seen_chunks:
+                    seen_chunks.add(identity)
+                    result.append(document)
+        return result
 
     async def _rerank_cross_source(
         self, query: str, candidates: list[Document]
@@ -1034,12 +1249,15 @@ class RetrievalNodesMixin:
             for group in groups:
                 if rank < len(group):
                     merged.append(group[rank])
-        merged, bypassed = preserve_non_empty(candidates, merged)
-        self._last_source_type_scope_bypassed = bypassed
         return merged
 
     async def _rerank_code_assisted(
-        self, query: str, candidates: list[Document], source_limit: int
+        self,
+        query: str,
+        candidates: list[Document],
+        source_limit: int,
+        *,
+        rerank_queries: tuple[str, ...] = (),
         ) -> list[Document]:
         """Rank documentation and code together on relevance, with no reserved slots.
 
@@ -1053,21 +1271,28 @@ class RetrievalNodesMixin:
 
         # Removing the per-family quota must not remove the family *scope*. This
         # route answers from documentation and code; delivery tickets belong to
-        # DELIVERY. preserve_non_empty keeps the scope fail-open.
+        # DELIVERY. An empty scoped set must remain empty and fail closed.
         scoped = [
             document
             for document in candidates
             if _document_source_type(document) in {"PAGE", "CODE"}
         ]
-        scoped, scope_bypassed = preserve_non_empty(candidates, scoped)
         selected: list[Document] = []
         if scoped:
             try:
-                selected = await self._reranker.rerank(
-                    query,
-                    scoped,
+                groups = [
+                    await self._reranker.rerank(
+                        rerank_query,
+                        scoped,
+                        top_n=self._settings.mixed_source_top_n,
+                        max_chunks_per_source=source_limit,
+                    )
+                    for rerank_query in (rerank_queries or (query,))
+                ]
+                selected = _fuse_reranked_groups(
+                    groups,
                     top_n=self._settings.mixed_source_top_n,
-                    max_chunks_per_source=source_limit,
+                    rank_fusion_k=self._settings.rank_fusion_k,
                 )
             except TypeError as error:
                 if "top_n" not in str(error):
@@ -1092,8 +1317,7 @@ class RetrievalNodesMixin:
             )
             for index, document in zip(code_slots, ordered_code):
                 selected[index] = document
-        selected, empty_bypassed = preserve_non_empty(scoped, selected)
-        self._last_source_type_scope_bypassed = scope_bypassed or empty_bypassed
+        self._last_source_type_scope_bypassed = False
         return selected
 
     async def _rerank_project_overview(

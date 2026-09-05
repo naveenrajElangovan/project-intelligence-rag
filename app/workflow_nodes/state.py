@@ -5,7 +5,7 @@ from typing import TypedDict
 from langchain_core.documents import Document
 
 from app.llm import GroundedAnswer
-from app.models import RagRequest
+from app.models import RagRequest, ResolvedRequest
 
 class RagState(TypedDict, total=False):
     _workflow: object
@@ -28,12 +28,14 @@ class RagState(TypedDict, total=False):
     query_intent: str
     overview_entity: str
     rerank_query: str
+    rerank_queries: tuple[str, ...]
     project_rerank_queries: tuple[str, ...]
     source_types: tuple[str, ...]
     source_route: str
     # Set when recovery widened a source scope that returned no candidates.
     source_scope_widened: bool
     resolved_question: str
+    resolved_request: ResolvedRequest
     query_quality: str
     query_quality_reason: str
     lexical_candidate_count: int
@@ -47,7 +49,14 @@ class RagState(TypedDict, total=False):
     context_failure_reason: str
     coverage_expected: int
     coverage_expected_identifiers: tuple[str, ...]
+    coverage_expected_fields: tuple[str, ...]
     coverage_covered: int
     coverage_missing: tuple[str, ...]
+    coverage_missing_fields: tuple[str, ...]
     population_retrieval_miss: bool
     stream_truncated: bool
+    output_gate_applied: bool
+    reconstruct_parent_records: bool
+    entity_mismatch_requested: str
+    entity_mismatch_suggested: str
+    uncertain_entity_token: str

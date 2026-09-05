@@ -6,6 +6,7 @@ import re
 from langgraph.config import get_stream_writer
 
 from app.llm import BilingualQueryPlanner, GroundedAnswer, TokenUsage, answer_sentence_floor
+from app.grounding_contract import evidence_facts, render_structured_facts
 from app.telemetry import stage_complete, started
 from app.table_evidence import contains_table
 from app.workflow_nodes.state import RagState
@@ -26,7 +27,10 @@ from app.workflow_support.answer_structure import (
 )
 from app.workflow_support.inventory_intent import is_inventory_question
 from app.workflow_support.identifiers import member_identifiers
-from app.workflow_support.filtering import preserve_non_empty
+from app.workflow_support.conversation import (
+    _conversation_subject,
+    _subject_matches_vocabulary,
+)
 from app.workflow_support.completeness import (
     _answer_requirements,
     _completeness_repair_query,
@@ -43,6 +47,8 @@ from app.workflow_support.deterministic_answers import (
     _deterministic_identifier_answer,
     _deterministic_structured_inventory_answer,
     _feature_inventory_answer_verified,
+    structured_entity_aliases,
+    structured_entity_field_names,
 )
 from app.workflow_support.query_analysis import (
     _add_usage,
@@ -108,6 +114,24 @@ def _list_response_requested(question: str) -> bool:
             r"\b(?:list|listado|lista|enumerate|enumerar|all|every|each|todos|todas|cada)\b",
             normalized,
         )
+    )
+
+
+def _referential_transformation_requested(
+    question: str,
+    resolved_question: str,
+    vocabulary: tuple[str, ...],
+    history: list[object],
+) -> bool:
+    """Detect a request that transforms the prior answer rather than changing subject."""
+
+    if question == resolved_question or not vocabulary or not any(
+        getattr(message, "role", "") == "assistant" for message in history
+    ):
+        return False
+    candidate_subject = _conversation_subject(question)
+    return bool(candidate_subject) and not _subject_matches_vocabulary(
+        candidate_subject, vocabulary
     )
 
 
@@ -1235,12 +1259,11 @@ def _scope_documents_to_entity(
             )
             continue
         scoped.append(document)
-    scoped, scope_bypassed = preserve_non_empty(documents, scoped)
     return (
         scoped,
         excluded,
         entity_excluded_titles,
-        scope_bypassed,
+        False,
     )
 
 
@@ -1295,6 +1318,7 @@ class AnswerNodesMixin:
                 answer_question, self._vocabulary.entities
             )
         inventory_question = is_inventory_question(answer_question)
+        resolved_request = state.get("resolved_request")
         if inventory_question or state.get("query_intent") in {
             "STRUCTURED_INVENTORY",
             "PROJECT_OVERVIEW",
@@ -1317,6 +1341,7 @@ class AnswerNodesMixin:
                 scope_bypassed,
             ) = _scope_documents_to_entity(retrieved_documents, requested_entity)
         coverage_expected_keys: tuple[str, ...] = ()
+        coverage_expected_fields: tuple[str, ...] = ()
         population_retrieval_miss = False
         if inventory_question:
             population_loader = getattr(self._retriever, "ainvoke_population", None)
@@ -1412,6 +1437,21 @@ class AnswerNodesMixin:
                 population_documents,
                 top_n=len(documents) + len(coverage_expected_keys),
             )
+        if resolved_request is not None and resolved_request.completeness.all_fields:
+            exact_loader = getattr(self._retriever, "ainvoke_exact_identifiers", None)
+            aliases = structured_entity_aliases(answer_question, documents)
+            if exact_loader is not None and aliases:
+                exact_documents = await exact_loader(
+                    aliases, state.get("source_types", ())
+                )
+                documents = _merge_ranked_documents(
+                    exact_documents,
+                    documents,
+                    top_n=len(exact_documents) + len(documents),
+                )
+            coverage_expected_fields = structured_entity_field_names(
+                answer_question, documents
+            )
         structured_tabular_evidence = _structured_tabular_evidence(documents)
         comparison_subjects = _comparison_subjects(
             answer_question, self._vocabulary.entities
@@ -1466,6 +1506,13 @@ class AnswerNodesMixin:
                 f"identifiers are: {', '.join(coverage_expected_keys)}. Never summarize "
                 "this population with 'such as'."
             )
+        if coverage_expected_fields:
+            generation_question = (
+                f"{generation_question}\n\nExhaustive field contract: exactly "
+                f"{len(coverage_expected_fields)} serialized fields are declared for this entity. "
+                "Include every field exactly once. The expected fields are: "
+                f"{', '.join(coverage_expected_fields)}."
+            )
         answer_question = _expand_standalone_identifier_question(
             generation_question, documents
         )
@@ -1488,7 +1535,7 @@ class AnswerNodesMixin:
         )
         if destination_answer is not None:
             generated = destination_answer
-        if state.get("query_intent") == "STRUCTURED_INVENTORY":
+        if state.get("query_intent") in {"STRUCTURED_INVENTORY", "STRUCTURED_ENTITY"}:
             if destination_answer is None:
                 generated = _deterministic_structured_inventory_answer(
                     answer_question,
@@ -1522,6 +1569,12 @@ class AnswerNodesMixin:
             generated = _deterministic_population_inventory_answer(
                 coverage_expected_keys, documents
             )
+        if (
+            generated is None
+            and resolved_request is not None
+            and resolved_request.expected_answer_shape in {"STRUCTURED", "COMPARISON"}
+        ):
+            generated = render_structured_facts(evidence_facts(documents))
         deterministic = generated is not None
         generation_temperature = 0.0
         answer_style = "concise"
@@ -1705,8 +1758,36 @@ class AnswerNodesMixin:
                 getattr(self._generator, "last_temperature", 0.0)
             )
         generation_usage = TokenUsage() if deterministic else self._generator.last_usage
+        user_transformation_repaired = False
+        # Every repair below is a second full evidence prefill on the one model
+        # slot, and each is retried. They can chain, so the budget is shared:
+        # the first shaping problem worth fixing gets fixed, and the rest are
+        # left to the validators rather than paid for in latency.
+        repairs_remaining = self._settings.max_answer_repairs
         if (
-            not deterministic
+            repairs_remaining > 0
+            and not deterministic
+            and _referential_transformation_requested(
+                self._request.question,
+                state.get("resolved_question") or self._request.question,
+                tuple(self._vocabulary.entities),
+                self._request.conversation_history,
+            )
+        ):
+            initial_usage = generation_usage
+            generated = await self._generator.repair(
+                answer_question,
+                documents,
+                state.get("language", "mixed"),
+                generated,
+                answer_style="user_requested_transformation",
+            )
+            generation_usage = _add_usage(initial_usage, self._generator.last_usage)
+            user_transformation_repaired = True
+            repairs_remaining -= 1
+        if (
+            repairs_remaining > 0
+            and not deterministic
             and list_response_requested
             and not re.search(r"(?m)^\s*(?:[-*]|\d+\.)\s+\S", generated.answer)
         ):
@@ -1720,9 +1801,11 @@ class AnswerNodesMixin:
             )
             generation_usage = _add_usage(initial_usage, self._generator.last_usage)
             list_style_repaired = True
+            repairs_remaining -= 1
         table_style_repaired = False
         if (
-            not deterministic
+            repairs_remaining > 0
+            and not deterministic
             and answer_style in {"structured_tabular", "comparison_table"}
             and (
                 answer_shape_metrics(generated.answer)["answer_table_count"] == 0
@@ -1739,8 +1822,11 @@ class AnswerNodesMixin:
             )
             generation_usage = _add_usage(initial_usage, self._generator.last_usage)
             table_style_repaired = True
+            repairs_remaining -= 1
         if (
-            not deterministic
+            repairs_remaining > 0
+            and not deterministic
+            and not user_transformation_repaired
             and state.get("query_intent") in {"ENTITY_OVERVIEW", "PROJECT_OVERVIEW"}
             and (
                 state.get("query_intent") == "PROJECT_OVERVIEW"
@@ -1761,6 +1847,7 @@ class AnswerNodesMixin:
             )
             generation_usage = _add_usage(initial_usage, self._generator.last_usage)
             overview_style_repaired = True
+            repairs_remaining -= 1
         generated = _normalize_citations(generated)
         if not (
             self._settings.incremental_verified_streaming_enabled
@@ -1779,6 +1866,9 @@ class AnswerNodesMixin:
             generated, answer_style
         )
         coverage_missing = _coverage(coverage_expected_keys, generated.answer)
+        coverage_missing_fields = _coverage(
+            coverage_expected_fields, generated.answer
+        )
         stage_complete(
             "generate",
             self._request.project_id,
@@ -1802,6 +1892,8 @@ class AnswerNodesMixin:
                 if deterministic
                 else "OVERVIEW_STYLE_REPAIRED"
                 if overview_style_repaired
+                else "USER_TRANSFORMATION_REPAIRED"
+                if user_transformation_repaired
                 else "LIST_STYLE_REPAIRED"
                 if list_style_repaired
                 else "TABLE_STYLE_REPAIRED"
@@ -1832,6 +1924,7 @@ class AnswerNodesMixin:
                 "sibling_expanded_count": sibling_expanded_count,
                 "list_response_requested": list_response_requested,
                 "list_style_repaired": list_style_repaired,
+                "user_transformation_repaired": user_transformation_repaired,
                 "table_style_repaired": table_style_repaired,
                 "answer_shape_selected": answer_shape_selected,
                 "answer_shape_reason": answer_shape_reason,
@@ -1839,6 +1932,10 @@ class AnswerNodesMixin:
                 "coverage_expected": len(coverage_expected_keys),
                 "coverage_covered": len(coverage_expected_keys) - len(coverage_missing),
                 "coverage_missing": list(coverage_missing),
+                "field_coverage_expected": len(coverage_expected_fields),
+                "field_coverage_covered": len(coverage_expected_fields)
+                - len(coverage_missing_fields),
+                "field_coverage_missing": list(coverage_missing_fields),
                 "population_retrieval_miss": population_retrieval_miss,
                 "documents_dropped": int(
                     getattr(self._generator, "last_documents_dropped", 0)
@@ -1876,6 +1973,8 @@ class AnswerNodesMixin:
             "coverage_expected_identifiers": coverage_expected_keys,
             "coverage_covered": len(coverage_expected_keys) - len(coverage_missing),
             "coverage_missing": coverage_missing,
+            "coverage_expected_fields": coverage_expected_fields,
+            "coverage_missing_fields": coverage_missing_fields,
             "population_retrieval_miss": population_retrieval_miss,
             "stream_truncated": bool(
                 getattr(self._generator, "last_stream_truncated", False)
@@ -2348,6 +2447,8 @@ class AnswerNodesMixin:
         population_missing = _coverage(
             population_expected, state["generated"].answer
         )
+        field_expected = tuple(state.get("coverage_expected_fields", ()))
+        field_missing = _coverage(field_expected, state["generated"].answer)
         population_summary_violation = bool(population_expected) and bool(
             re.search(r"\bsuch as\b", state["generated"].answer, flags=re.IGNORECASE)
         )
@@ -2376,6 +2477,9 @@ class AnswerNodesMixin:
                 "coverage_expected": len(population_expected),
                 "coverage_covered": len(population_expected) - len(population_missing),
                 "coverage_missing": list(population_missing),
+                "field_coverage_expected": len(field_expected),
+                "field_coverage_covered": len(field_expected) - len(field_missing),
+                "field_coverage_missing": list(field_missing),
                 "population_summary_violation": population_summary_violation,
                 "query_intent": state.get("query_intent", "DIRECT"),
                 "source_route": state.get("source_route", "MIXED"),
@@ -2403,6 +2507,8 @@ class AnswerNodesMixin:
             "coverage_expected": len(population_expected),
             "coverage_covered": len(population_expected) - len(population_missing),
             "coverage_missing": population_missing,
+            "coverage_expected_fields": field_expected,
+            "coverage_missing_fields": field_missing,
             "repaired": state.get("repaired", False)
             or reason_code in {"REPAIRED_SUPPORTED", "CLAIMS_REMOVED_SUPPORTED"},
         }

@@ -1620,6 +1620,163 @@ def test_direct_conversation_question_does_not_need_resolution() -> None:
     assert workflow_module._conversation_resolution_needed("Who is their owner?") is True
 
 
+def test_event_attribute_followup_keeps_entity_and_does_not_route_to_jira() -> None:
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="what status will pass here?",
+        accessPolicyIds=["project:DEMO"],
+        conversationContext={
+            "activeSubject": "LOGIN_POS_EVENT",
+            "stateRevision": 21,
+        },
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow.__new__(
+        workflow_module.AuthorizedRagWorkflow
+    )
+    workflow._request = request
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = CorpusVocabulary(entities=("pos", "bot"))
+
+    resolved = asyncio.run(
+        workflow._resolve_conversation_question(request.question, "en")
+    )
+    update = workflow._conversation_context_update(
+        {"resolved_question": resolved, "query_intent": "CODE_ASSISTED"}
+    )
+
+    assert resolved.endswith("(previous subject: LOGIN_POS_EVENT)")
+    assert workflow_module._source_route_intent(resolved) == "CODE_ASSISTED"
+    assert update.active_subject == "LOGIN_POS_EVENT"
+
+
+def test_event_attribute_value_followup_plans_code_only_evidence() -> None:
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="what status will pass here?",
+        accessPolicyIds=["project:DEMO"],
+        conversationContext={"activeSubject": "LOGIN_POS_EVENT", "stateRevision": 21},
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow.__new__(
+        workflow_module.AuthorizedRagWorkflow
+    )
+    workflow._request = request
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = CorpusVocabulary(
+        entities=("pos", "bot"), source_types=("PAGE", "CODE", "ISSUE")
+    )
+
+    planned = asyncio.run(workflow._plan_queries({"request": request}))
+
+    assert planned["resolved_question"].endswith(
+        "(previous subject: LOGIN_POS_EVENT)"
+    )
+    assert planned["query_intent"] == "IMPLEMENTATION"
+    assert planned["source_types"] == ("CODE",)
+    assert planned["source_route"] == "GITHUB"
+
+
+def test_named_subtopic_fragment_keeps_the_prior_workflow_predicate() -> None:
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="Backend of Trade (BOT) flow?",
+        accessPolicyIds=["project:DEMO"],
+        conversationHistory=[
+            {"role": "user", "content": "How does POS perform cash reliefs?"},
+            {
+                "role": "assistant",
+                "content": (
+                    "POS supports manual relief and Backend of Trade (BOT) "
+                    "requested relief during the cash-relief workflow."
+                ),
+            },
+        ],
+        conversationContext={
+            "activeSubject": "POS perform cash reliefs",
+            "stateRevision": 22,
+        },
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow.__new__(
+        workflow_module.AuthorizedRagWorkflow
+    )
+    workflow._request = request
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = CorpusVocabulary(entities=("pos", "bot"))
+
+    resolved = asyncio.run(
+        workflow._resolve_conversation_question(request.question, "en")
+    )
+
+    assert resolved == (
+        "Backend of Trade (BOT) flow? "
+        "(previous subject: POS perform cash reliefs)"
+    )
+
+
+def test_named_subtopic_planning_requires_both_child_and_parent_focus() -> None:
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="Backend of Trade (BOT) flow?",
+        accessPolicyIds=["project:DEMO"],
+        conversationHistory=[
+            {"role": "user", "content": "How does POS perform cash reliefs?"},
+            {
+                "role": "assistant",
+                "content": "Cash relief supports a Backend of Trade (BOT) request.",
+            },
+        ],
+        conversationContext={"activeSubject": "POS cash reliefs"},
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow.__new__(
+        workflow_module.AuthorizedRagWorkflow
+    )
+    workflow._request = request
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = CorpusVocabulary(
+        entities=("pos", "bot"), source_types=("PAGE", "CODE", "ISSUE")
+    )
+
+    planned = asyncio.run(workflow._plan_queries({"request": request}))
+
+    assert planned["resolved_question"] == (
+        "Backend of Trade (BOT) flow specifically within POS cash reliefs?"
+    )
+    assert planned["rerank_query"] == planned["resolved_question"]
+    assert planned["query_intent"] == "CODE_ASSISTED"
+    assert planned["source_types"] == ("PAGE", "CODE")
+    assert all("POS cash reliefs" in query for query in planned["queries"])
+    assert all("Backend of Trade (BOT) flow" in query for query in planned["queries"])
+
+
+def test_complete_question_about_named_topic_does_not_inherit_old_predicate() -> None:
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="How does the BOT authentication flow work?",
+        accessPolicyIds=["project:DEMO"],
+        conversationHistory=[
+            {"role": "user", "content": "How does POS perform cash reliefs?"},
+            {"role": "assistant", "content": "BOT can request a cash relief."},
+        ],
+        conversationContext={"activeSubject": "POS cash reliefs"},
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow.__new__(
+        workflow_module.AuthorizedRagWorkflow
+    )
+    workflow._request = request
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = CorpusVocabulary(entities=("pos", "bot"))
+
+    resolved = asyncio.run(
+        workflow._resolve_conversation_question(request.question, "en")
+    )
+
+    assert resolved == request.question
+
+
 def test_followup_modifiers_are_not_misclassified_as_a_new_subject() -> None:
     assert workflow_module._conversation_subject("yes what it do specifically") == ""
     assert workflow_module._conversation_subject("okay, explain it further") == ""
@@ -1654,6 +1811,62 @@ def test_specific_followup_keeps_and_classifies_the_active_subject(monkeypatch) 
     assert planned["query_intent"] == "ENTITY_OVERVIEW"
     assert planned["overview_entity"] == "pos"
     assert all("POS" in query for query in planned["queries"])
+
+
+def test_referential_reformat_request_keeps_the_active_subject(monkeypatch) -> None:
+    class UnexpectedConversationResolver:
+        def __init__(self, *_args) -> None:
+            raise AssertionError("The active subject resolves this without a model call.")
+
+    monkeypatch.setattr(
+        workflow_module, "ConversationQueryResolver", UnexpectedConversationResolver
+    )
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="can you give the same answer in points?",
+        accessPolicyIds=["project:DEMO"],
+        conversationHistory=[
+            {"role": "user", "content": "Give me overall details about POS."},
+            {"role": "assistant", "content": "POS details were provided with citations."},
+        ],
+        conversationContext={"activeSubject": "POS application", "stateRevision": 2},
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow.__new__(
+        workflow_module.AuthorizedRagWorkflow
+    )
+    workflow._request = request
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = CorpusVocabulary(entities=("pos", "bot"))
+    workflow._query_planner_factory = UnexpectedConversationResolver
+
+    planned = asyncio.run(workflow._plan_queries({"request": request}))
+
+    assert planned["resolved_question"] == (
+        "can you give the same answer in points? (previous subject: POS application)"
+    )
+    assert planned["query_intent"] == "ENTITY_OVERVIEW"
+    assert planned["overview_entity"] == "pos"
+    assert all("POS" in query for query in planned["queries"])
+
+
+def test_referential_transformation_detection_is_vocabulary_driven() -> None:
+    from app.workflow_nodes.answering import _referential_transformation_requested
+
+    history = [type("Message", (), {"role": "assistant"})()]
+
+    assert _referential_transformation_requested(
+        "can you give the same answer in points?",
+        "can you give the same answer in points? (previous subject: POS application)",
+        ("pos", "bot"),
+        history,
+    )
+    assert not _referential_transformation_requested(
+        "How does BOT work and where is it used?",
+        "How does BOT work and where is it used?",
+        ("pos", "bot"),
+        history,
+    )
 
 
 def test_existing_noisy_subject_is_cleaned_during_followup_resolution() -> None:
@@ -1884,9 +2097,8 @@ def test_unscoped_code_assisted_still_issues_a_dense_request(monkeypatch) -> Non
     type so a small family cannot be buried by a large one. With no scope at all
     that fan-out had nothing to iterate, so it produced an empty request list and
     the dense arm never executed: retrieval fell back to the lexical sample while
-    still reporting `reason_code: OK`. The implementation-flow planner branch
-    returns exactly this combination (query_intent CODE_ASSISTED, source_types ()),
-    as does recovery after it widens a scope that returned nothing.
+    still reporting `reason_code: OK`. An intentionally unrestricted planner route
+    still uses one mixed-scope request; recovery never broadens a selected scope.
     """
 
     scopes_requested: list[tuple[str, ...]] = []

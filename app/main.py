@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from contextlib import suppress
 import json
 import logging
 import os
@@ -20,7 +21,8 @@ from app.llm import (
     no_access_answer,
     pipeline_unavailable_answer,
 )
-from app.models import RagRequest, RagResponse
+from app.models import AnswerStatus, Coverage, RagRequest, RagResponse
+from app.openinference_tracing import configure_openinference
 from app.embedding import build_embedder, warm_embedder
 from app.reranking import build_reranker
 from app.retrieval import warm_authorized_lexical_corpora
@@ -30,44 +32,156 @@ from app.workflow import AuthorizedRagWorkflow, detect_query_language
 from app.telemetry import (
     configure_telemetry_logging,
     new_request_id,
+    admission_capacity,
     request_complete,
+    request_admitted,
     request_id,
+    request_released,
     reset_request_id,
+    request_shed,
     set_request_id,
     stage_complete,
     started,
 )
 
 
+def _cancellation_requested() -> bool:
+    """True when this task has been asked to stop.
+
+    `asyncio.wait_for` can surface an external cancellation as TimeoutError, and
+    a retry loop that treats every TimeoutError as "try again" then ignores the
+    request and runs forever -- a process alive and stuck on shutdown, which is
+    the same failure this module was rewritten to remove from startup.
+    """
+
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+async def _warm_lexical_corpora_until_ready(
+    application: FastAPI, settings: Settings, embedder: object
+) -> None:
+    """Warm the optional lexical cache without holding the ASGI lifespan open."""
+
+    while not application.state.lexical_corpus_ready:
+        try:
+            await asyncio.wait_for(
+                warm_authorized_lexical_corpora(settings, embedder),
+                timeout=settings.lexical_corpus_warm_timeout_seconds,
+            )
+            application.state.lexical_corpus_ready = True
+            logging.getLogger("app.startup").info(
+                "The authorized lexical corpora are warm; RAG is ready."
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            if _cancellation_requested():
+                raise asyncio.CancelledError
+            logging.getLogger("app.startup").warning(
+                "The lexical corpus warm-up exceeded %.1fs; serving with the "
+                "corpus cold and retrying in %.1fs. Chroma at %s:%s is the "
+                "usual cause.",
+                settings.lexical_corpus_warm_timeout_seconds,
+                settings.lexical_corpus_warm_retry_seconds,
+                settings.chroma_host,
+                settings.chroma_port,
+            )
+        except Exception as failure:
+            if _cancellation_requested():
+                raise asyncio.CancelledError
+            logging.getLogger("app.startup").warning(
+                "The lexical corpus warm-up failed (%s: %s); serving with the "
+                "corpus cold and retrying in %.1fs. Chroma at %s:%s is the "
+                "usual cause.",
+                type(failure).__name__,
+                failure,
+                settings.lexical_corpus_warm_retry_seconds,
+                settings.chroma_host,
+                settings.chroma_port,
+            )
+        await asyncio.sleep(settings.lexical_corpus_warm_retry_seconds)
+
+
+async def _warm_or_report(name: str, awaitable) -> None:
+    """Run a startup warm-up, downgrading any failure to a log line."""
+
+    try:
+        await awaitable
+    except asyncio.CancelledError:
+        raise
+    except Exception as failure:
+        logging.getLogger("app.startup").warning(
+            "The %s warm-up failed (%s: %s); serving cold. /ready stays 503 "
+            "while its dependency is unavailable.",
+            name,
+            type(failure).__name__,
+            failure,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_application: FastAPI):
-    """Warm latency-sensitive local models, then serve requests."""
+    """Warm local models and recover optional caches without blocking liveness."""
 
     settings = get_settings()
+    tracer_provider = configure_openinference(settings)
     _application.state.lexical_corpus_ready = not (
         settings.lexical_fallback_enabled
         and settings.warm_lexical_corpus_on_startup
     )
     if settings.warm_local_models_on_startup:
         reranker = build_reranker(settings)
-        await reranker.rerank(
-            "project knowledge",
-            [
-                Document(
-                    page_content="Project knowledge warm-up sample.",
-                    metadata={"source_id": "startup-warmup", "score": 1.0},
-                )
-            ],
-            score_threshold=0.0,
-            top_n=1,
+        # Warming is an optimisation, never a precondition. When scoring is
+        # delegated to the accelerator this is a call to another process, and
+        # letting it raise here would make the container exit and -- under
+        # `restart: unless-stopped` -- crash-loop for as long as that worker is
+        # down. /ready already reports the accelerator, so the honest behaviour
+        # is to serve, stay unready, and recover on its own.
+        await _warm_or_report(
+            "reranker",
+            reranker.rerank(
+                "project knowledge",
+                [
+                    Document(
+                        page_content="Project knowledge warm-up sample.",
+                        metadata={"source_id": "startup-warmup", "score": 1.0},
+                    )
+                ],
+                score_threshold=0.0,
+                top_n=1,
+            ),
         )
     embedder = build_embedder(settings)
     if settings.warm_local_embedder_on_startup:
-        warm_embedder(embedder)
+        # to_thread because warm_embedder is synchronous and, against the
+        # accelerator, performs a blocking socket read. On the event loop it
+        # stalls everything else in startup, including liveness.
+        await _warm_or_report(
+            "embedder", asyncio.to_thread(warm_embedder, embedder)
+        )
+    warm_task = None
     if settings.lexical_fallback_enabled and settings.warm_lexical_corpus_on_startup:
-        await warm_authorized_lexical_corpora(settings, embedder)
-        _application.state.lexical_corpus_ready = True
-    yield
+        # Never await a downstream from inside startup. The ASGI server can expose
+        # /health immediately, while /ready remains 503 until this task succeeds.
+        # If Chroma comes back later, the task retries and readiness self-recovers.
+        warm_task = asyncio.create_task(
+            _warm_lexical_corpora_until_ready(_application, settings, embedder),
+            name="warm-authorized-lexical-corpora",
+        )
+    try:
+        yield
+    finally:
+        if warm_task is not None:
+            warm_task.cancel()
+            # Bounded on purpose. Shutdown must complete even if this task finds
+            # another way to lose its cancellation; a stuck shutdown is as bad
+            # as a stuck startup.
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(warm_task, timeout=5)
+        if tracer_provider is not None:
+            await asyncio.to_thread(tracer_provider.shutdown)
 
 
 def create_app() -> FastAPI:
@@ -112,25 +226,59 @@ LOGGER = logging.getLogger("project_intelligence.rag.stages")
 _REQUEST_SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
 
 
-async def _acquire_request_slot(settings: Settings) -> asyncio.Semaphore:
+class _RequestSlot:
+    def __init__(self, semaphore: asyncio.Semaphore) -> None:
+        self._semaphore = semaphore
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._semaphore.release()
+        request_released()
+
+
+async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
     """Acquire capacity before retrieval or reject the request immediately."""
 
     loop = asyncio.get_running_loop()
-    key = (id(loop), settings.max_inflight_requests)
-    semaphore = _REQUEST_SEMAPHORES.setdefault(
-        key, asyncio.Semaphore(settings.max_inflight_requests)
-    )
+    # Every locally served request uses the shared MPS reranker, and local model
+    # generation is bounded by the same configured capacity. Admitting a wider
+    # request window only moves the queue inside expensive stages, where requests
+    # compete for unified memory and turn normal seconds into minute-long tail
+    # latency. Shed excess work at the request boundary instead.
+    capacity = settings.max_inflight_requests
+    if settings.local_inference_enabled:
+        capacity = min(capacity, settings.local_max_concurrency)
+    key = (id(loop), capacity)
+    if key not in _REQUEST_SEMAPHORES:
+        _REQUEST_SEMAPHORES[key] = asyncio.Semaphore(capacity)
+        admission_capacity(capacity)
+        if capacity < settings.max_inflight_requests:
+            LOGGER.info(
+                "Admission capacity is %d, clamped from PI_RAG_MAX_INFLIGHT_"
+                "REQUESTS=%d by PI_RAG_LOCAL_MAX_CONCURRENCY=%d. Requests beyond "
+                "it are shed with 503, not queued.",
+                capacity,
+                settings.max_inflight_requests,
+                settings.local_max_concurrency,
+            )
+    semaphore = _REQUEST_SEMAPHORES[key]
+    admission_began = started()
     try:
         await asyncio.wait_for(
             semaphore.acquire(), timeout=settings.load_shed_wait_seconds
         )
     except TimeoutError as failure:
+        request_shed(admission_began)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The project knowledge service is busy. Please retry shortly.",
             headers={"Retry-After": "1"},
         ) from failure
-    return semaphore
+    request_admitted(admission_began)
+    return _RequestSlot(semaphore)
 
 
 @app.middleware("http")
@@ -171,6 +319,17 @@ async def ready(settings: Settings = Depends(get_settings)) -> dict[str, str]:
         from chromadb import HttpClient
 
         await asyncio.to_thread(HttpClient(host=settings.chroma_host, port=settings.chroma_port).heartbeat)
+        if settings.local_accelerator_url:
+            from app.accelerator import accelerator_request
+
+            await asyncio.to_thread(
+                accelerator_request,
+                settings.local_accelerator_url,
+                "/health",
+                None,
+                api_key=settings.internal_api_key,
+                timeout_seconds=5,
+            )
         if settings.llm_provider == "ollama":
             async with httpx.AsyncClient(timeout=5) as client:
                 response = await client.get(
@@ -236,11 +395,15 @@ async def answer(request: RagRequest, settings: Settings = Depends(get_settings)
             language=language,
         )
         return RagResponse(
+            status=AnswerStatus.ACCESS_DENIED,
             answer=refusal,
             confidence="NONE",
             project_id=request.project_id,
             sources=[],
             missing_information=[],
+            coverage=Coverage.NOT_APPLICABLE,
+            failureReason="ACCESS_DENIED",
+            resolvedIntent="ACCESS_CHECK",
         )
     if (
         request.embedding_model not in settings.supported_embedding_models

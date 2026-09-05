@@ -14,6 +14,9 @@ dependencies = [
   "langchain-openai==1.5.1",
   "langgraph==1.2.11",
   "chromadb==1.5.2",
+  "openinference-instrumentation-langchain==0.1.73",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+  "opentelemetry-sdk==1.44.0",
   "prometheus-client==0.26.0",
   "pydantic-settings==2.15.0",
   "sentence-transformers==5.7.0",
@@ -22,6 +25,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.4,<9"]
+eval = [
+  "ragas==0.4.3",
+  # Ragas 0.4.3 still imports chat_models.vertexai; 0.4.2 removed it.
+  "langchain-community==0.4.1",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

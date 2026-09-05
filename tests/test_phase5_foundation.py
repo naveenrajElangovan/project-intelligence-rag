@@ -103,6 +103,28 @@ def test_load_shedding_rejects_before_waiting_for_work() -> None:
     asyncio.run(scenario())
 
 
+def test_local_inference_capacity_bounds_the_whole_request() -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            local_inference_enabled=True,
+            local_max_concurrency=1,
+            max_inflight_requests=4,
+            load_shed_wait_seconds=0.001,
+        )
+        slot = await _acquire_request_slot(settings)
+        try:
+            with pytest.raises(HTTPException) as failure:
+                await _acquire_request_slot(settings)
+            assert failure.value.status_code == 503
+        finally:
+            slot.release()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
 def test_degradation_is_explicit_and_defaults_to_empty() -> None:
     response = RagResponse(
         answer="Verified answer",
@@ -191,7 +213,7 @@ def test_code_assisted_passes_the_source_limit_to_the_reranker() -> None:
     assert seen.get("max_chunks_per_source") == 3
 
 
-def test_source_type_scope_cannot_empty_non_empty_candidates() -> None:
+def test_source_type_scope_never_falls_back_to_unrelated_candidates() -> None:
     class Reranker:
         async def rerank(self, _query, documents, **_kwargs):
             return list(documents)
@@ -211,5 +233,5 @@ def test_source_type_scope_cannot_empty_non_empty_candidates() -> None:
         )
     )
 
-    assert selected == candidates
-    assert workflow._last_source_type_scope_bypassed is True
+    assert selected == []
+    assert workflow._last_source_type_scope_bypassed is False

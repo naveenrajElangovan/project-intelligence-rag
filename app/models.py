@@ -1,3 +1,4 @@
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -57,7 +58,7 @@ class ConversationContext(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    version: int = Field(default=1, ge=1, le=10)
+    version: int = Field(default=2, ge=1, le=10)
     summary: str = Field(default="", max_length=2000)
     active_subject: str = Field(default="", alias="activeSubject", max_length=500)
     entities: list[ConversationEntity] = Field(default_factory=list, max_length=12)
@@ -73,7 +74,7 @@ class ConversationContextUpdate(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    version: int = Field(default=1, ge=1, le=10)
+    version: int = Field(default=2, ge=1, le=10)
     standalone_question: str = Field(alias="standaloneQuestion", min_length=2, max_length=4000)
     active_subject: str = Field(default="", alias="activeSubject", max_length=500)
     entities: list[ConversationEntity] = Field(default_factory=list, max_length=12)
@@ -144,13 +145,74 @@ class SourceReference(BaseModel):
     language: str | None = None
 
 
+class AnswerStatus(StrEnum):
+    """The only externally observable outcomes of a factual request."""
+
+    ANSWERED = "ANSWERED"
+    NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    SOURCE_CONFLICT = "SOURCE_CONFLICT"
+    ACCESS_DENIED = "ACCESS_DENIED"
+
+
+class Coverage(StrEnum):
+    COMPLETE = "COMPLETE"
+    PARTIAL = "PARTIAL"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class ResolvedEntity(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str = Field(default="subject", min_length=1, max_length=80)
+    value: str = Field(min_length=1, max_length=500)
+    canonical_id: str = Field(alias="canonicalId", min_length=1, max_length=500)
+
+
+class CompletenessRequirements(BaseModel):
+    all_items: bool = Field(default=False, alias="all")
+    all_fields: bool = Field(default=False, alias="allFields")
+    latest: bool = False
+    compare: bool = False
+
+
+class ResolvedRequest(BaseModel):
+    """Standalone, policy-bounded request produced before retrieval."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    standalone_request: str = Field(alias="standaloneRequest", min_length=2, max_length=4000)
+    intent: str = Field(min_length=1, max_length=80)
+    operation: str = Field(default="ANSWER", min_length=1, max_length=80)
+    referenced_entities: list[ResolvedEntity] = Field(
+        default_factory=list, alias="referencedEntities", max_length=20
+    )
+    allowed_source_categories: list[str] = Field(
+        default_factory=list, alias="allowedSourceCategories", max_length=50
+    )
+    expected_answer_shape: str = Field(
+        default="NARRATIVE", alias="expectedAnswerShape", max_length=40
+    )
+    completeness: CompletenessRequirements = Field(
+        default_factory=CompletenessRequirements
+    )
+
+
 class RagResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     answer: str
+    status: AnswerStatus = AnswerStatus.INSUFFICIENT_EVIDENCE
     confidence: str
     project_id: str = Field(alias="projectId")
     sources: list[SourceReference]
+    citations: list[SourceReference] = Field(default_factory=list)
+    resolved_intent: str = Field(default="", alias="resolvedIntent")
+    resolved_entities: list[ResolvedEntity] = Field(
+        default_factory=list, alias="resolvedEntities"
+    )
+    coverage: Coverage = Coverage.NOT_APPLICABLE
+    failure_reason: str | None = Field(default=None, alias="failureReason")
     missing_information: list[str] = Field(alias="missingInformation")
     evidence_status: str = Field(default="UNKNOWN", alias="evidenceStatus")
     context_quality: str = Field(default="UNKNOWN", alias="contextQuality")
@@ -161,3 +223,13 @@ class RagResponse(BaseModel):
     conversation_context_update: ConversationContextUpdate | None = Field(
         default=None, alias="conversationContextUpdate"
     )
+
+    @model_validator(mode="after")
+    def keep_legacy_sources_and_citations_compatible(self) -> "RagResponse":
+        """Expose the new citations field while preserving existing clients."""
+
+        if self.status == AnswerStatus.ANSWERED and self.sources and not self.citations:
+            self.citations = list(self.sources)
+        elif self.citations and not self.sources:
+            self.sources = list(self.citations)
+        return self

@@ -10,6 +10,7 @@ from typing import Any
 from langchain_core.documents import Document
 
 from app.config import Settings
+from app.accelerator import accelerator_scores
 from app.workflow_support.filtering import preserve_non_empty
 from app.retry import with_transient_retry
 from app.table_evidence import linearize_tables
@@ -35,10 +36,14 @@ def progressive_rerank_candidates(
         index, document = item
         metadata = document.metadata
         primary_rank = int(metadata.get("primary_query_rank") or 0)
+        query_rank = min(
+            (int(value) for value in (metadata.get("query_candidate_ranks") or {}).values()),
+            default=0,
+        )
         return (
             1.0 if metadata.get("identifier_anchor") else 0.0,
-            1.0 if primary_rank else 0.0,
-            float(-primary_rank) if primary_rank else float("-inf"),
+            1.0 if primary_rank or query_rank else 0.0,
+            float(-(primary_rank or query_rank)) if primary_rank or query_rank else float("-inf"),
             float(metadata.get("retrieval_fused_score", 0.0) or 0.0),
             float(metadata.get("fusion_score", 0.0) or 0.0),
             float(metadata.get("lexical_score", 0.0) or 0.0),
@@ -65,8 +70,10 @@ def progressive_rerank_candidates(
             selected_ids.add(identity)
 
     for document in ranked:
-        if document.metadata.get("identifier_anchor") or document.metadata.get(
-            "primary_query_rank"
+        if (
+            document.metadata.get("identifier_anchor")
+            or document.metadata.get("primary_query_rank")
+            or document.metadata.get("query_candidate_ranks")
         ):
             add(document)
 
@@ -99,6 +106,7 @@ class LocalMultilingualReranker:
         exact_code_retrieval_score_floor: float,
         max_chunks_per_source: int,
         batch_size: int = _DEFAULT_BATCH_SIZE,
+        max_length: int = 1024,
         linearize_table_evidence: bool = True,
     ) -> None:
         self._linearize_table_evidence = linearize_table_evidence
@@ -106,6 +114,7 @@ class LocalMultilingualReranker:
         self._device = device
         self._revision = revision
         self._batch_size = batch_size
+        self._max_length = max_length
         self._top_n = top_n
         self._threshold = score_threshold
         self._exact_code_threshold = exact_code_score_threshold
@@ -188,11 +197,69 @@ class LocalMultilingualReranker:
             revision=self._revision,
             pairs=pairs,
             batch_size=self._batch_size,
+            max_length=self._max_length,
         )
 
 
+class RemoteMultilingualReranker(LocalMultilingualReranker):
+    """Run identical cross-encoder pairs on the authenticated macOS worker."""
+
+    def __init__(
+        self,
+        *args,
+        base_url: str,
+        api_key: str,
+        timeout_seconds: float,
+        attempts: int = 1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._base_url = base_url
+        self._api_key = api_key
+        self._timeout_seconds = timeout_seconds
+        self._attempts = attempts
+
+    def _predict(self, query: str, documents: list[Document]):
+        pairs = [
+            (
+                query,
+                scoring_evidence(
+                    document.page_content,
+                    linearize_tables_enabled=self._linearize_table_evidence,
+                ),
+            )
+            for document in documents
+        ]
+        scores = accelerator_scores(
+            self._base_url,
+            pairs,
+            api_key=self._api_key,
+            timeout_seconds=self._timeout_seconds,
+            max_length=self._max_length,
+            attempts=self._attempts,
+        )
+        if len(scores) != len(documents):
+            raise RuntimeError("Local accelerator returned invalid reranker scores.")
+        return scores
+
+
 def build_reranker(settings: Settings):
-    return LocalMultilingualReranker(
+    reranker_type = (
+        RemoteMultilingualReranker
+        if settings.local_accelerator_url
+        else LocalMultilingualReranker
+    )
+    remote = (
+        {
+            "base_url": settings.local_accelerator_url,
+            "api_key": settings.internal_api_key,
+            "timeout_seconds": settings.local_accelerator_timeout_seconds,
+            "attempts": settings.local_accelerator_retry_attempts,
+        }
+        if settings.local_accelerator_url
+        else {}
+    )
+    return reranker_type(
         settings.local_rerank_model,
         device=settings.local_rerank_device,
         model_path=settings.local_models_path,
@@ -203,14 +270,18 @@ def build_reranker(settings: Settings):
         exact_code_retrieval_score_floor=settings.exact_code_retrieval_score_floor,
         max_chunks_per_source=settings.max_chunks_per_source,
         batch_size=settings.local_rerank_batch_size,
+        max_length=settings.local_rerank_max_length,
         linearize_table_evidence=settings.linearize_table_evidence,
+        **remote,
     )
 
 
-def _load_local_model(model_ref: str, device: str, revision: str):
+def _load_local_model(
+    model_ref: str, device: str, revision: str, max_length: int
+):
     expanded = Path(model_ref).expanduser()
     resolved = str(expanded) if expanded.exists() else model_ref
-    key = (resolved + "@" + revision, device)
+    key = (resolved + "@" + revision + f"#max_length={max_length}", device)
     with _LOCAL_MODELS_LOCK:
         if key in _LOCAL_MODELS:
             return _LOCAL_MODELS[key]
@@ -223,6 +294,7 @@ def _load_local_model(model_ref: str, device: str, revision: str):
         model = CrossEncoder(
             resolved,
             device=device,
+            max_length=max_length,
             trust_remote_code=False,
             local_files_only=True,
             revision=None if Path(resolved).exists() else revision,
@@ -238,6 +310,7 @@ def predict_local_scores(
     revision: str,
     pairs: list[tuple[str, str]],
     batch_size: int = _DEFAULT_BATCH_SIZE,
+    max_length: int = 1024,
 ):
     """Score text pairs with the pinned local cross-encoder and shared inference lock.
 
@@ -248,7 +321,7 @@ def predict_local_scores(
 
     if not pairs:
         return []
-    model = _load_local_model(model_ref, device, revision)
+    model = _load_local_model(model_ref, device, revision, max_length)
     with _LOCAL_INFERENCE_LOCK:
         return model.predict(
             pairs,
@@ -290,7 +363,11 @@ def scoring_evidence(value: str, *, linearize_tables_enabled: bool = True) -> st
     """
 
     cleaned = sanitize_evidence(value)
-    return linearize_tables(cleaned) if linearize_tables_enabled else cleaned
+    if not linearize_tables_enabled:
+        return cleaned
+    # Re-apply the bound after linearisation. Repeating a header on every row
+    # grows the text, so sizing only the input leaves the output unbounded.
+    return sanitize_evidence(linearize_tables(cleaned))
 
 
 def _exact_code_anchor_match(query: str, document: Document) -> bool:

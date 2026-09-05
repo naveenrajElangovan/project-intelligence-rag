@@ -10,6 +10,7 @@ from app.llm import GroundedAnswer, TokenUsage
 from app.lexical_tokens import subtokens
 from app.workflow_support.identifiers import member_identifiers
 
+
 def detect_query_language(value: str) -> str:
     lowered = f" {value.lower()} "
     spanish = sum(
@@ -61,6 +62,161 @@ def _safe_query_variant(original: str, candidate: str) -> bool:
     if len(candidate) < 2 or len(candidate) > 4000 or candidate == original.strip():
         return False
     return _identifiers(candidate).issubset(_identifiers(original))
+
+
+def _safe_translation_variant(
+    original: str, candidate: str, known_entities: tuple[str, ...] = ()
+) -> bool:
+    """Accept a translation only when every protected token survives verbatim."""
+
+    if not _safe_query_variant(original, candidate):
+        return False
+    protected = set(_identifiers(original))
+    protected.update(
+        match.group(0)
+        for entity in known_entities
+        if str(entity).strip()
+        for match in re.finditer(
+            rf"(?<![A-Za-z0-9_]){re.escape(str(entity))}(?![A-Za-z0-9_])",
+            original,
+            re.IGNORECASE,
+        )
+    )
+    folded_candidate = candidate.casefold()
+    return all(value.casefold() in folded_candidate for value in protected)
+
+
+_QUERY_LEXICON_EN = frozenset(
+    {
+        "a", "about", "all", "an", "and", "answer", "application", "are",
+        "can", "check", "code", "details", "do", "does", "event", "events",
+        "find", "for", "from", "get", "give", "how", "i", "in", "is", "it",
+        "list", "look", "of", "on", "print", "process", "reprint", "show",
+        "status", "the", "this", "to", "what", "where", "which", "with",
+    }
+)
+_QUERY_LEXICON_ES = frozenset(
+    {
+        "como", "cual", "de", "detalles", "el", "en", "estado", "eventos",
+        "imprimir", "la", "los", "precio", "que", "revisar", "reviso", "todos",
+    }
+)
+
+
+def _damerau_levenshtein(left: str, right: str) -> int:
+    """Return edit distance including adjacent transpositions."""
+
+    rows, columns = len(left) + 1, len(right) + 1
+    distance = [[0] * columns for _ in range(rows)]
+    for row in range(rows):
+        distance[row][0] = row
+    for column in range(columns):
+        distance[0][column] = column
+    for row in range(1, rows):
+        for column in range(1, columns):
+            cost = 0 if left[row - 1] == right[column - 1] else 1
+            distance[row][column] = min(
+                distance[row - 1][column] + 1,
+                distance[row][column - 1] + 1,
+                distance[row - 1][column - 1] + cost,
+            )
+            if (
+                row > 1
+                and column > 1
+                and left[row - 1] == right[column - 2]
+                and left[row - 2] == right[column - 1]
+            ):
+                distance[row][column] = min(
+                    distance[row][column], distance[row - 2][column - 2] + cost
+                )
+    return distance[-1][-1]
+
+
+def corrected_query_variant(
+    value: str, known_entities: tuple[str, ...] = ()
+) -> str:
+    """Build one conservative spelling variant; never replace recognized entities."""
+
+    letter_tokens = re.findall(r"[A-Za-zÀ-ÿ]+", value)
+    uppercase_heavy = bool(letter_tokens) and sum(
+        token.isupper() for token in letter_tokens
+    ) / len(letter_tokens) >= 0.6
+    if not uppercase_heavy:
+        return ""
+    entities = {str(entity).casefold() for entity in known_entities if str(entity).strip()}
+    folded_tokens = {token.casefold() for token in letter_tokens}
+    english_matches = len(folded_tokens & _QUERY_LEXICON_EN)
+    spanish_matches = len(folded_tokens & _QUERY_LEXICON_ES)
+    language_lexicon = (
+        _QUERY_LEXICON_ES if spanish_matches > english_matches else _QUERY_LEXICON_EN
+    )
+    lexicon = language_lexicon | entities
+    protected_spans = [match.span() for match in re.finditer(r"`[^`]+`|['\"][^'\"]+['\"]", value)]
+    changed = False
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changed
+        token = match.group(0)
+        folded = token.casefold()
+        if (
+            folded in lexicon
+            or folded in entities
+            or any(start <= match.start() < end for start, end in protected_spans)
+            or any(character.isdigit() for character in token)
+            or "_" in token
+            or len(token) < 2
+        ):
+            return token
+        threshold = 1 if len(token) <= 5 else 2
+        scored = sorted(
+            (
+                _damerau_levenshtein(folded, candidate),
+                abs(len(candidate) - len(folded)),
+                candidate,
+            )
+            for candidate in lexicon
+            if abs(len(candidate) - len(folded)) <= threshold
+        )
+        if not scored or scored[0][0] > threshold:
+            return token
+        best_key = scored[0][:2]
+        best = [candidate for distance, length_delta, candidate in scored if (distance, length_delta) == best_key]
+        if len(best) != 1:
+            return token
+        changed = True
+        replacement = best[0]
+        return replacement.upper() if token.isupper() else replacement
+
+    corrected = re.sub(r"[A-Za-zÀ-ÿ_][A-Za-zÀ-ÿ0-9_]*", replace, value)
+    return corrected if changed and corrected != value else ""
+
+
+def retrieval_terminology_variant(value: str) -> str:
+    """Normalize broad action synonyms for recall without adding factual terms."""
+
+    normalized = re.sub(
+        r"\b(?:review|inspect|verify|consult|look\s+up|look)\b",
+        "check",
+        value,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized if normalized.casefold() != value.strip().casefold() else ""
+
+
+def uncertain_entity_token(
+    value: str, known_entities: tuple[str, ...] = ()
+) -> str:
+    """Find one identifier-like unknown token close to corpus-owned entities."""
+
+    entities = {str(entity).casefold() for entity in known_entities if str(entity).strip()}
+    for token in re.findall(r"\b[A-Z][A-Z0-9]{1,30}\b", value):
+        folded = token.casefold()
+        if folded in entities:
+            continue
+        if any(_damerau_levenshtein(folded, entity) <= 1 for entity in entities):
+            return token
+    return ""
 
 
 def _multi_part_question(value: str) -> bool:
@@ -330,15 +486,42 @@ def _source_route_intent(
     """Classify only the source authority needed; never create answer content."""
 
     normalized = " ".join(_normalized_words(question))
-    # A specific work-item signal wins over generic words such as configuration
-    # or implementation that commonly occur in ticket titles.
-    if re.search(
-        r"\b(?:jira|tickets?|issues?|bugs?|sprints?|statuses|status|delivery|"
-        r"releases?|priority|priorities|estado|entrega|incidencias?|errores?|"
-        r"prioridad(?:es)?)\b",
-        normalized,
-    ):
+    if re.search(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]+-\d+(?![A-Za-z0-9])", question):
         return "DELIVERY"
+    # An explicit work-item term selects Jira. A bare attribute such as "status"
+    # does not: in a follow-up it commonly belongs to the carried code or document
+    # entity (for example, an event payload field).
+    explicit_work_item = re.search(
+        r"\b(?:jira|issues?|bugs?|sprints?|delivery|releases?|priority|"
+        r"priorities|assignees?|entrega|incidencias?|errores?|prioridad(?:es)?)\b",
+        normalized,
+    )
+    project_status = re.search(
+        r"\b(?:statuses|status|estado)\b.{0,35}\b(?:project|release|delivery|sprint|"
+        r"proyecto|entrega)\b|\b(?:project|release|delivery|sprint|proyecto|entrega)"
+        r"\b.{0,35}\b(?:statuses|status|estado)\b",
+        normalized,
+    )
+    ticket_term = re.search(r"\b(?:tickets?|boletos?)\b", normalized)
+    ticket_work_item_context = ticket_term and re.search(
+        r"\b(?:open|closed|blocked|assigned|backlog|sprint|release|priority|status|"
+        r"issue|bug|jira|show|list|about|abierto|cerrado|bloqueado|asignado|"
+        r"estado|prioridad|incidencia|error|entrega|muestra|lista|sobre)\b",
+        normalized,
+    )
+    ticket_document_context = ticket_term and re.search(
+        r"\b(?:print|reprint|printer|receipt|paper|imprimir|reimprimir|impresora|"
+        r"recibo|comprobante|papel)\b",
+        normalized,
+    )
+    if explicit_work_item or project_status:
+        return "DELIVERY"
+    if ticket_document_context:
+        return "CODE_ASSISTED"
+    if ticket_work_item_context:
+        return "DELIVERY"
+    if member_identifiers(question):
+        return "CODE_ASSISTED"
     cross_source_signal = re.search(
         r"\b(?:compare|compares|comparison|versus|vs|match|matches|align|alignment|"
         r"differ|differs|difference|architecture|architectural|compara|comparar|"

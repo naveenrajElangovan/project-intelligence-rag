@@ -117,6 +117,29 @@ def test_anchor_rejection_is_reported_separately_from_a_low_score(monkeypatch) -
     assert verifier.last_rejections[0].score is None
 
 
+def test_fabricated_cited_identifier_is_rejected_while_supported_claim_survives(
+    monkeypatch,
+) -> None:
+    verifier = _verifier(monkeypatch, [0.95])
+    verdict = asyncio.run(
+        verifier.verify(
+            "What members exist?",
+            [Document(page_content=TABLE_EVIDENCE)],
+            GroundedAnswer(
+                answer=(
+                    "The summary has `tickets_count` [SOURCE 1]. "
+                    "It also has `LOGIN_ADMIN` [SOURCE 1]."
+                ),
+                citations=[1],
+            ),
+        )
+    )
+
+    assert not verdict.supported
+    assert verdict.unsupported_claims == ["It also has `LOGIN_ADMIN` [SOURCE 1]."]
+    assert verifier.last_rejections[0].reason == "NUMERIC_OR_IDENTIFIER_ANCHOR_ABSENT"
+
+
 def test_missing_citation_is_reported_separately(monkeypatch) -> None:
     verifier = _verifier(monkeypatch, [])
     asyncio.run(

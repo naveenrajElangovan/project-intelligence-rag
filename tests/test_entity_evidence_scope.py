@@ -33,7 +33,7 @@ def test_multi_entity_document_is_kept_when_it_contains_requested_entity() -> No
     assert scope_bypassed is False
 
 
-def test_total_entity_mismatch_bypasses_scope_and_keeps_evidence() -> None:
+def test_total_entity_mismatch_fails_closed() -> None:
     other_application = Document(
         page_content="Application-specific behavior",
         metadata={"entity_key": "bot"},
@@ -43,7 +43,7 @@ def test_total_entity_mismatch_bypasses_scope_and_keeps_evidence() -> None:
         [other_application], "pos"
     )
 
-    assert scoped == [other_application]
+    assert scoped == []
     assert excluded == 1
     assert diagnostics == [
         {
@@ -52,7 +52,7 @@ def test_total_entity_mismatch_bypasses_scope_and_keeps_evidence() -> None:
             "exclusion_reason": "not_in_entities",
         }
     ]
-    assert scope_bypassed is True
+    assert scope_bypassed is False
 
 
 def test_entity_scope_still_excludes_mismatches_when_some_evidence_remains() -> None:

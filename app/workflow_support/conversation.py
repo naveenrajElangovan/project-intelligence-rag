@@ -2,8 +2,23 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable
 
 from app.workflow_support.query_analysis import _normalized_words
+
+
+def _subject_matches_vocabulary(
+    subject: str, vocabulary: Iterable[str]
+) -> bool:
+    """Return whether a candidate subject shares a normalized project term."""
+
+    subject_words = set(_normalized_words(subject))
+    vocabulary_words = {
+        word
+        for entry in vocabulary
+        for word in _normalized_words(str(entry))
+    }
+    return bool(subject_words & vocabulary_words)
 
 
 def _bounded_history(
@@ -40,13 +55,86 @@ def _estimated_tokens(value: str) -> int:
     return max(1, -(-len(value.encode("utf-8")) // 3))
 
 
-def _conversation_resolution_needed(question: str) -> bool:
+def _contextual_subtopic_followup(
+    question: str, history: list[tuple[str, str]]
+) -> bool:
+    """Recognize a short named subtopic taken from the preceding answer.
+
+    A fragment such as ``named subsystem flow?`` names a real entity, but it
+    still borrows its predicate from the prior turn. Prior answer text is used
+    only to link the topic; retrieved project evidence remains the sole source
+    of answer facts.
+    """
+
+    normalized = unicodedata.normalize("NFKC", question).casefold().strip()
+    words = set(_normalized_words(normalized))
+    if not normalized.endswith(("?", "¿")) or not 1 < len(words) <= 8:
+        return False
+    relation_words = {
+        "behavior", "details", "flow", "mechanism", "overview", "part",
+        "path", "process", "sequence", "steps", "workflow",
+        "comportamiento", "detalles", "flujo", "mecanismo", "parte",
+        "pasos", "proceso", "secuencia",
+    }
+    if not words & relation_words:
+        return False
+    # A complete interrogative introduces its own predicate and must remain
+    # standalone even if some of its nouns appeared in the previous answer.
+    if words & {
+        "can", "could", "did", "do", "does", "how", "is", "should",
+        "what", "when", "where", "which", "who", "why", "would",
+        "como", "cómo", "cuando", "cuándo", "cual", "cuál", "donde",
+        "dónde", "por", "que", "qué", "quien", "quién",
+    }:
+        return False
+    topic_words = words - relation_words - {
+        "a", "an", "and", "de", "del", "el", "la", "of", "the", "y",
+    }
+    if not topic_words:
+        return False
+    previous_answer = next(
+        (content for role, content in reversed(history) if role == "assistant"),
+        "",
+    )
+    return bool(topic_words & set(_normalized_words(previous_answer)))
+
+
+def _complete_explicit_question(value: str) -> bool:
+    """Return whether a turn supplies its own predicate and non-referential topic."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold().strip()
+    if re.search(
+        r"\b(?:it|its|that|this|these|those|their|them|same|above|previous|"
+        r"eso|esto|esa|ese|esos|esas|mismo|misma|anterior)\b",
+        normalized,
+    ):
+        return False
+    complete_interrogative = re.match(
+        r"^(?:how|what|when|where|which|who|why|como|cómo|que|qué|cuando|"
+        r"cuándo|donde|dónde|cual|cuál|quien|quién)\b.{0,80}\b(?:am|are|can|"
+        r"could|did|do|does|is|should|was|were|would|es|son|esta|está|estan|"
+        r"están|puede|pueden|hace|hacen)\b",
+        normalized,
+    )
+    explicit_imperative = re.match(
+        r"^(?:describe|explain|summarize|define|document|explica|"
+        r"describe|resume|define)\s+(?!more\b|further\b|again\b|más\b|mas\b)",
+        normalized,
+    )
+    return bool(complete_interrogative or explicit_imperative)
+
+
+def _conversation_resolution_needed(
+    question: str, vocabulary: Iterable[str] | None = None
+) -> bool:
     """Detect short anaphoric follow-ups without calling a model for direct questions."""
 
-    return _conversation_resolution_decision(question)[0]
+    return _conversation_resolution_decision(question, vocabulary)[0]
 
 
-def _conversation_resolution_decision(question: str) -> tuple[bool, str]:
+def _conversation_resolution_decision(
+    question: str, vocabulary: Iterable[str] | None = None
+) -> tuple[bool, str]:
     """Return the follow-up decision and a content-free telemetry reason."""
 
     normalized = unicodedata.normalize("NFKC", question).casefold().strip()
@@ -178,6 +266,12 @@ def _conversation_resolution_decision(question: str) -> tuple[bool, str]:
     ):
         return True, "DEMONSTRATIVE_ATTRIBUTE_FOLLOWUP"
     if topic_words:
+        if _complete_explicit_question(normalized):
+            return False, "EXPLICIT_SUBJECT"
+        if vocabulary is not None and not _subject_matches_vocabulary(
+            " ".join(topic_words), vocabulary
+        ):
+            return True, "NON_VOCABULARY_SUBJECT"
         return False, "EXPLICIT_SUBJECT"
     if words & pronouns:
         return True, "ANAPHORIC_PRONOUN"
@@ -300,6 +394,30 @@ def _resolved_conversation_subject(value: str) -> str:
     if match:
         return match.group(1).strip()[:500]
     return _conversation_subject(value)
+
+
+def _conversation_context_subject(
+    original: str,
+    resolved: str,
+    existing: str,
+    vocabulary: Iterable[str],
+) -> tuple[str, bool]:
+    """Keep an active entity across attribute follow-ups without trusting chat as evidence."""
+
+    known = tuple(vocabulary)
+    is_followup = _conversation_resolution_decision(original, known or None)[0]
+    explicit = _conversation_subject(original)
+    if is_followup and explicit and known and not _subject_matches_vocabulary(
+        explicit, known
+    ):
+        explicit = ""
+    carried = _resolved_conversation_subject(resolved)
+    subject = (
+        carried or _conversation_subject(existing) or existing
+        if is_followup and not explicit
+        else explicit
+    )
+    return subject or carried or existing, is_followup
 
 
 def _safe_conversation_rewrite(

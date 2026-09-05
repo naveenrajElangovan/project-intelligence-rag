@@ -6,7 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LANGSMITH_TRACING=false
 
 WORKDIR /app
-COPY requirements.txt .
+RUN useradd --create-home --uid 10001 appuser
+COPY --chown=10001:10001 requirements.txt .
 # torch is installed first, from PyTorch's CPU-only index. On Linux the default
 # PyPI wheel hard-depends on nvidia-cudnn-cu13, nvidia-cusparselt-cu13,
 # nvidia-nccl-cu13, nvidia-nvshmem-cu13 and triton -- about 1.1 GB of compressed
@@ -16,10 +17,9 @@ COPY requirements.txt .
 # instance.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.11.0 \
  && pip install --no-cache-dir -r requirements.txt
-COPY app ./app
-COPY scripts ./scripts
+COPY --chown=10001:10001 app ./app
+COPY --chown=10001:10001 scripts ./scripts
 RUN python -m scripts.generate_sbom /opt/project-intelligence-rag.cdx.json
-RUN useradd --create-home --uid 10001 appuser
 USER appuser
 EXPOSE 8002
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002", "--proxy-headers"]

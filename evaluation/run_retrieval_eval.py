@@ -7,6 +7,7 @@ import asyncio
 from collections import Counter, defaultdict, deque
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from chromadb import HttpClient
@@ -49,9 +50,27 @@ except ModuleNotFoundError:  # Direct `python evaluation/run_retrieval_eval.py` 
     from score import score, score_generation
 
 
-_MANIFEST_FIELDS = ("structure_path", "title", "source_id", "doc_category")
-_MANIFEST_VERSION = 2
+# entity_key is carried through from ingestion (structured_chunking sets it on
+# chunk metadata; vector.py passes non-reserved keys straight into Chroma). A
+# registry entry names its event there even when the event is not a section
+# heading, so a gold predicate can address it without the manifest having to
+# carry chunk text.
+_MANIFEST_FIELDS = (
+    "structure_path",
+    "title",
+    "source_id",
+    "doc_category",
+    "entity_key",
+)
+# Bumped with the field list. A cached manifest captured under the old schema
+# has no entity_key, and reusing it would not fail -- it would silently resolve
+# fewer cases, which is exactly the class of error this preflight exists to
+# stop.
+_MANIFEST_VERSION = 4
+_MINIMUM_GOLD_RESOLUTION_RATE = 0.95
 _PARAPHRASE_GROUPS_PATH = Path(__file__).with_name("paraphrase_groups.json")
+_DEFAULT_SUITES_PATH = Path(__file__).with_name("gold_suites.jsonl")
+_BILINGUAL_SUITES_PATH = Path(__file__).with_name("bilingual_gold_suites.jsonl")
 _RERANK_SWEEP = (
     ("baseline", 12, 16, 8, 0.10, 3),
     ("regular_candidates_16", 16, 16, 8, 0.10, 3),
@@ -69,6 +88,42 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def retired_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Cases withdrawn from scoring, each carrying the reason it was withdrawn.
+
+    A case whose evidence has left the corpus cannot be scored, and leaving it
+    in depresses every metric for a reason unrelated to retrieval quality. It is
+    withdrawn rather than deleted so the record of what was dropped, and why,
+    stays in the suite -- an unexplained absence is what this preflight exists
+    to prevent.
+    """
+
+    return [case for case in cases if case.get("retired") is True]
+
+
+def _load_evaluation_cases(path: Path) -> list[dict[str, Any]]:
+    cases = _load_jsonl(path)
+    if path.resolve() == _DEFAULT_SUITES_PATH.resolve():
+        cases.extend(_load_jsonl(_BILINGUAL_SUITES_PATH))
+    missing_reason = sorted(
+        str(case.get("id"))
+        for case in retired_cases(cases)
+        if not str(case.get("retired_reason") or "").strip()
+    )
+    if missing_reason:
+        raise ValueError(
+            "Retired evaluation cases must record retired_reason: "
+            + ", ".join(missing_reason[:10])
+        )
+    identifiers = [str(case.get("id")) for case in cases]
+    duplicates = sorted(
+        identifier for identifier, count in Counter(identifiers).items() if count > 1
+    )
+    if duplicates:
+        raise ValueError(f"Duplicate evaluation case ids: {duplicates[:10]}")
+    return cases
 
 
 def _manifest_cache_path(output: Path) -> Path:
@@ -137,15 +192,151 @@ def _gold_ids(
     case: dict[str, Any], manifest: dict[str, dict[str, str]]
 ) -> list[str]:
     predicates = case.get("gold_match", {}).get("any_of", [])
+
+    def predicate_matches(
+        predicate: dict[str, Any], metadata: dict[str, str]
+    ) -> bool:
+        if "all_of" in predicate:
+            return all(
+                predicate_matches(item, metadata)
+                for item in predicate.get("all_of", [])
+            )
+        field = str(predicate.get("field") or "")
+        actual = str(metadata.get(field) or "").casefold()
+        if field not in _MANIFEST_FIELDS:
+            return False
+        if "equals" in predicate:
+            return actual == str(predicate.get("equals") or "").casefold()
+        expected = str(predicate.get("contains") or "").casefold()
+        if not expected:
+            return False
+        if expected in actual:
+            return True
+        # Ingestion formats section paths as JSON strings and some importers
+        # omit presentational brackets around stable section identifiers.
+        normalized_expected = re.sub(r"[^a-z0-9]+", "", expected)
+        normalized_actual = re.sub(r"[^a-z0-9]+", "", actual)
+        return bool(normalized_expected) and normalized_expected in normalized_actual
+
     matches: list[str] = []
     for chunk_id, metadata in manifest.items():
         for predicate in predicates:
-            field = str(predicate.get("field") or "")
-            expected = str(predicate.get("contains") or "").casefold()
-            if field in _MANIFEST_FIELDS and expected in metadata[field].casefold():
+            if predicate_matches(predicate, metadata):
                 matches.append(chunk_id)
                 break
     return matches
+
+
+def _predicate_values(predicate: dict[str, Any]):
+    """Every literal a predicate tries to match, flattening all_of groups."""
+
+    if "all_of" in predicate:
+        for item in predicate.get("all_of", []):
+            yield from _predicate_values(item)
+        return
+    value = str(predicate.get("equals") or predicate.get("contains") or "")
+    if value:
+        yield str(predicate.get("field") or ""), value
+
+
+def _unresolved_diagnostics(
+    unresolved: list[dict[str, Any]], manifest: dict[str, dict[str, str]]
+) -> dict[str, Any]:
+    """Separate "addressed to the wrong field" from "not in the corpus".
+
+    A failing predicate has two very different causes, and the remedies are
+    opposites: repoint the predicate, or retire the case. Reporting only a count
+    of unresolved cases leaves that triage to guesswork, which is how a suite
+    accumulates cases nobody can act on.
+    """
+
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    # One normalized haystack per field. The separator is a space, which cannot
+    # appear in a normalized needle, so nothing matches across two entries.
+    haystacks = {
+        field: " ".join(normalized(values.get(field, "")) for values in manifest.values())
+        for field in _MANIFEST_FIELDS
+    }
+    diagnostics: dict[str, Any] = {}
+    repointable = 0
+    for case in unresolved:
+        found: dict[str, list[str]] = {}
+        values: list[str] = []
+        for predicate in case.get("gold_match", {}).get("any_of", []):
+            for field, value in _predicate_values(predicate):
+                values.append(f"{field}={value}")
+                needle = normalized(value)
+                if not needle:
+                    continue
+                for candidate, haystack in haystacks.items():
+                    if candidate != field and needle in haystack:
+                        found.setdefault(value, []).append(candidate)
+        if found:
+            repointable += 1
+        diagnostics[str(case.get("id"))] = {
+            "predicates": values,
+            "present_in_other_fields": {
+                value: sorted(set(fields)) for value, fields in found.items()
+            },
+            "verdict": "REPOINTABLE" if found else "ABSENT_FROM_CORPUS",
+        }
+    return {
+        "repointable_cases": repointable,
+        "absent_from_corpus_cases": len(unresolved) - repointable,
+        "by_case": diagnostics,
+    }
+
+
+def _validate_gold_resolution(
+    cases: list[dict[str, Any]],
+    manifest: dict[str, dict[str, str]],
+    *,
+    minimum_rate: float = _MINIMUM_GOLD_RESOLUTION_RATE,
+) -> dict[str, Any]:
+    withdrawn = retired_cases(cases)
+    answerable = [
+        case
+        for case in cases
+        if case.get("answerable") is True and case.get("retired") is not True
+    ]
+    unresolved_cases = [case for case in answerable if not _gold_ids(case, manifest)]
+    unresolved = [str(case.get("id")) for case in unresolved_cases]
+    resolved = len(answerable) - len(unresolved)
+    rate = resolved / len(answerable) if answerable else 0.0
+    diagnostics = _unresolved_diagnostics(unresolved_cases, manifest)
+    report = {
+        "answerable_cases": len(answerable),
+        "resolved_gold_cases": resolved,
+        "gold_resolution_rate": rate,
+        "minimum_gold_resolution_rate": minimum_rate,
+        "unresolved_gold_case_ids": unresolved,
+        "unresolved_gold_diagnostics": diagnostics,
+        # Reported, never silent. Excluding a case without saying so is the
+        # failure this preflight was added to catch.
+        "retired_cases": len(withdrawn),
+        "retired_case_reasons": {
+            str(case.get("id")): str(case.get("retired_reason") or "")
+            for case in withdrawn
+        },
+    }
+    if rate < minimum_rate:
+        preview = ", ".join(unresolved[:10])
+        remainder = len(unresolved) - min(len(unresolved), 10)
+        suffix = f" (+{remainder} more)" if remainder else ""
+        raise ValueError(
+            "Gold resolution preflight failed: "
+            f"{resolved}/{len(answerable)} ({rate:.3f}) resolved; "
+            f"minimum is {minimum_rate:.3f}. "
+            f"{diagnostics['repointable_cases']} unresolved predicates name a "
+            "value the corpus carries under a different manifest field "
+            "(repoint them); "
+            f"{diagnostics['absent_from_corpus_cases']} name a value absent "
+            "from the corpus entirely (re-ingest or retire). "
+            f"Unresolved: {preview}{suffix}"
+        )
+    return report
 
 
 def _chunk_ids(documents: list[Any]) -> list[str]:
@@ -269,6 +460,8 @@ def _result_row(
     return {
         "id": case.get("id"),
         "suite": case.get("suite"),
+        "query_language": case.get("query_language") or "und",
+        "target_evidence_language": case.get("target_evidence_language") or "und",
         "role": role,
         "gold_chunk_ids": gold,
         "retrieved_chunk_ids": retrieved_ids,
@@ -569,13 +762,20 @@ async def _main(arguments: argparse.Namespace) -> None:
         dense_weight=settings.dense_fusion_weight,
     )
     reranker = build_reranker(settings)
-    all_cases = _load_jsonl(arguments.suites)
+    all_cases = _load_evaluation_cases(arguments.suites)
     cases = [case for case in all_cases if case.get("evaluation_lane") != "generation"]
     wrong_project = [case.get("id") for case in all_cases if case.get("project_id") != arguments.project_id]
     if wrong_project:
         raise ValueError(
             f"Suite cases do not belong to {arguments.project_id}: {wrong_project[:5]}"
         )
+    gold_resolution = _validate_gold_resolution(
+        cases,
+        manifest,
+        minimum_rate=arguments.minimum_gold_resolution_rate,
+    )
+    print("GOLD_RESOLUTION_PREFLIGHT", flush=True)
+    print(json.dumps(gold_resolution, indent=2, sort_keys=True), flush=True)
     if arguments.reranker_sweep_out:
         recorded_candidates = (
             _load_recorded_candidates(arguments.sweep_candidates_from, collection)
@@ -651,6 +851,7 @@ def _stratified_sample(cases: list[dict[str, Any]], size: int) -> list[dict[str,
     for case in cases:
         key = (
             case.get("suite"),
+            case.get("query_language") or "und",
             bool(case.get("answerable")),
             case.get("expected_refusal_reason"),
         )
@@ -713,6 +914,8 @@ async def _run_generation_lane(
             {
                 "id": case.get("id"),
                 "suite": case.get("suite"),
+                "query_language": case.get("query_language") or "und",
+                "target_evidence_language": case.get("target_evidence_language") or "und",
                 "paraphrase_group": case.get("paraphrase_group"),
                 "answerable": bool(case.get("answerable")),
                 "answered": response.confidence != "NONE",
@@ -745,7 +948,7 @@ def main() -> None:
     parser.add_argument(
         "--suites",
         type=Path,
-        default=Path(__file__).with_name("gold_suites.jsonl"),
+        default=_DEFAULT_SUITES_PATH,
     )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
@@ -756,6 +959,12 @@ def main() -> None:
         help="Run full generation, citation validation, and grounding on 30-40 cases.",
     )
     parser.add_argument("--generation-out", type=Path)
+    parser.add_argument(
+        "--minimum-gold-resolution-rate",
+        type=float,
+        default=_MINIMUM_GOLD_RESOLUTION_RATE,
+        help="Abort before retrieval when fewer answerable cases resolve to live chunks.",
+    )
     parser.add_argument("--cross-encoder-candidate-limit", type=int)
     parser.add_argument("--inventory-cross-encoder-candidate-limit", type=int)
     parser.add_argument("--rerank-top-n", type=int)

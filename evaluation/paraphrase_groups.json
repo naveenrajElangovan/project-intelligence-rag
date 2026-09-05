@@ -1,0 +1,22 @@
+[
+  {"id":"paraphrase-named-member-01","paraphrase_group":"named_member","project_id":"T2.0","question":"`POS_LOGIN`","query_language":"en","answerable":true},
+  {"id":"paraphrase-named-member-02","paraphrase_group":"named_member","project_id":"T2.0","question":"What does POS_LOGIN do?","query_language":"en","answerable":true},
+  {"id":"paraphrase-named-member-03","paraphrase_group":"named_member","project_id":"T2.0","question":"Explain POS_LOGIN.","query_language":"en","answerable":true},
+  {"id":"paraphrase-named-member-04","paraphrase_group":"named_member","project_id":"T2.0","question":"Give me the contract details for POS_LOGIN.","query_language":"en","answerable":true},
+  {"id":"paraphrase-named-member-05","paraphrase_group":"named_member","project_id":"T2.0","question":"What fields does POS_LOGIN have?","query_language":"en","answerable":true},
+  {"id":"paraphrase-pos-event-inventory-01","paraphrase_group":"pos_event_inventory","project_id":"T2.0","question":"What events does POS use?","query_language":"en","answerable":true},
+  {"id":"paraphrase-pos-event-inventory-02","paraphrase_group":"pos_event_inventory","project_id":"T2.0","question":"Which events does POS use?","query_language":"en","answerable":true},
+  {"id":"paraphrase-pos-event-inventory-03","paraphrase_group":"pos_event_inventory","project_id":"T2.0","question":"What POS events are available?","query_language":"en","answerable":true},
+  {"id":"paraphrase-pos-event-inventory-04","paraphrase_group":"pos_event_inventory","project_id":"T2.0","question":"List all events for POS.","query_language":"en","answerable":true},
+  {"id":"paraphrase-pos-event-inventory-05","paraphrase_group":"pos_event_inventory","project_id":"T2.0","question":"Show every POS event.","query_language":"en","answerable":true},
+  {"id":"paraphrase-entity-behavior-01","paraphrase_group":"entity_behavior","project_id":"T2.0","question":"How does POS work?","query_language":"en","answerable":true},
+  {"id":"paraphrase-entity-behavior-02","paraphrase_group":"entity_behavior","project_id":"T2.0","question":"What does the POS application do?","query_language":"en","answerable":true},
+  {"id":"paraphrase-entity-behavior-03","paraphrase_group":"entity_behavior","project_id":"T2.0","question":"Explain the POS application.","query_language":"en","answerable":true},
+  {"id":"paraphrase-entity-behavior-04","paraphrase_group":"entity_behavior","project_id":"T2.0","question":"What is POS responsible for?","query_language":"en","answerable":true},
+  {"id":"paraphrase-entity-behavior-05","paraphrase_group":"entity_behavior","project_id":"T2.0","question":"Tell me about POS.","query_language":"en","answerable":true},
+  {"id":"paraphrase-cross-source-01","paraphrase_group":"cross_source","project_id":"T2.0","question":"Compare POS and BOT.","query_language":"en","answerable":true},
+  {"id":"paraphrase-cross-source-02","paraphrase_group":"cross_source","project_id":"T2.0","question":"How do POS and BOT interact?","query_language":"en","answerable":true},
+  {"id":"paraphrase-cross-source-03","paraphrase_group":"cross_source","project_id":"T2.0","question":"What is the relationship between POS and BOT?","query_language":"en","answerable":true},
+  {"id":"paraphrase-cross-source-04","paraphrase_group":"cross_source","project_id":"T2.0","question":"Where do POS and BOT differ?","query_language":"en","answerable":true},
+  {"id":"paraphrase-cross-source-05","paraphrase_group":"cross_source","project_id":"T2.0","question":"Explain POS versus BOT.","query_language":"en","answerable":true}
+]

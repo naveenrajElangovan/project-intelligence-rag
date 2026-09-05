@@ -193,7 +193,8 @@ def build(corpus: Path, project_id: str) -> tuple[list[dict], list[tuple[str, st
                     continue
                 rows.append(case(
                     f"registry-{key}".lower(), "registry_keys",
-                    f"Which event id and version does {key} have?", [anchor],
+                    f"Which event id and version does {key} have?",
+                    [key, key.removesuffix("_EVENT")],
                     f"{path.name}:{index + 1} registry row", role,
                     {"expected_facts": [event_id.group("id")], "doc_category": category},
                 ))

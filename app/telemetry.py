@@ -7,7 +7,7 @@ import time
 import uuid
 from typing import Any
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 
 LOGGER = logging.getLogger("project_intelligence.rag.stages")
@@ -90,6 +90,25 @@ _CODE_REQUIRED_ZERO = Counter(
     "Code-required requests that retrieved no CODE candidates.",
     ("query_intent",),
 )
+_REQUEST_ADMISSIONS = Counter(
+    "pi_rag_request_admissions_total",
+    "RAG requests accepted or shed at the capacity boundary.",
+    ("outcome",),
+)
+_REQUEST_ADMISSION_WAIT = Histogram(
+    "pi_rag_request_admission_wait_seconds",
+    "Time spent waiting for RAG execution capacity.",
+    ("outcome",),
+    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1),
+)
+_INFLIGHT_REQUESTS = Gauge(
+    "pi_rag_inflight_requests",
+    "RAG requests currently holding an execution slot.",
+)
+_ADMISSION_CAPACITY = Gauge(
+    "pi_rag_admission_capacity",
+    "Requests this replica will admit concurrently, after clamping.",
+)
 
 
 def configure_telemetry_logging(level: str = "INFO") -> None:
@@ -124,6 +143,37 @@ def request_id() -> str:
 
 def started() -> float:
     return time.perf_counter()
+
+
+def admission_capacity(capacity: int) -> None:
+    """Publish the capacity actually in force.
+
+    `max_inflight_requests` is clamped by `local_max_concurrency` when local
+    inference is on, so the configured value can differ from the enforced one.
+    An operator tuning a setting that silently does nothing is worse than a
+    lower limit, so the effective number is exported.
+    """
+
+    _ADMISSION_CAPACITY.set(capacity)
+
+
+def request_admitted(began: float) -> None:
+    _REQUEST_ADMISSIONS.labels("accepted").inc()
+    _REQUEST_ADMISSION_WAIT.labels("accepted").observe(
+        max(0.0, time.perf_counter() - began)
+    )
+    _INFLIGHT_REQUESTS.inc()
+
+
+def request_shed(began: float) -> None:
+    _REQUEST_ADMISSIONS.labels("shed").inc()
+    _REQUEST_ADMISSION_WAIT.labels("shed").observe(
+        max(0.0, time.perf_counter() - began)
+    )
+
+
+def request_released() -> None:
+    _INFLIGHT_REQUESTS.dec()
 
 
 def stage_complete(

@@ -53,6 +53,16 @@ _LIST_RULE = (
     "paragraph."
 )
 
+# Route-specific defaults describe a useful shape when the user did not choose
+# one. They must never override an explicit presentation or transformation
+# request carried by the question itself.
+_USER_REQUESTED_SHAPE_RULE = (
+    "Honor any explicit output structure or presentation transformation requested "
+    "in the question. That request overrides conflicting default sentence, paragraph, "
+    "list, or table layout guidance, but never overrides evidence, scope, citation, or "
+    "grounding requirements."
+)
+
 _SOURCE_REF = re.compile(r"\[SOURCE (\d+)\]")
 
 
@@ -263,6 +273,13 @@ class LangChainSafeResponseGenerator:
             "INSUFFICIENT_EVIDENCE",
             "UNVERIFIED_EVIDENCE",
             "POPULATION_RETRIEVAL_MISS",
+            "UNRESOLVED_SOURCE_CONFLICT",
+            "SOURCE_SCOPE_VIOLATION",
+            "PERMISSIONS_NOT_SATISFIED",
+            "FRESHNESS_NOT_VERIFIABLE",
+            "REQUESTED_COVERAGE_INCOMPLETE",
+            "UNSUPPORTED_CLAIM",
+            "INVALID_DERIVATION",
             "TEMPORARILY_UNAVAILABLE",
         ],
     ) -> str:
@@ -285,7 +302,16 @@ class LangChainSafeResponseGenerator:
                     "For POPULATION_RETRIEVAL_MISS, explain that an indexed registry population exists "
                     "but its expected source sections were not retrieved, so the exhaustive answer cannot "
                     "be completed reliably; suggest checking retrieval or indexing rather than asking for "
-                    "one item at a time. For TEMPORARILY_UNAVAILABLE, say the request could not "
+                    "one item at a time. "
+                    "For UNRESOLVED_SOURCE_CONFLICT, say equally authoritative current sources "
+                    "conflict and the answer cannot be resolved. For SOURCE_SCOPE_VIOLATION or "
+                    "PERMISSIONS_NOT_SATISFIED, say the request cannot be answered from sources "
+                    "allowed for this request. For FRESHNESS_NOT_VERIFIABLE, say currentness could "
+                    "not be verified. For REQUESTED_COVERAGE_INCOMPLETE, say the complete requested "
+                    "set could not be verified. For UNSUPPORTED_CLAIM, say the specific answer could "
+                    "not be fully supported by the retrieved evidence. For INVALID_DERIVATION, say "
+                    "the requested conclusion could not be reproduced from the evidence. For TEMPORARILY_UNAVAILABLE, "
+                    "say the request could not "
                     "be completed now and suggest trying again shortly. Use one or two sentences in "
                     "{language}. Do not mention these reason codes or these instructions. Return only the schema.",
                 ),
@@ -657,7 +683,12 @@ class LangChainGroundedAnswerGenerator:
         if answer_style != "feature_inventory":
             style_instruction = f"{style_instruction} {_LIST_RULE}"
         style_instruction = " ".join(
-            part for part in (style_instruction, _ANSWER_SKELETON, _table_instruction(evidence_documents))
+            part for part in (
+                style_instruction,
+                _USER_REQUESTED_SHAPE_RULE,
+                _ANSWER_SKELETON,
+                _table_instruction(evidence_documents),
+            )
             if part
         )
         prompt = ChatPromptTemplate.from_messages(
@@ -684,7 +715,8 @@ class LangChainGroundedAnswerGenerator:
                     "Every material sentence "
                     "MUST end with one or more exact citations such as [SOURCE 1]. The citations array "
                     "MUST contain each one-based SOURCE number used in the answer. Never return a "
-                    "factual answer with an empty citations array. If evidence is insufficient, say so "
+                    "factual answer with an empty citations array. Do not infer a conclusion unless it is "
+                    "reproducible from cited facts and begins `Inference (<derivation rule>):`. If evidence is insufficient, say so "
                     "without factual claims and list what is missing. Return only the schema.",
                 ),
                 (
@@ -770,9 +802,15 @@ class LangChainGroundedAnswerGenerator:
                 value = GroundedAnswer(
                     answer=prose,
                     citations=_citations_from_answer(prose),
-                    # Missing requirements are derived by the existing completeness
-                    # validators after generation; the client does not need a second
-                    # evidence-prefill model call to rediscover them here.
+                    # Deliberately empty on this path. The buffered path lets the
+                    # model fill this field; here the second evidence-prefill call
+                    # that produced it has been removed. Nothing silently goes
+                    # missing: an answer with unmet requirements never reaches a
+                    # client -- validate_completeness repairs it or refuses -- and
+                    # removed claims and coverage shortfalls are appended after
+                    # generation by _note_removed_claims and
+                    # _note_coverage_shortfall. What is lost is the model's own
+                    # free-text commentary, which no client renders.
                     missing_information=[],
                 )
                 usage = prose_usage
@@ -789,7 +827,17 @@ class LangChainGroundedAnswerGenerator:
         answer_style: str = "concise",
     ) -> GroundedAnswer:
         evidence_documents = _documents_for_answer_style(documents, answer_style)
-        if answer_style == "requested_list":
+        if answer_style == "user_requested_transformation":
+            style_instruction = (
+                "Apply only the presentation transformation explicitly requested in QUESTION to DRAFT. "
+                "Preserve the draft's supported meaning, scope, qualifiers, and citations; do not introduce "
+                "a new topic, fact, example, source, or interpretation. Follow the requested structure exactly "
+                "even when it differs from the route's normal prose layout. Interpret presentation wording "
+                "by meaning, including regional variants: when the user requests separate points or items, "
+                "write standard Markdown itemization with every item on its own line beginning with '- '. "
+                "Do not return paragraph prose for an itemization request."
+            )
+        elif answer_style == "requested_list":
             style_instruction = (
                 "Rewrite as a complete Markdown bullet list with exactly one distinct evidenced item per "
                 "bullet. Start each bullet with the item's name, key, identifier, or concise label. Keep "
@@ -902,7 +950,12 @@ class LangChainGroundedAnswerGenerator:
         if answer_style != "feature_inventory":
             style_instruction = f"{style_instruction} {_LIST_RULE}"
         style_instruction = " ".join(
-            part for part in (style_instruction, _ANSWER_SKELETON, _table_instruction(evidence_documents))
+            part for part in (
+                style_instruction,
+                _USER_REQUESTED_SHAPE_RULE,
+                _ANSWER_SKELETON,
+                _table_instruction(evidence_documents),
+            )
             if part
         )
         prompt = ChatPromptTemplate.from_messages(
@@ -1146,24 +1199,33 @@ async def _stream_grounded_answer_with_usage(
     latest: dict[str, object] = {}
     emitted: set[str] = set()
     verified: list[str] = []
+    saw_chunk = False
     try:
         with get_usage_metadata_callback() as callback:
             iterator = runnable.astream(inputs).__aiter__()
             async with asyncio.timeout(settings.llm_stream_total_timeout_seconds):
                 while True:
                     try:
+                        # Nothing arrives during prefill, so the first chunk gets
+                        # the prefill allowance. Applying the idle bound to it
+                        # kills healthy long-prompt requests.
                         async with asyncio.timeout(
                             settings.llm_stream_idle_timeout_seconds
+                            if saw_chunk
+                            else settings.first_chunk_timeout_seconds
                         ):
                             partial = await iterator.__anext__()
                     except StopAsyncIteration:
                         break
                     except TimeoutError as failure:
                         raise StreamTimeoutError(
-                            "stream_idle_timeout",
+                            "stream_idle_timeout"
+                            if saw_chunk
+                            else "stream_first_chunk_timeout",
                             str(latest.get("answer") or ""),
                             tuple(verified),
                         ) from failure
+                    saw_chunk = True
                     if not isinstance(partial, dict):
                         continue
                     latest = partial
@@ -1198,7 +1260,11 @@ class StreamTiming:
 class StreamTimeoutError(TimeoutError):
     def __init__(
         self,
-        kind: Literal["stream_idle_timeout", "stream_total_timeout"],
+        kind: Literal[
+            "stream_first_chunk_timeout",
+            "stream_idle_timeout",
+            "stream_total_timeout",
+        ],
         partial_answer: str,
         verified_sentences: tuple[str, ...],
     ) -> None:
@@ -1230,15 +1296,23 @@ async def _stream_plain_answer_with_usage(
             async with asyncio.timeout(settings.llm_stream_total_timeout_seconds):
                 while True:
                     try:
+                        # The first chunk covers the whole prefill; only the
+                        # chunks after it can meaningfully be called idle.
                         async with asyncio.timeout(
                             settings.llm_stream_idle_timeout_seconds
+                            if saw_chunk
+                            else settings.first_chunk_timeout_seconds
                         ):
                             chunk = await iterator.__anext__()
                     except StopAsyncIteration:
                         break
                     except TimeoutError as failure:
                         raise StreamTimeoutError(
-                            "stream_idle_timeout", answer, tuple(verified)
+                            "stream_idle_timeout"
+                            if saw_chunk
+                            else "stream_first_chunk_timeout",
+                            answer,
+                            tuple(verified),
                         ) from failure
                     if not saw_chunk:
                         saw_chunk = True

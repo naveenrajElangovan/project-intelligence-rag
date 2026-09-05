@@ -38,6 +38,26 @@ _INVENTORY_NOUN = re.compile(
     re.IGNORECASE,
 )
 
+_EXHAUSTIVE_DETAIL = re.compile(
+    r"\b(?:all|every|full|complete|entire)\b",
+    re.IGNORECASE,
+)
+_ENTITY_DETAIL_NOUN = re.compile(
+    r"\b(?:details?|fields?|parameters?|payload|schema|attributes?|properties|contract)\b",
+    re.IGNORECASE,
+)
+
+
+def is_exhaustive_entity_detail_question(question: str) -> bool:
+    """Return true for every-field requests about one explicit identifier."""
+
+    normalized = " ".join(question.split())
+    return bool(
+        member_identifiers(normalized)
+        and _EXHAUSTIVE_DETAIL.search(normalized)
+        and _ENTITY_DETAIL_NOUN.search(normalized)
+    )
+
 
 def is_inventory_question(question: str) -> bool:
     """Return true when the user requests a collection rather than one fact."""

@@ -8,6 +8,7 @@ from app.config import Settings
 from app.llm import (
     _ANSWER_SKELETON,
     _LIST_RULE,
+    _USER_REQUESTED_SHAPE_RULE,
     _paragraph_range,
     _sentence_range,
     _table_instruction,
@@ -67,6 +68,12 @@ def test_configuration_rejects_an_undocumented_band():
 def test_answer_contract_starts_directly_and_separates_missing_information():
     assert "begin with one or two sentences" in _ANSWER_SKELETON
     assert "missing_information" in _ANSWER_SKELETON
+
+
+def test_explicit_user_shape_overrides_route_defaults_without_weakening_grounding():
+    assert "explicit output structure" in _USER_REQUESTED_SHAPE_RULE
+    assert "overrides conflicting default" in _USER_REQUESTED_SHAPE_RULE
+    assert "never overrides evidence" in _USER_REQUESTED_SHAPE_RULE
 
 
 def test_table_instruction_activates_only_for_material_tabular_evidence():

@@ -41,13 +41,21 @@ PLANNER_MODEL="$(resolve_setting PI_RAG_OLLAMA_PLANNER_MODEL "${GENERATOR_MODEL}
 # report success while the service kept serving, and then delete the only record
 # of what was running. What actually matters is whether the port is still held.
 listeners() {
-  lsof -ti "tcp:${PORT}" -sTCP:LISTEN 2>/dev/null || true
+  local pid command
+  for pid in $(lsof -ti "tcp:${PORT}" -sTCP:LISTEN 2>/dev/null || true); do
+    command="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+    if [[ "${command}" == *"${PROJECT_DIRECTORY}"* ]]; then
+      printf '%s\n' "${pid}"
+    fi
+  done
 }
 
 targets=""
 if [[ -f "${PID_FILE}" ]]; then
   recorded="$(tr -cd '0-9' <"${PID_FILE}")"
-  if [[ -n "${recorded}" ]] && kill -0 "${recorded}" 2>/dev/null; then
+  recorded_command="$(ps -p "${recorded}" -o command= 2>/dev/null || true)"
+  if [[ -n "${recorded}" && "${recorded_command}" == *"${PROJECT_DIRECTORY}"* ]] \
+    && kill -0 "${recorded}" 2>/dev/null; then
     targets="${recorded}"
   fi
 fi

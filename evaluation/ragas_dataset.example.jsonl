@@ -1,0 +1,1 @@
+{"user_input":"Where is the service health endpoint?","response":"The service health endpoint is /health.","retrieved_contexts":["The service exposes GET /health for liveness checks."],"reference":"The service health endpoint is GET /health."}

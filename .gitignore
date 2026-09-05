@@ -11,6 +11,7 @@ htmlcov/
 __pycache__/
 .pytest_cache/
 .evaluation-cache/
+evaluation/ragas-results.json
 *.py[cod]
 *.egg-info/
 dist/
@@ -21,3 +22,9 @@ build/
 *.pfx
 credentials*.json
 secrets*.json
+
+# Local scratch, never committed
+_to_delete/
+
+# Local scratch, never committed
+_to_delete/

@@ -193,6 +193,12 @@ class ChromaAccessRetriever(BaseRetriever):
         return self._search(query, ())
 
     def _search(self, query: str, source_types: tuple[str, ...]) -> list[Document]:
+        vector = self.embedder.embed_query(query)
+        return self._search_with_vector(vector, source_types)
+
+    def _search_with_vector(
+        self, vector: list[float], source_types: tuple[str, ...]
+    ) -> list[Document]:
         filters: list[dict[str, dict[str, str | list[str]]]] = [
             {"project_id": {"$eq": self.project_id}},
             {"access_policy_id": {"$eq": f"project:{self.project_id}"}},
@@ -224,6 +230,12 @@ class ChromaAccessRetriever(BaseRetriever):
                 "locator",
                 "schema_version",
                 "source_version",
+                "canonical_entity_id",
+                "field_path",
+                "source_span",
+                "normalized_value",
+                "authority",
+                "observed_at",
                 "visual_eligible",
                 "visual_types",
                 "visual_asset_ids",
@@ -264,7 +276,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 "security_classification",
                 "credential_sensitive",
             ]
-        hits = self._search_local_vector(query, metadata_filter)
+        hits = self._search_local_vector(vector, metadata_filter)
         documents: list[Document] = []
         drops: dict[str, int] = {}
         for chunk_id, score, hit_fields in hits:
@@ -286,11 +298,10 @@ class ChromaAccessRetriever(BaseRetriever):
         return documents
 
     def _search_local_vector(
-        self, query: str, metadata_filter: dict[str, object]
+        self, vector: list[float], metadata_filter: dict[str, object]
     ) -> list[tuple[str, float, dict[str, object]]]:
-        """Query with a locally computed vector so no provider embedding quota is spent."""
+        """Query Chroma with a precomputed local vector."""
 
-        vector = self.embedder.embed_query(query)
         response = self.index.query(query_embeddings=[vector], n_results=self.top_k, where=metadata_filter, include=["documents", "metadatas", "distances"])
         self._record_usage(None, embedded_locally=True)
         hits: list[tuple[str, float, dict[str, object]]] = []
@@ -374,6 +385,12 @@ class ChromaAccessRetriever(BaseRetriever):
                 "locator": str(fields.get("locator") or ""),
                 "schema_version": str(fields.get("schema_version") or ""),
                 "source_version": str(fields.get("source_version") or ""),
+                "canonical_entity_id": str(fields.get("canonical_entity_id") or ""),
+                "field_path": str(fields.get("field_path") or ""),
+                "source_span": str(fields.get("source_span") or ""),
+                "normalized_value": str(fields.get("normalized_value") or ""),
+                "authority": int(fields.get("authority") or 0),
+                "observed_at": str(fields.get("observed_at") or ""),
                 "embedding_model": str(fields.get("embedding_model") or ""),
                 "visual_eligible": bool(fields.get("visual_eligible", False)),
                 "visual_types": _list_field(fields.get("visual_types")),
@@ -471,8 +488,21 @@ class ChromaAccessRetriever(BaseRetriever):
         """Retrieve with an additional server-selected source boundary."""
 
         try:
+            # Local transformer inference runs in a worker thread. Cancelling an
+            # asyncio.to_thread wait cannot stop that thread, so placing embedding
+            # inside the dependency retry loop multiplied CPU work after a timeout.
+            # Compute it exactly once; only the remote Chroma operation is retried.
+            #
+            # It is not unbounded, though. Against the accelerator the embedder
+            # carries its own socket timeout and replays only connection-level
+            # failures, so a lapsed attempt genuinely ends. In-process it is
+            # bounded by the forward pass itself, which is the trade this change
+            # accepts: no bound that leaves an orphan burning the GPU.
+            vector = await asyncio.to_thread(self.embedder.embed_query, query)
             documents, retry_count = await with_transient_retry(
-                lambda: asyncio.to_thread(self._search, query, source_types),
+                lambda: asyncio.to_thread(
+                    self._search_with_vector, vector, source_types
+                ),
                 attempts=self.retry_attempts,
                 timeout_seconds=self.timeout_seconds,
             )
@@ -555,7 +585,12 @@ class ChromaAccessRetriever(BaseRetriever):
             {"project_id": {"$eq": self.project_id}},
             {"access_policy_id": {"$eq": f"project:{self.project_id}"}},
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
-            {"source_id": {"$in": list(source_ids)}},
+            {
+                "$or": [
+                    {"source_id": {"$in": list(source_ids)}},
+                    {"parent_id": {"$in": list(source_ids)}},
+                ]
+            },
         ]
         normalized_types = tuple(
             dict.fromkeys(value.strip().upper() for value in source_types if value.strip())
@@ -622,28 +657,46 @@ class ChromaAccessRetriever(BaseRetriever):
             if len(identifiers) == 1
             else {"$or": [{"$contains": identifier} for identifier in identifiers]}
         )
-        response = self.index.get(
-            where={"$and": filters},
-            where_document=where_document,
-            include=["documents", "metadatas"],
-        )
+        structured_filter = {
+            "$or": [
+                {field: {"$in": list(identifiers)}}
+                for field in (
+                    "canonical_entity_id",
+                    "entity_key",
+                    "issue_key",
+                    "reference",
+                )
+            ]
+        }
+        responses = [
+            self.index.get(
+                where={"$and": [*filters, structured_filter]},
+                include=["documents", "metadatas"],
+            ),
+            self.index.get(
+                where={"$and": filters},
+                where_document=where_document,
+                include=["documents", "metadatas"],
+            ),
+        ]
         found: dict[str, Document] = {}
         drops: dict[str, int] = {}
-        for chunk_id, text, metadata in zip(
-            response.get("ids", []), response.get("documents", []),
-            response.get("metadatas", []), strict=True,
-        ):
-            fields = dict(metadata or {})
-            fields[self.text_field] = text or ""
-            document = self._document_from_fields(fields, str(chunk_id), 1.0, drops)
-            if document is None:
-                continue
-            document.metadata["identifier_anchor"] = True
-            document.metadata["identifier_anchor_score"] = max(
-                _identifier_anchor_score(identifier, document)
-                for identifier in identifiers
-            )
-            found[str(document.metadata.get("chunk_id") or chunk_id)] = document
+        for response in responses:
+            for chunk_id, text, metadata in zip(
+                response.get("ids", []), response.get("documents", []),
+                response.get("metadatas", []), strict=True,
+            ):
+                fields = dict(metadata or {})
+                fields[self.text_field] = text or ""
+                document = self._document_from_fields(fields, str(chunk_id), 1.0, drops)
+                if document is None:
+                    continue
+                document.metadata["identifier_anchor"] = True
+                document.metadata["identifier_anchor_score"] = max(
+                    _identifier_anchor_score(identifier, document)
+                    for identifier in identifiers
+                )
+                found[str(document.metadata.get("chunk_id") or chunk_id)] = document
         return sorted(
             found.values(),
             key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),

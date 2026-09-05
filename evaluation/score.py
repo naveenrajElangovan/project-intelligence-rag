@@ -17,7 +17,8 @@ def score(
     *,
     settings: Settings,
     project_id: str,
-) -> dict[str, float | int]:
+    _include_language_splits: bool = True,
+) -> dict[str, object]:
     answerable = [row for row in rows if row.get("answerable") is True]
     recalls, ndcgs = [], []
     resolved_gold_cases = 0
@@ -49,7 +50,7 @@ def score(
         if row.get("gold_chunk_ids")
         and row.get("role", "answer_evidence") == "answer_evidence"
     )
-    return {
+    summary: dict[str, object] = {
         "cases": len(rows),
         "recall_at_25": sum(recalls) / len(recalls) if recalls else 0,
         "ndcg_at_8": sum(ndcgs) / len(ndcgs) if ndcgs else 0,
@@ -61,9 +62,29 @@ def score(
         ),
         "cross_project_leakage": leakage,
     }
+    languages = sorted(
+        {str(row.get("query_language") or "und") for row in rows}
+    )
+    if _include_language_splits and languages != ["und"]:
+        summary["by_query_language"] = {
+            language: score(
+                [
+                    row
+                    for row in rows
+                    if str(row.get("query_language") or "und") == language
+                ],
+                settings=settings,
+                project_id=project_id,
+                _include_language_splits=False,
+            )
+            for language in languages
+        }
+    return summary
 
 
-def score_generation(rows: list[dict[str, object]]) -> dict[str, float | int]:
+def score_generation(
+    rows: list[dict[str, object]], *, _include_language_splits: bool = True
+) -> dict[str, object]:
     """Score only outcomes produced by generate, citation, and grounding gates."""
 
     answerable = [row for row in rows if row.get("answerable") is True]
@@ -94,7 +115,7 @@ def score_generation(rows: list[dict[str, object]]) -> dict[str, float | int]:
     divergent_groups = sum(
         len(signatures) > 1 for signatures in paraphrase_groups.values()
     )
-    return {
+    summary: dict[str, object] = {
         "cases": len(rows),
         "grounding_acceptance_rate": accepted / len(answerable) if answerable else 0,
         "citation_precision": citations_valid / citations_total if citations_total else 0,
@@ -109,6 +130,22 @@ def score_generation(rows: list[dict[str, object]]) -> dict[str, float | int]:
             else 0
         ),
     }
+    languages = sorted(
+        {str(row.get("query_language") or "und") for row in rows}
+    )
+    if _include_language_splits and languages != ["und"]:
+        summary["by_query_language"] = {
+            language: score_generation(
+                [
+                    row
+                    for row in rows
+                    if str(row.get("query_language") or "und") == language
+                ],
+                _include_language_splits=False,
+            )
+            for language in languages
+        }
+    return summary
 
 
 if __name__ == "__main__":

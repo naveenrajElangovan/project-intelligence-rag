@@ -18,7 +18,7 @@ from app.models import RagRequest
 from app.workflow_nodes.answering import _note_removed_claims
 
 GOOD = "`POS_LOGIN` is event id 101 at version 0.3 [SOURCE 1]."
-BAD = "The login event carries a terminal serial number field [SOURCE 1]."
+BAD = "Fabricated `LOGIN_ADMIN` is also emitted [SOURCE 1]."
 
 
 class _Retriever:
@@ -129,7 +129,7 @@ def test_verified_claim_survives_an_unsupported_sibling():
     finally:
         monkeypatch.undo()
     assert "101" in response.answer
-    assert "terminal serial number" not in response.answer
+    assert "LOGIN_ADMIN" not in response.answer
     assert response.evidence_status == "SUFFICIENT"
     assert _Safe.reasons == []
 

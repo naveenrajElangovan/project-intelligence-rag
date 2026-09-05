@@ -36,7 +36,7 @@ def test_answer_deltas_reconstruct_verified_markdown() -> None:
     assert "".join(_answer_deltas(answer, target_characters=12)) == answer
 
 
-def test_deterministic_finished_text_is_a_snapshot_not_simulated_deltas() -> None:
+def test_deterministic_finished_text_streams_only_verified_deltas() -> None:
     workflow = object.__new__(main_module.AuthorizedRagWorkflow)
     workflow._request = RagRequest(
         projectId="DEMO",
@@ -47,12 +47,12 @@ def test_deterministic_finished_text_is_a_snapshot_not_simulated_deltas() -> Non
 
     events = asyncio.run(_collect(workflow.stream()))
 
-    assert [event["type"] for event in events] == [
-        "answer_start",
-        "answer_snapshot",
-        "complete",
-    ]
-    assert events[1]["answer"] == events[-1]["response"]["answer"]
+    assert events[0]["type"] == "answer_start"
+    assert events[-1]["type"] == "complete"
+    deltas = [event for event in events if event["type"] == "answer_delta"]
+    assert "".join(event["delta"] for event in deltas) == events[-1]["response"]["answer"]
+    assert all(event["verification"] == "verified" for event in deltas)
+    assert not any(event["type"] == "answer_snapshot" for event in events)
 
 
 def test_progress_events_are_localized_and_content_free() -> None:
@@ -167,7 +167,7 @@ def test_stream_timeout_uses_static_error_without_another_llm_call(
     assert completion["reason_code"] == "TIMEOUTERROR"
 
 
-def test_incremental_stream_never_labels_a_failed_sentence_verified() -> None:
+def test_stream_withholds_factual_text_until_final_gate_then_emits_verified_deltas() -> None:
     request = RagRequest(
         projectId="second-project",
         collectionName="project-intelligence",
@@ -181,6 +181,7 @@ def test_incremental_stream_never_labels_a_failed_sentence_verified() -> None:
         incremental_verified_streaming_enabled=True,
     )
     workflow._request = request
+    workflow._vocabulary = type("Vocabulary", (), {"entities": ()})()
 
     class Graph:
         async def astream(self, _state, stream_mode, config):
@@ -223,14 +224,13 @@ def test_incremental_stream_never_labels_a_failed_sentence_verified() -> None:
     workflow._grounding_verifier = Verifier()
     workflow._response_from_state = types.MethodType(response_from_state, workflow)
     events = asyncio.run(_collect(workflow.stream()))
-    verified = "".join(
-        str(event.get("delta") or "")
-        for event in events
-        if event.get("verification") == "verified"
+    assert not any(event["type"] == "answer_sentence_rejected" for event in events)
+    deltas = [event for event in events if event["type"] == "answer_delta"]
+    assert "".join(event["delta"] for event in deltas) == (
+        "Supported project behavior is present."
     )
-    assert "Supported project behavior" in verified
-    assert "Invented project behavior" not in verified
-    assert any(event["type"] == "answer_sentence_rejected" for event in events)
+    assert all(event["verification"] == "verified" for event in deltas)
+    assert not any(event["type"] == "answer_snapshot" for event in events)
 
 
 def test_structured_generation_releases_each_citation_complete_sentence_early() -> None:
