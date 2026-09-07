@@ -38,10 +38,10 @@ Preguntas equivalentes:
 Rutas:
 
 - Inicio normal: `T2STORE-AUTH`, `[AUTH-LOGIN-NORMAL]`.
-- Rechazo: `[AUTH-INVALID]`, `[AUTH-RETRY-LIMIT]`.
-- Sin conexión: `[AUTH-OFFLINE]`, `[AUTH-OFFLINE-EXPIRED]`.
-- Contraseña: `[AUTH-PASSWORD-CHANGE]`, `[AUTH-PASSWORD-RESET]`.
-- Bloqueo: `[AUTH-LOCKED-SESSION]`, `[AUTH-UNLOCK]`.
+- Rechazo y límite de intentos: `[AUTH-INVALID]`.
+- Sin conexión o autorización vencida: `[AUTH-OFFLINE]`.
+- Contraseña: `[AUTH-PASSWORD-WARNING]`, `[AUTH-PASSWORD-REQUIRED]`, `[AUTH-PASSWORD-FAILED]`.
+- Bloqueo: `[AUTH-SESSION-LOCK]`, `[AUTH-SESSION-UNLOCK]`.
 - Procesamiento: `[AUTH-PROCESSING]`.
 
 ## [QUESTION-PERMISSION] Permisos y autorización
@@ -134,7 +134,7 @@ Preguntas equivalentes:
 - “¿Intento otra vez?”
 - “Se imprimió comprobante pero POS no terminó.”
 
-Ruta prioritaria: `T2STORE-PAY`, `[PAY-SAFETY-FIRST]`, `[PAY-AMBIGUOUS]`, `[PAY-DUPLICATE-PREVENTION]`, `[PAY-ESCALATE]`.
+Ruta prioritaria: `T2STORE-PAY`, `[PAY-SCOPE]`, `[PAY-PROCESSING]`, `[PAY-AMBIGUOUS-CHECKLIST]`, `[PAY-RETRY]`.
 
 Respuesta inmediata: no repetir el pago; conservar método, importe, hora, terminal, pantalla y comprobante permitido; verificar por el flujo aprobado o escalar.
 
@@ -154,7 +154,7 @@ Rutas:
 - Efectivo: `T2STORE-PAY`, `[PAY-CASH]`.
 - Mixto: `[PAY-MIXED]`.
 - Cajón: `T2STORE-PRINT`, `[PRINT-CASH-DRAWER]`.
-- Resultado parcial: `[PAY-AMBIGUOUS]`.
+- Resultado parcial: `[PAY-AMBIGUOUS-CHECKLIST]`.
 
 ## [QUESTION-CARD] Tarjeta y Santander
 
@@ -169,7 +169,7 @@ Preguntas equivalentes:
 - “¿Cómo cancelo el pago con tarjeta?”
 - “¿Cómo concilio el cobro?”
 
-Rutas: `T2STORE-PAY`, `[PAY-CARD-START]`, `[PAY-CARD-PROCESSING]`, `[PAY-CARD-DECLINED]`, `[PAY-CARD-APPROVED-POS-UNKNOWN]`, `[PAY-CARD-CANCEL]`, `[PAY-RECONCILIATION]`.
+Rutas: `T2STORE-PAY`, `[PAY-CARD]`, `[PAY-PROCESSING]`, `[PAY-CARD-DECLINED]`, `[PAY-CARD-APPROVED-POS-PENDING]`, `[PAY-CANCEL]`, `[PAY-AMBIGUOUS-CHECKLIST]`.
 
 ## [QUESTION-CODI] CoDi
 
@@ -184,7 +184,7 @@ Preguntas equivalentes:
 - “Cancelé el QR.”
 - “¿Genero otro código?”
 
-Rutas: `T2STORE-PAY`, `[PAY-CODI-QR]`, `[PAY-CODI-WAITING]`, `[PAY-CODI-ACCEPTED]`, `[PAY-CODI-REJECTED]`, `[PAY-CODI-TIMEOUT]`, `[PAY-CODI-CANCEL]`.
+Rutas: `T2STORE-PAY`, `[PAY-CODI]`, `[PAY-PROCESSING]`, `[PAY-CODI-DECLINED]`, `[PAY-CODI-TIMEOUT]`, `[PAY-CANCEL]`.
 
 Si el cliente muestra cargo o aceptación, no generar otro QR.
 
@@ -200,7 +200,7 @@ Preguntas equivalentes:
 - “El dispositivo no responde.”
 - “¿Puedo volver a pasarla?”
 
-Rutas: `T2STORE-PAY`, `[PAY-VOUCHER-DETECT]`, `[PAY-VOUCHER-BALANCE]`, `[PAY-VOUCHER-CHARGE]`, `[PAY-VOUCHER-REJECTED]`, `[PAY-VOUCHER-DEVICE]`.
+Rutas: `T2STORE-PAY`, `[PAY-EVALE]`, `[PAY-EVALE-NOT-DETECTED]`, `[PAY-EVALE-BALANCE]`, `[PAY-RETRY]`.
 
 ## [QUESTION-SERVICES] Servicios y tiempo aire
 
@@ -213,7 +213,7 @@ Preguntas equivalentes:
 - “El proveedor no respondió.”
 - “¿Vuelvo a vender la recarga?”
 
-Rutas: `T2STORE-PAY`, `[PAY-SERVICE]`, `[PAY-AIRTIME]`, `[PAY-SERVICE-UNKNOWN]`; impresión en `T2STORE-PRINT`, `[PRINT-SERVICE-AIRTIME]`.
+Rutas: `T2STORE-PAY`, `[PAY-SERVICE]`, `[PAY-AIRTIME]`, `[PAY-AMBIGUOUS-CHECKLIST]`; impresión en `T2STORE-PRINT`, `[PRINT-SERVICE-AIRTIME]`.
 
 No repetir una recarga o servicio con resultado ambiguo.
 
@@ -246,7 +246,7 @@ Preguntas equivalentes:
 - “No puedo cerrar el día.”
 - “¿Qué pendientes bloquean el cierre?”
 
-Rutas: `T2STORE-BOTOPS`, `[BOTOPS-STARTUP]`, `[BOTOPS-START-DAY]`, `[BOTOPS-EXISTING-DAY]`, `[BOTOPS-DASHBOARD]`, `[BOTOPS-POS-REQUESTS]`, `[BOTOPS-END-DAY-BLOCKERS]`, `[BOTOPS-END-DAY]`.
+Rutas: `T2STORE-BOTOPS`, `[BOTOPS-START]`, `[BOTOPS-START-DAY]`, `[BOTOPS-DASHBOARD]`, `[BOTOPS-POS-REQUEST]`, `[BOTOPS-END-DAY-BLOCKERS]`, `[BOTOPS-END-DAY]`.
 
 ## [QUESTION-CASH-OPS] Efectivo, alivios y gastos
 
@@ -263,7 +263,7 @@ Preguntas equivalentes:
 Rutas:
 
 - POS: `T2STORE-POSOPS`, `[POSOPS-ADDITIONAL-FUNDING]`, `[POSOPS-CASH-RELIEF]`, `[POSOPS-EXPENSE-WITHDRAWAL]`, `[POSOPS-EXPENSE-SETTLEMENT]`.
-- BOT: `T2STORE-BOTOPS`, `[BOTOPS-FUNDING]`, `[BOTOPS-RELIEF]`, `[BOTOPS-EXPENSE]`, `[BOTOPS-CASH-DELIVERY]`.
+- BOT: `T2STORE-BOTOPS`, `[BOTOPS-INITIAL-FUND]`, `[BOTOPS-ADDITIONAL-FUND]`, `[BOTOPS-RELIEF]`, `[BOTOPS-EXPENSE]`, `[BOTOPS-CASH-DELIVERY]`.
 - Impresión: `T2STORE-PRINT`, `[PRINT-FUNDING]`, `[PRINT-RELIEF]`, `[PRINT-EXPENSE]`.
 
 ## [QUESTION-MERCHANDISE] Recepción, transferencias y merma
@@ -346,7 +346,7 @@ Preguntas equivalentes:
 - “La sesión de la herramienta venció.”
 - “¿Cómo regreso a BOT?”
 
-Rutas: `T2STORE-TOOLS`, `[PDF-CREATE]`, `[PDF-PREVIEW]`, `[PDF-PRINT]`, `[PDF-FAILED]`, `[WEBVIEW-OPEN]`, `[WEBVIEW-LOADING]`, `[WEBVIEW-BLANK]`, `[WEBVIEW-SESSION]`, `[WEBVIEW-RETURN]`.
+Rutas: `T2STORE-TOOLS`, `[PDF-GENERATION]`, `[PDF-FAILURE]`, `[TOOLS-OPEN]`, `[TOOLS-BLANK]`, `[TOOLS-INIT-ERROR]`, `[TOOLS-EXTERNAL-SESSION]`.
 
 ## [QUESTION-NAVIGATION] Búsqueda, tablas, diálogos y teclado
 
@@ -361,7 +361,7 @@ Preguntas equivalentes:
 - “El teclado no responde.”
 - “¿Cuáles son los atajos?”
 
-Rutas: `T2STORE-TOOLS`, `[TABLE-SEARCH]`, `[TABLE-EMPTY]`, `[TABLE-PAGINATION]`, `[TABLE-SELECTION]`, `[DIALOG-CONFIRM]`, `[NAV-BACK-CANCEL]`, `[KEYBOARD-FOCUS]`, `[KEYBOARD-SHORTCUTS]`.
+Rutas: `T2STORE-TOOLS`, `[TABLE-SEARCH]`, `[TABLE-EMPTY]`, `[TABLE-PAGINATION]`, `[DIALOG-CONFIRM]`, `[KEYBOARD]`.
 
 No inventar atajos no confirmados en la pantalla liberada.
 
@@ -377,7 +377,7 @@ Preguntas equivalentes:
 - “El movimiento no llega.”
 - “¿Reinicio para sincronizar?”
 
-Rutas: `T2STORE-TOOLS`, `[OFFLINE-VISIBLE]`, `[OFFLINE-SAVED-WORK]`, `[OFFLINE-MISSING-DATA]`, `[SYNC-POS-BOT]`, `[SYNC-DELAYED]`, `[LINUX-RESTART-BOUNDARY]`.
+Rutas: `T2STORE-AUTH`, `[AUTH-OFFLINE]`; documento maestro `T2.0-STORE`, `[SYNC-01]`; y `T2STORE-TOOLS`, `[TOOLS-INIT-ERROR]`, `[LINUX-RESTART]`.
 
 No afirmar que una operación se guardó si no existe confirmación visible.
 
@@ -411,7 +411,7 @@ Preguntas equivalentes:
 - “¿Puedo reiniciar la computadora?”
 - “Dame un comando de Linux.”
 
-Rutas: `T2STORE-TOOLS`, `[LINUX-RESTART-CHECK]`, `[LINUX-RESTART-BOUNDARY]`, `[LINUX-NO-COMMANDS]`; para pago usar antes `T2STORE-PAY`, `[PAY-AMBIGUOUS]`.
+Rutas: `T2STORE-TOOLS`, `[LINUX-BOUNDARY]`, `[LINUX-RESTART]`; para pago usar antes `T2STORE-PAY`, `[PAY-AMBIGUOUS-CHECKLIST]`.
 
 No proporcionar comandos. Antes de cerrar, confirmar que no exista pago, impresión, importación, confirmación o cierre en proceso.
 
@@ -455,4 +455,3 @@ Antes de publicar:
 - Verificar preguntas cortas, errores ortográficos comunes y mensajes exactos de pantalla.
 - Confirmar que pagos ambiguos siempre producen una advertencia de no repetir.
 - Confirmar que preguntas fuera de alcance no reciben conocimiento general.
-
