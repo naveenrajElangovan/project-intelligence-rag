@@ -365,6 +365,13 @@ authorization, validation, and quota-exhaustion errors are not blindly retried.
 
 ## 15. Observability and privacy
 
+Observability ownership is intentionally split. Phoenix owns RAG traces,
+offline retrieval evaluation, RAGAS answer evaluation, bilingual comparisons,
+and quality history. Prometheus/Grafana own operational behavior only: traffic,
+latency, capacity, token usage, retries, and dependency or retrieval failures.
+RAG quality scores are never exported as Prometheus metrics or reproduced in a
+Grafana dashboard.
+
 Metrics and structured events may include request ID, project ID, stage, duration, candidate counts,
 model/profile, token counts, retry counts, outcome, and safe reason codes.
 

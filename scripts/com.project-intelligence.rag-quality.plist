@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.project-intelligence.rag-quality</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/naveenrajelangovan/Desktop/project-intelligence-rag/scripts/run_quality_monitor.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/naveenrajelangovan/Desktop/project-intelligence-rag</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PI_RAG_QUALITY_PROJECT_ID</key>
+    <string>T2.0</string>
+    <key>PI_RAG_RAGAS_REFERENCES</key>
+    <string>/absolute/path/to/reviewed-bilingual-references.jsonl</string>
+    <key>PI_RAG_RAGAS_MODEL</key>
+    <string>pi-qwen3.5:2026-08</string>
+    <key>PI_RAG_PHOENIX_URL</key>
+    <string>http://127.0.0.1:6006</string>
+    <!-- Keep the collector in path so its privacy scrubber is always applied. -->
+    <key>PI_RAG_OPENINFERENCE_OTLP_ENDPOINT</key>
+    <string>http://127.0.0.1:4318/v1/traces</string>
+    <key>PI_RAG_QUALITY_OUTPUT_DIR</key>
+    <string>/Users/naveenrajelangovan/Desktop/project-intelligence-rag/.quality-runs</string>
+    <key>PI_RAG_DATASET_VERSION</key>
+    <string>1</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/naveenrajelangovan/Desktop/project-intelligence-rag/.quality-runs/logs/quality-monitor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/naveenrajelangovan/Desktop/project-intelligence-rag/.quality-runs/logs/quality-monitor.error.log</string>
+</dict>
+</plist>

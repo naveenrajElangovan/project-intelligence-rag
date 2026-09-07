@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter, defaultdict, deque
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -45,9 +47,25 @@ from app.retrieval_pipeline import (
     deduplicate_candidate_bodies,
 )
 try:
-    from evaluation.score import score, score_generation
+    from evaluation.phoenix_client import publish_scores_to_phoenix
+    from evaluation.score import (
+        generation_dashboard_scores,
+        generation_dashboard_sample_counts,
+        retrieval_dashboard_sample_counts,
+        retrieval_dashboard_scores,
+        score,
+        score_generation,
+    )
 except ModuleNotFoundError:  # Direct `python evaluation/run_retrieval_eval.py` execution.
-    from score import score, score_generation
+    from phoenix_client import publish_scores_to_phoenix
+    from score import (
+        generation_dashboard_scores,
+        generation_dashboard_sample_counts,
+        retrieval_dashboard_sample_counts,
+        retrieval_dashboard_scores,
+        score,
+        score_generation,
+    )
 
 
 # entity_key is carried through from ingestion (structured_chunking sets it on
@@ -88,6 +106,96 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _apply_reviewed_references(
+    cases: list[dict[str, Any]], path: Path, *, expected_dataset_version: str
+) -> list[dict[str, Any]]:
+    """Join separately reviewed references onto source-bound bilingual cases."""
+
+    references = _load_jsonl(path)
+    by_id: dict[str, dict[str, Any]] = {}
+    for reference in references:
+        case_id = str(reference.get("case_id") or "")
+        if not case_id or case_id in by_id:
+            raise ValueError(f"Invalid or duplicate reviewed reference case_id: {case_id!r}")
+        if reference.get("reference_status") != "reviewed":
+            raise ValueError(f"Reference {case_id} is not marked reviewed")
+        if not str(reference.get("reference") or "").strip():
+            raise ValueError(f"Reference {case_id} has no answer text")
+        by_id[case_id] = reference
+    versions = {str(reference.get("dataset_version") or "") for reference in references}
+    if versions != {expected_dataset_version}:
+        raise ValueError(
+            "Reviewed reference dataset_version mismatch: "
+            f"expected {expected_dataset_version!r}, found {sorted(versions)!r}"
+        )
+    known = {str(case.get("id")) for case in cases}
+    unknown = sorted(by_id.keys() - known)
+    if unknown:
+        raise ValueError(f"Reviewed references name unknown cases: {unknown[:10]}")
+    merged: list[dict[str, Any]] = []
+    for case in cases:
+        reference = by_id.get(str(case.get("id")))
+        if reference is None:
+            merged.append(case)
+            continue
+        if reference.get("query_language") != case.get("query_language"):
+            raise ValueError(f"Reference language does not match case {case.get('id')}")
+        if reference.get("target_evidence_language") != case.get(
+            "target_evidence_language"
+        ):
+            raise ValueError(
+                f"Reference evidence language does not match case {case.get('id')}"
+            )
+        expected_question_hash = hashlib.sha256(
+            str(case.get("question") or "").encode("utf-8")
+        ).hexdigest()
+        if reference.get("question_sha256") != expected_question_hash:
+            raise ValueError(
+                f"Reference question_sha256 does not match case {case.get('id')}"
+            )
+        merged.append(
+            {
+                **case,
+                "reference": reference["reference"],
+                "reference_status": "reviewed",
+                "dataset_version": expected_dataset_version,
+            }
+        )
+    return merged
+
+
+def _reviewed_bilingual_ragas_cases(
+    cases: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    expected = [
+        case
+        for case in cases
+        if case.get("suite") == "bilingual_curated"
+        and case.get("answerable") is True
+        and case.get("retired") is not True
+    ]
+    missing = [
+        str(case.get("id"))
+        for case in expected
+        if case.get("reference_status") != "reviewed"
+    ]
+    if missing:
+        raise ValueError(
+            "Reviewed bilingual references are incomplete: "
+            + ", ".join(missing[:10])
+        )
+    directions = {
+        (case.get("query_language"), case.get("target_evidence_language"))
+        for case in expected
+    }
+    required = {("en", "en"), ("es", "es"), ("en", "es"), ("es", "en")}
+    if not required.issubset(directions):
+        raise ValueError(
+            f"Reviewed bilingual references are missing directions: {sorted(required - directions)}"
+        )
+    return expected
 
 
 def retired_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -763,7 +871,18 @@ async def _main(arguments: argparse.Namespace) -> None:
     )
     reranker = build_reranker(settings)
     all_cases = _load_evaluation_cases(arguments.suites)
-    cases = [case for case in all_cases if case.get("evaluation_lane") != "generation"]
+    if arguments.ragas_references:
+        all_cases = _apply_reviewed_references(
+            all_cases,
+            arguments.ragas_references,
+            expected_dataset_version=arguments.dataset_version,
+        )
+    cases = [
+        case
+        for case in all_cases
+        if case.get("evaluation_lane") != "generation"
+        and case.get("retired") is not True
+    ]
     wrong_project = [case.get("id") for case in all_cases if case.get("project_id") != arguments.project_id]
     if wrong_project:
         raise ValueError(
@@ -825,6 +944,7 @@ async def _main(arguments: argparse.Namespace) -> None:
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
+    _publish_retrieval_quality(summary, settings=settings, arguments=arguments)
     if arguments.generate:
         generation_out = arguments.generation_out or arguments.out.with_name(
             f"{arguments.out.stem}.generation.jsonl"
@@ -842,6 +962,166 @@ async def _main(arguments: argparse.Namespace) -> None:
         )
         print("GENERATION_LANE", flush=True)
         print(json.dumps(generation_summary, indent=2, sort_keys=True))
+        _publish_generation_quality(
+            generation_summary, settings=settings, arguments=arguments
+        )
+    if arguments.ragas_references:
+        ragas_cases = _reviewed_bilingual_ragas_cases(all_cases)
+        bilingual_generation_cases = [
+            case
+            for case in all_cases
+            if case.get("suite") == "bilingual_curated"
+            and case.get("retired") is not True
+        ]
+        generation_output = arguments.ragas_out.with_name(
+            f"{arguments.ragas_out.stem}.generation.jsonl"
+        )
+        generation_rows = await _run_generation_lane(
+            bilingual_generation_cases,
+            settings=settings,
+            project_id=arguments.project_id,
+            output=generation_output,
+        )
+        generation_summary = score_generation(generation_rows)
+        generation_summary_path = generation_output.with_suffix(".json")
+        generation_summary_path.write_text(
+            json.dumps(generation_summary, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        ragas_ids = {str(case.get("id")) for case in ragas_cases}
+        ragas_rows = [row for row in generation_rows if str(row.get("id")) in ragas_ids]
+        if len(ragas_rows) != len(ragas_cases):
+            raise RuntimeError(
+                "Bilingual RAGAS input is incomplete: "
+                f"expected {len(ragas_cases)} rows, found {len(ragas_rows)}"
+            )
+        arguments.ragas_out.parent.mkdir(parents=True, exist_ok=True)
+        arguments.ragas_out.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in ragas_rows),
+            encoding="utf-8",
+        )
+        print("BILINGUAL_GENERATION_DIAGNOSTICS", flush=True)
+        print(json.dumps(generation_summary, indent=2, sort_keys=True))
+        _publish_generation_quality(
+            generation_summary, settings=settings, arguments=arguments
+        )
+
+
+def _publish_retrieval_quality(
+    summary: dict[str, object], *, settings: Settings, arguments: argparse.Namespace
+) -> None:
+    """Publish only content-free retrieval aggregates to the Phoenix quality project."""
+
+    if not arguments.phoenix_url:
+        return
+    from app.openinference_tracing import configure_openinference
+
+    tracing_settings = settings.model_copy(
+        update={
+            "openinference_enabled": True,
+            "openinference_otlp_endpoint": arguments.openinference_otlp_endpoint,
+        }
+    )
+    provider = configure_openinference(tracing_settings)
+    if provider is None:
+        return
+    try:
+        tracer = provider.get_tracer("project-intelligence-quality")
+        with tracer.start_as_current_span(
+            "rag.quality.retrieval",
+            attributes={
+                "openinference.span.kind": "CHAIN",
+                "quality.section": "retrieval",
+                "quality.run_id": arguments.quality_run_id or "standalone",
+                "quality.sample_count": int(summary.get("cases", 0)),
+            },
+        ) as span:
+            span_id = format(span.get_span_context().span_id, "016x")
+        provider.force_flush()
+        publish_scores_to_phoenix(
+            arguments.phoenix_url,
+            span_id,
+            retrieval_dashboard_scores(summary),
+            int(summary.get("cases", 0)),
+            section="retrieval",
+            annotator_kind="CODE",
+            metadata={
+                "run_id": arguments.quality_run_id or "standalone",
+                "project_id": arguments.project_id,
+                "dataset_version": arguments.dataset_version,
+                "commit_sha": arguments.commit_sha,
+                "embedding_model": settings.local_embedding_model,
+                "rerank_model": settings.local_rerank_model,
+                "sample_count_en": int(
+                    (summary.get("by_query_language", {}) or {}).get("en", {}).get("cases", 0)
+                ),
+                "sample_count_es": int(
+                    (summary.get("by_query_language", {}) or {}).get("es", {}).get("cases", 0)
+                ),
+                "retrieval_top_k": settings.retrieval_top_k,
+                "rerank_top_n": settings.rerank_top_n,
+            },
+            sample_counts=retrieval_dashboard_sample_counts(summary),
+        )
+    finally:
+        provider.shutdown()
+
+
+def _publish_generation_quality(
+    summary: dict[str, object], *, settings: Settings, arguments: argparse.Namespace
+) -> None:
+    """Publish content-free deterministic generation diagnostics to Phoenix."""
+
+    if not arguments.phoenix_url:
+        return
+    from app.openinference_tracing import configure_openinference
+
+    tracing_settings = settings.model_copy(
+        update={
+            "openinference_enabled": True,
+            "openinference_otlp_endpoint": arguments.openinference_otlp_endpoint,
+        }
+    )
+    provider = configure_openinference(tracing_settings)
+    if provider is None:
+        return
+    try:
+        tracer = provider.get_tracer("project-intelligence-quality")
+        with tracer.start_as_current_span(
+            "rag.quality.answer_generation",
+            attributes={
+                "openinference.span.kind": "CHAIN",
+                "quality.section": "answer_generation",
+                "quality.run_id": arguments.quality_run_id or "standalone",
+                "quality.sample_count": int(summary.get("cases", 0)),
+                "quality.evaluator": "deterministic",
+            },
+        ) as span:
+            span_id = format(span.get_span_context().span_id, "016x")
+        provider.force_flush()
+        publish_scores_to_phoenix(
+            arguments.phoenix_url,
+            span_id,
+            generation_dashboard_scores(summary),
+            int(summary.get("cases", 0)),
+            section="answer_generation",
+            annotator_kind="CODE",
+            metadata={
+                "run_id": arguments.quality_run_id or "standalone",
+                "project_id": arguments.project_id,
+                "dataset_version": arguments.dataset_version,
+                "commit_sha": arguments.commit_sha,
+                "sample_count_en": int(
+                    (summary.get("by_query_language", {}) or {}).get("en", {}).get("cases", 0)
+                ),
+                "sample_count_es": int(
+                    (summary.get("by_query_language", {}) or {}).get("es", {}).get("cases", 0)
+                ),
+            },
+            sample_counts=generation_dashboard_sample_counts(summary),
+        )
+    finally:
+        provider.shutdown()
 
 
 def _stratified_sample(cases: list[dict[str, Any]], size: int) -> list[dict[str, Any]]:
@@ -908,29 +1188,48 @@ async def _run_generation_lane(
             accessPolicyIds=[f"project:{project_id}"],
             modelProfile="budget",
         )
-        response = await AuthorizedRagWorkflow(settings, request).run()
+        evaluation_result = await AuthorizedRagWorkflow(
+            settings, request
+        ).run_for_evaluation()
+        response = evaluation_result.response
         cited = [source.reference for source in response.sources if source.reference]
-        rows.append(
-            {
-                "id": case.get("id"),
-                "suite": case.get("suite"),
-                "query_language": case.get("query_language") or "und",
-                "target_evidence_language": case.get("target_evidence_language") or "und",
-                "paraphrase_group": case.get("paraphrase_group"),
-                "answerable": bool(case.get("answerable")),
-                "answered": response.confidence != "NONE",
-                "grounding_accepted": response.evidence_status == "SUFFICIENT",
-                "cited_source_ids": cited,
-                "valid_citation_count": len(cited),
-                "refusal_reason": response.refusal_reason,
-                "expected_refusal_reason": case.get("expected_refusal_reason"),
-            }
-        )
+        row = {
+            "id": case.get("id"),
+            "case_id": case.get("id"),
+            "suite": case.get("suite"),
+            "query_language": case.get("query_language") or "und",
+            "target_evidence_language": case.get("target_evidence_language") or "und",
+            "paraphrase_group": case.get("paraphrase_group"),
+            "answerable": bool(case.get("answerable")),
+            "answered": response.confidence != "NONE",
+            "grounding_accepted": response.evidence_status == "SUFFICIENT",
+            "cited_source_ids": cited,
+            "valid_citation_count": len(cited),
+            "refusal_reason": response.refusal_reason,
+            "expected_refusal_reason": case.get("expected_refusal_reason"),
+        }
+        if case.get("reference") and case.get("reference_status") == "reviewed":
+            row.update(
+                {
+                    "user_input": str(case["question"]),
+                    "response": response.answer,
+                    "retrieved_contexts": list(evaluation_result.retrieved_contexts),
+                    "reference": str(case["reference"]),
+                    "reference_status": "reviewed",
+                    "dataset_version": case.get("dataset_version", "1"),
+                }
+            )
+        rows.append(row)
         output.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
             encoding="utf-8",
         )
         print(f"generation_case={position}/{len(cases)} id={case.get('id')}", flush=True)
+    if len(rows) != len(cases):
+        raise RuntimeError(
+            "Generation lane output is incomplete or duplicated: "
+            f"expected {len(cases)} rows, found {len(rows)}"
+        )
     return rows
 
 
@@ -960,6 +1259,17 @@ def main() -> None:
     )
     parser.add_argument("--generation-out", type=Path)
     parser.add_argument(
+        "--ragas-references",
+        type=Path,
+        help="Reviewed reference-answer JSONL joined by bilingual case_id.",
+    )
+    parser.add_argument(
+        "--ragas-out",
+        type=Path,
+        default=Path(".quality-runs/ragas-generated.jsonl"),
+        help="Local content-bearing RAGAS input generated from the production workflow.",
+    )
+    parser.add_argument(
         "--minimum-gold-resolution-rate",
         type=float,
         default=_MINIMUM_GOLD_RESOLUTION_RATE,
@@ -970,6 +1280,20 @@ def main() -> None:
     parser.add_argument("--rerank-top-n", type=int)
     parser.add_argument("--rerank-score-threshold", type=float)
     parser.add_argument("--max-chunks-per-source", type=int)
+    parser.add_argument(
+        "--phoenix-url",
+        default=os.getenv("PI_RAG_PHOENIX_URL", ""),
+        help="Publish aggregate retrieval quality annotations to Phoenix when set.",
+    )
+    parser.add_argument(
+        "--openinference-otlp-endpoint",
+        default=os.getenv(
+            "PI_RAG_OPENINFERENCE_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces"
+        ),
+    )
+    parser.add_argument("--quality-run-id", default=os.getenv("PI_RAG_QUALITY_RUN_ID", ""))
+    parser.add_argument("--dataset-version", default=os.getenv("PI_RAG_DATASET_VERSION", "1"))
+    parser.add_argument("--commit-sha", default=os.getenv("PI_RAG_COMMIT_SHA", "unknown"))
     parser.add_argument(
         "--reranker-sweep-out",
         type=Path,

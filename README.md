@@ -70,8 +70,9 @@ Backend authorization and ingestion procedures live in their respective reposito
 Executable production-component labs are in [labs/README.md](labs/README.md). The evidence-derived
 live DEMO acceptance gate is `evaluation/t2_live_acceptance.json`. The default local evaluation
 also loads the 80 source-bound bilingual cases in `evaluation/bilingual_gold_suites.jsonl` and
-reports every metric by query language. `evaluation/run_retrieval_eval.py` has two deliberately
-separate lanes: the default 378-case
+reports every metric by query language. Retired cases remain recorded with their reasons but are
+excluded from scoring; the current active retrieval lane contains 284 cases.
+`evaluation/run_retrieval_eval.py` has two deliberately separate lanes: the default
 retrieval gate reports recall, nDCG, and gold survival; `--generate N` (30–40) runs the full
 generation, citation-validation, and grounding workflow and is the only lane that reports
 grounding acceptance, citation precision, refusal precision, and refusal-reason accuracy. The
@@ -100,9 +101,35 @@ run it against a curated JSONL file containing `user_input`, `response`,
 The evaluator uses the local OpenAI-compatible Ollama endpoint by default,
 writes `evaluation/ragas-results.json`, attaches aggregate scores to its
 evaluation span in Phoenix, and traces evaluator model calls through
-OpenInference. Grafana does not duplicate these RAG quality results.
-Context recall and faithfulness are the default local metrics. Add
-`--include-factual-correctness` for the slower nightly factual-correctness
-judge; on the bundled local model this can take several minutes per sample.
+OpenInference. Faithfulness, answer relevancy, and answer correctness are the
+standard answer-generation metrics. Add `--include-factual-correctness` for the
+slower optional diagnostic; on the bundled local model this can take several
+minutes per sample.
 Use a reviewed internal dataset rather than production conversations unless
 your privacy policy explicitly permits evaluation of that content.
+
+Phoenix is the sole owner of RAG quality history. A completed quality run has
+`rag.quality.retrieval` and `rag.quality.answer_generation` child spans. Each
+contains overall, English, Spanish, signed language-gap, and absolute-gap annotations. Only scores,
+counts, version identifiers, and model names are published; evaluation content
+stays in the local gitignored run directory. Prometheus and Grafana remain for
+operational health (latency, traffic, capacity, dependency failures, retries,
+and tokens) and must not duplicate these quality scores.
+
+`scripts/run_quality_monitor.sh` runs both sections and publishes them only
+after both finish. Set `PI_RAG_RAGAS_REFERENCES` to a reviewed bilingual
+reference-answer JSONL file and `PI_RAG_QUALITY_PROJECT_ID` to the authorized
+project. Each reference row contains `case_id`, both language fields,
+`question_sha256`, `reference`, `reference_status: "reviewed"`, and one shared
+`dataset_version`; the monitor joins these
+to the source-bound cases and generates fresh answers and exact contexts through
+the production workflow. Generate the 60-row review worksheet with
+`.venv/bin/python -m evaluation.build_bilingual_reference_template --out <path>`;
+an owner must fill each reference from its approved gold source and change its
+status only after review. The supplied
+`scripts/com.project-intelligence.rag-quality.plist` schedules it daily at
+02:00 local time on the validated macOS evaluation host. Replace the reference
+path placeholder in that file, then copy and load it explicitly after the
+dataset and local services are ready. The plist is intentionally not installed
+until all bilingual references have been reviewed. The same script is the pre-release
+quality command.

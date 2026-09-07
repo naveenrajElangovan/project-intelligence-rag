@@ -1,0 +1,62 @@
+"""Evaluation-only access to final workflow evidence, outside the HTTP contract."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from app.models import RagResponse
+from app.telemetry import started
+from app.workflow_support.execution import invoke_bounded_graph
+from app.workflow_support.fail_closed import clarification_response
+from app.workflow_support.json_transform import json_transform_response
+from app.workflow_support.query_analysis import resolve_response_language
+
+
+@dataclass(frozen=True)
+class WorkflowEvaluationResult:
+    response: RagResponse
+    retrieved_contexts: tuple[str, ...]
+    query_language: str
+
+
+class EvaluationWorkflowMixin:
+    """Execute the same graph and final output gate while retaining local evidence."""
+
+    _request: Any
+    _settings: Any
+    _vocabulary: Any
+    _graph: Any
+
+    async def run_for_evaluation(self) -> WorkflowEvaluationResult:
+        began = started()
+        deterministic = json_transform_response(self._request, began)
+        if deterministic is not None:
+            return WorkflowEvaluationResult(
+                deterministic, (), resolve_response_language(self._request.question)
+            )
+        clarification = clarification_response(
+            self._request, self._vocabulary.entities
+        )
+        if clarification is not None:
+            return WorkflowEvaluationResult(
+                clarification, (), resolve_response_language(self._request.question)
+            )
+        state = await invoke_bounded_graph(
+            self._graph,
+            {"request": self._request, "_workflow": self},
+            project_id=self._request.project_id,
+            max_retrieval_attempts=self._settings.max_retrieval_attempts,
+            began=began,
+        )
+        response = await self._response_from_state(state, began)
+        return WorkflowEvaluationResult(
+            response=response,
+            retrieved_contexts=tuple(
+                document.page_content for document in state.get("documents", [])
+            ),
+            query_language=(
+                state.get("language")
+                or resolve_response_language(self._request.question)
+            ),
+        )

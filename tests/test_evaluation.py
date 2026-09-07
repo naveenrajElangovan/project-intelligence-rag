@@ -1,19 +1,150 @@
 import runpy
+import hashlib
+import json
 import math
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app.config import Settings
+from app.models import RagResponse
+from app.workflow import AuthorizedRagWorkflow
+from langchain_core.documents import Document
 from evaluation.run_retrieval_eval import (
+    _MINIMUM_GOLD_RESOLUTION_RATE,
+    _apply_reviewed_references,
+    _reviewed_bilingual_ragas_cases,
     _generation_sample,
     _gold_ids,
     _load_evaluation_cases,
+    _run_generation_lane,
     _stratified_sample,
     _validate_gold_resolution,
 )
-from evaluation.score import score, score_generation
+from evaluation.score import (
+    generation_dashboard_scores,
+    generation_dashboard_sample_counts,
+    retrieval_dashboard_sample_counts,
+    retrieval_dashboard_scores,
+    score,
+    score_generation,
+)
+from evaluation.build_bilingual_reference_template import build as build_reference_template
 
 
 EVALUATION = Path(__file__).parents[1] / "evaluation"
+
+
+def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None:
+    response = RagResponse(
+        answer="Grounded answer",
+        status="ANSWERED",
+        confidence="HIGH",
+        projectId="T2.0",
+        sources=[],
+        missingInformation=[],
+    )
+    state = {
+        "language": "es",
+        "documents": [Document(page_content="evidencia", metadata={})],
+    }
+    workflow = object.__new__(AuthorizedRagWorkflow)
+    workflow._request = SimpleNamespace(question="pregunta", project_id="T2.0")
+    workflow._settings = SimpleNamespace(max_retrieval_attempts=2)
+    workflow._vocabulary = SimpleNamespace(entities=())
+    workflow._graph = object()
+
+    async def invoke(*_args, **_kwargs):
+        return state
+
+    async def response_from_state(actual_state, _began):
+        assert actual_state is state
+        return response
+
+    monkeypatch.setattr("app.workflow_evaluation.invoke_bounded_graph", invoke)
+    monkeypatch.setattr("app.workflow_evaluation.json_transform_response", lambda *_: None)
+    monkeypatch.setattr("app.workflow_evaluation.clarification_response", lambda *_: None)
+    monkeypatch.setattr(workflow, "_response_from_state", response_from_state)
+    evaluated = asyncio.run(workflow.run_for_evaluation())
+    assert evaluated.response is response
+    assert evaluated.retrieved_contexts == ("evidencia",)
+    assert evaluated.query_language == "es"
+
+
+def test_quality_monitoring_does_not_change_runtime_gates() -> None:
+    settings = Settings(_env_file=None, environment="development")
+    assert settings.rerank_score_threshold == 0.10
+    assert settings.rerank_cross_language_score_threshold == 0.05
+    assert settings.grounding_score_threshold == 0.65
+    assert settings.grounding_cross_language_score_threshold == 0.60
+    assert settings.grounding_table_evidence_score_threshold == 0.60
+    assert _MINIMUM_GOLD_RESOLUTION_RATE == 0.95
+
+
+def test_reviewed_references_join_without_changing_gold_cases(tmp_path) -> None:
+    question = "Reviewed question"
+    question_sha256 = hashlib.sha256(question.encode("utf-8")).hexdigest()
+    path = tmp_path / "references.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "case_id": "case-en",
+                "query_language": "en",
+                "target_evidence_language": "en",
+                "question_sha256": question_sha256,
+                "reference": "Reviewed answer",
+                "reference_status": "reviewed",
+                "dataset_version": "2026-09",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cases = [
+        {
+            "id": "case-en",
+            "query_language": "en",
+            "target_evidence_language": "en",
+            "question": question,
+            "answerable": True,
+            "gold_match": {"any_of": [{"field": "title", "equals": "Gold"}]},
+        }
+    ]
+    merged = _apply_reviewed_references(
+        cases, path, expected_dataset_version="2026-09"
+    )
+    assert merged[0]["reference"] == "Reviewed answer"
+    assert merged[0]["gold_match"] == cases[0]["gold_match"]
+
+
+def test_bilingual_ragas_requires_every_answerable_reference() -> None:
+    cases = _load_evaluation_cases(EVALUATION / "bilingual_gold_suites.jsonl")
+    cases[0] = {
+        **cases[0],
+        "reference": "Reviewed answer",
+        "reference_status": "reviewed",
+    }
+    with pytest.raises(ValueError, match="references are incomplete"):
+        _reviewed_bilingual_ragas_cases(cases)
+
+
+def test_reference_template_covers_all_bilingual_answerable_cases() -> None:
+    cases = _load_evaluation_cases(EVALUATION / "gold_suites.jsonl")
+    references = build_reference_template(cases, "2026-09")
+    assert len(references) == 60
+    assert {row["query_language"] for row in references} == {"en", "es"}
+    assert {
+        (row["query_language"], row["target_evidence_language"])
+        for row in references
+    } >= {("en", "en"), ("es", "es"), ("en", "es"), ("es", "en")}
+    assert all(row["reference_status"] == "pending_review" for row in references)
+    assert all(
+        row["question_sha256"]
+        == hashlib.sha256(row["question_for_review"].encode("utf-8")).hexdigest()
+        for row in references
+    )
 
 
 def test_t2_dataset_has_all_80_curated_bilingual_cases() -> None:
@@ -35,7 +166,7 @@ def test_threshold_calibration_respects_five_percent_limit() -> None:
     assert false_positive_rate <= 0.05
 
 
-def test_score_uses_configured_retrieval_pool_fixed_ndcg_window_and_project_boundary() -> None:
+def test_score_uses_configured_cutoffs_and_project_boundary() -> None:
     settings = Settings(
         _env_file=None,
         environment="development",
@@ -57,9 +188,58 @@ def test_score_uses_configured_retrieval_pool_fixed_ndcg_window_and_project_boun
         project_id="expected-project",
     )
 
-    assert summary["recall_at_25"] == 0
-    assert math.isclose(summary["ndcg_at_8"], 1 / math.log2(3))
+    assert summary["recall_at_1"] == 0
+    assert summary["precision_at_1"] == 0
+    assert summary["hit_rate_at_1"] == 0
+    assert summary["mrr_at_1"] == 0
+    assert summary["ndcg_at_1"] == 0
     assert summary["cross_project_leakage"] == 1
+
+
+def test_precision_uses_fixed_k_when_rerank_list_is_short() -> None:
+    settings = Settings(
+        _env_file=None, environment="development", retrieval_top_k=25, rerank_top_n=8
+    )
+    summary = score(
+        [
+            {
+                "answerable": True,
+                "gold_chunk_ids": ["gold"],
+                "retrieved_chunk_ids": ["gold"],
+                "reranked_chunk_ids": ["gold"],
+                "exposed_project_ids": ["T2.0"],
+            }
+        ],
+        settings=settings,
+        project_id="T2.0",
+    )
+    assert summary["precision_at_8"] == 1 / 8
+    assert summary["ndcg_at_8"] == 1
+    assert summary["answerable_cases"] == 1
+    assert summary["gold_resolved_cases"] == 1
+    assert summary["answer_evidence_cases"] == 1
+
+
+def test_retrieval_annotations_use_metric_population_denominators() -> None:
+    settings = Settings(
+        _env_file=None, environment="development", retrieval_top_k=25, rerank_top_n=8
+    )
+    rows = [
+        {
+            "answerable": True,
+            "role": role,
+            "gold_chunk_ids": ["gold"],
+            "retrieved_chunk_ids": ["gold"],
+            "reranked_chunk_ids": ["gold"],
+            "exposed_project_ids": ["T2.0"],
+        }
+        for role in ("answer_evidence", "diagnostic")
+    ]
+    counts = retrieval_dashboard_sample_counts(
+        score(rows, settings=settings, project_id="T2.0")
+    )
+    assert counts["recall_at_25.overall"] == 2
+    assert counts["precision_at_8.overall"] == 1
 
 
 def test_gold_predicates_support_language_specific_all_of_matches() -> None:
@@ -198,6 +378,72 @@ def test_metrics_are_split_by_query_language() -> None:
 
     assert summary["by_query_language"]["en"]["ndcg_at_8"] == 1
     assert summary["by_query_language"]["es"]["ndcg_at_8"] == 0
+    assert summary["language_gap"]["hit_rate_at_8"] == 1
+    assert summary["language_gap_abs"]["hit_rate_at_8"] == 1
+    dashboard = retrieval_dashboard_scores(summary)
+    assert dashboard["ndcg_at_8.overall"] == 0.5
+    assert dashboard["ndcg_at_8.en"] == 1
+    assert dashboard["ndcg_at_8.es"] == 0
+    assert dashboard["ndcg_at_8.language_gap"] == 1
+
+
+def test_retrieval_signed_language_gap_preserves_direction() -> None:
+    settings = Settings(_env_file=None, retrieval_top_k=25, rerank_top_n=8)
+    rows = [
+        {
+            "query_language": language,
+            "answerable": True,
+            "gold_chunk_ids": ["gold"],
+            "retrieved_chunk_ids": ["gold"] if language == "es" else [],
+            "reranked_chunk_ids": ["gold"] if language == "es" else [],
+            "exposed_project_ids": ["T2.0"],
+        }
+        for language in ("en", "es")
+    ]
+    summary = score(rows, settings=settings, project_id="T2.0")
+    assert summary["language_gap"]["hit_rate_at_8"] == -1
+    assert summary["language_gap_abs"]["hit_rate_at_8"] == 1
+
+
+def test_reviewed_reference_rejects_question_or_dataset_drift(tmp_path) -> None:
+    reference = {
+        "case_id": "case-en",
+        "query_language": "en",
+        "target_evidence_language": "en",
+        "question_sha256": "wrong",
+        "reference": "Reviewed answer",
+        "reference_status": "reviewed",
+        "dataset_version": "v1",
+    }
+    path = tmp_path / "references.jsonl"
+    path.write_text(json.dumps(reference) + "\n", encoding="utf-8")
+    cases = [
+        {
+            "id": "case-en",
+            "question": "Current question",
+            "query_language": "en",
+            "target_evidence_language": "en",
+        }
+    ]
+    with pytest.raises(ValueError, match="question_sha256"):
+        _apply_reviewed_references(cases, path, expected_dataset_version="v1")
+    with pytest.raises(ValueError, match="dataset_version mismatch"):
+        _apply_reviewed_references(cases, path, expected_dataset_version="v2")
+
+
+def test_generation_lane_rejects_duplicate_stale_rows(tmp_path) -> None:
+    output = tmp_path / "ragas.jsonl"
+    row = {"id": "case-1"}
+    output.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n")
+    with pytest.raises(RuntimeError, match="expected 1 rows, found 2"):
+        asyncio.run(
+            _run_generation_lane(
+                [{"id": "case-1"}],
+                settings=SimpleNamespace(),
+                project_id="T2.0",
+                output=output,
+            )
+        )
 
 
 def test_generation_metrics_report_paraphrase_divergence() -> None:
@@ -217,6 +463,28 @@ def test_generation_metrics_report_paraphrase_divergence() -> None:
     assert summary["paraphrase_groups"] == 1
     assert summary["paraphrase_divergent_groups"] == 1
     assert summary["paraphrase_invariance_rate"] == 0
+
+
+def test_generation_metrics_include_language_split_and_signed_gap() -> None:
+    rows = [
+        {
+            "query_language": language,
+            "answerable": True,
+            "answered": accepted,
+            "grounding_accepted": accepted,
+            "cited_source_ids": [],
+        }
+        for language, accepted in (("en", False), ("es", True))
+    ]
+    summary = score_generation(rows)
+    dashboard = generation_dashboard_scores(summary)
+    assert dashboard["grounding_acceptance_rate.en"] == 0
+    assert dashboard["grounding_acceptance_rate.es"] == 1
+    assert dashboard["grounding_acceptance_rate.language_gap"] == -1
+    assert dashboard["grounding_acceptance_rate.language_gap_abs"] == 1
+    counts = generation_dashboard_sample_counts(summary)
+    assert counts["grounding_acceptance_rate.overall"] == 2
+    assert counts["citation_precision.overall"] == 0
 
 
 def test_default_suite_has_bilingual_fast_lane_and_negative_reasons() -> None:
