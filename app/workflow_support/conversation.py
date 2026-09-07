@@ -323,6 +323,22 @@ def _conversation_resolution_decision(
         and not _conversation_subject(question)
     ):
         return True, "SHORT_VERB_ELLIPSIS"
+    # A turn that opens with a bare preposition carries the previous
+    # predicate: "from the product types" is the tail of the question already
+    # asked, not a new one. The topic-word test below counts "product" and
+    # "types" as two fresh subjects and returns EXPLICIT_SUBJECT, which drops
+    # the conversation and retrieves on a fragment no document answers.
+    # Bounded to short fragments that carry no interrogative and no finite verb
+    # of their own, so "from the product types, what is MC?" and "de acuerdo
+    # con la politica, cual es el limite?" stay standalone.
+    leading = _normalized_words(normalized)[:1]
+    if (
+        leading
+        and leading[0] in _CONTINUATION_PREPOSITIONS
+        and len(normalized.split()) <= _MAX_PREPOSITIONAL_CONTINUATION_WORDS
+        and not words & _INDEPENDENT_PREDICATE_WORDS
+    ):
+        return True, "PREPOSITIONAL_CONTINUATION"
     topic_words = words - pronouns - {
         "a", "an", "and", "are", "be", "do", "does", "explain", "for", "how",
         "is", "know", "me", "of", "please", "tell", "the", "to", "what", "you",
@@ -365,6 +381,28 @@ def _conversation_resolution_decision(
     if words & pronouns:
         return True, "ANAPHORIC_PRONOUN"
     return False, "NO_FOLLOWUP_SIGNAL"
+
+
+# A question fragment that begins with one of these has no predicate of its own.
+_CONTINUATION_PREPOSITIONS = frozenset({
+    "from", "for", "about", "with", "within", "under", "regarding", "concerning",
+    "de", "del", "para", "por", "sobre", "con", "desde", "segun", "respecto",
+    "acerca",
+})
+
+# An interrogative or finite verb makes a fragment a question in its own right,
+# whatever preposition opens it. Accent-stripped: _normalized_words folds
+# diacritics, so "cual" here also matches "cuál".
+_INDEPENDENT_PREDICATE_WORDS = frozenset({
+    "how", "what", "when", "where", "which", "who", "whom", "whose", "why",
+    "am", "are", "be", "can", "could", "did", "do", "does", "had", "has",
+    "have", "is", "may", "must", "should", "was", "were", "will", "would",
+    "como", "cuando", "cual", "cuales", "donde", "que", "quien", "quienes",
+    "es", "son", "esta", "estan", "estuvo", "fue", "fueron", "hace", "hacen",
+    "hay", "podria", "puede", "pueden", "sera", "seran", "tiene", "tienen",
+})
+
+_MAX_PREPOSITIONAL_CONTINUATION_WORDS = 6
 
 
 # Shared with the follow-up predicate so the two cannot drift apart. A word
