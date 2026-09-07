@@ -19,6 +19,9 @@ class WorkflowEvaluationResult:
     retrieved_contexts: tuple[str, ...]
     query_language: str
     uncited_claims_dropped: int = 0
+    answer_style: str = ""
+    context_relevance: float = -1.0
+    answer_relevance: float = -1.0
 
 
 class EvaluationWorkflowMixin:
@@ -61,4 +64,7 @@ class EvaluationWorkflowMixin:
                 or resolve_response_language(self._request.question)
             ),
             uncited_claims_dropped=int(state.get("uncited_claims_dropped", 0)),
+            answer_style=str(state.get("answer_style") or ""),
+            context_relevance=float(state.get("context_relevance", -1.0)),
+            answer_relevance=float(state.get("answer_relevance", -1.0)),
         )

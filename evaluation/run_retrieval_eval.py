@@ -1206,15 +1206,21 @@ async def _run_generation_lane(
             "cited_source_ids": cited,
             "valid_citation_count": len(cited),
             "uncited_claims_dropped": evaluation_result.uncited_claims_dropped,
+            # Pairwise inputs are deliberately content-bearing and remain in
+            # the gitignored local run directory.  Aggregate publishers never
+            # receive these fields.
+            "user_input": str(case["question"]),
+            "response": response.answer,
+            "retrieved_contexts": list(evaluation_result.retrieved_contexts),
+            "answer_style": evaluation_result.answer_style,
+            "context_relevance": evaluation_result.context_relevance,
+            "answer_relevance": evaluation_result.answer_relevance,
             "refusal_reason": response.refusal_reason,
             "expected_refusal_reason": case.get("expected_refusal_reason"),
         }
         if case.get("reference") and case.get("reference_status") == "reviewed":
             row.update(
                 {
-                    "user_input": str(case["question"]),
-                    "response": response.answer,
-                    "retrieved_contexts": list(evaluation_result.retrieved_contexts),
                     "reference": str(case["reference"]),
                     "reference_status": "reviewed",
                     "dataset_version": case.get("dataset_version", "1"),

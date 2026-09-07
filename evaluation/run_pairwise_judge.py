@@ -63,6 +63,8 @@ async def main() -> None:
     parser.add_argument("--api-key", default=os.getenv("PI_RAG_RAGAS_API_KEY", "ollama"))
     parser.add_argument("--evidence-characters", type=int, default=6000)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--context-tokens", type=int, default=32768)
+    parser.add_argument("--max-output-tokens", type=int, default=768)
     arguments = parser.parse_args()
 
     from langchain_core.prompts import ChatPromptTemplate
@@ -80,6 +82,17 @@ async def main() -> None:
     shared = sorted(set(baseline_rows) & set(candidate_rows))
     if not shared:
         raise SystemExit("The two files share no case_id.")
+    style_mismatches = [
+        case_id
+        for case_id in shared
+        if baseline_rows[case_id].get("answer_style")
+        != candidate_rows[case_id].get("answer_style")
+    ]
+    if style_mismatches:
+        raise SystemExit(
+            "Pairwise comparison requires the same answer_style for every case; "
+            f"mismatches: {', '.join(style_mismatches[:10])}"
+        )
 
     judge = ChatOpenAI(
         model=model,
@@ -87,7 +100,15 @@ async def main() -> None:
         api_key=arguments.api_key,
         temperature=0,
         timeout=arguments.timeout,
-        extra_body={"think": False},
+        max_retries=0,
+        max_completion_tokens=arguments.max_output_tokens,
+        extra_body={
+            "think": False,
+            "options": {
+                "num_ctx": arguments.context_tokens,
+                "num_predict": arguments.max_output_tokens,
+            },
+        },
     )
     chain = (
         ChatPromptTemplate.from_messages(

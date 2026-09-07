@@ -49,6 +49,9 @@ def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None
     state = {
         "language": "es",
         "documents": [Document(page_content="evidencia", metadata={})],
+        "answer_style": "direct",
+        "context_relevance": 0.42,
+        "answer_relevance": 0.73,
     }
     workflow = object.__new__(AuthorizedRagWorkflow)
     workflow._request = SimpleNamespace(question="pregunta", project_id="T2.0")
@@ -71,6 +74,9 @@ def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None
     assert evaluated.response is response
     assert evaluated.retrieved_contexts == ("evidencia",)
     assert evaluated.query_language == "es"
+    assert evaluated.answer_style == "direct"
+    assert evaluated.context_relevance == 0.42
+    assert evaluated.answer_relevance == 0.73
 
 
 def test_quality_monitoring_does_not_change_runtime_gates() -> None:
@@ -469,6 +475,67 @@ def test_generation_lane_rejects_duplicate_stale_rows(tmp_path) -> None:
                 output=output,
             )
         )
+
+
+def test_generation_lane_always_captures_local_pairwise_content(
+    tmp_path, monkeypatch
+) -> None:
+    from app.workflow_evaluation import WorkflowEvaluationResult
+
+    response = RagResponse(
+        answer="Grounded answer",
+        status="ANSWERED",
+        confidence="HIGH",
+        projectId="T2.0",
+        sources=[],
+        missingInformation=[],
+        evidenceStatus="SUFFICIENT",
+    )
+
+    class FakeWorkflow:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run_for_evaluation(self):
+            return WorkflowEvaluationResult(
+                response=response,
+                retrieved_contexts=("local evidence",),
+                query_language="en",
+                answer_style="direct",
+                context_relevance=0.42,
+                answer_relevance=0.73,
+            )
+
+    monkeypatch.setattr(
+        "evaluation.run_retrieval_eval.AuthorizedRagWorkflow", FakeWorkflow
+    )
+    settings = SimpleNamespace(
+        chroma_collection="collection",
+        supported_embedding_models=("model",),
+        supported_schema_versions=("3",),
+    )
+    rows = asyncio.run(
+        _run_generation_lane(
+            [
+                {
+                    "id": "case-1",
+                    "question": "Local question",
+                    "answerable": True,
+                    "query_language": "en",
+                }
+            ],
+            settings=settings,
+            project_id="T2.0",
+            output=tmp_path / "generation.jsonl",
+        )
+    )
+
+    assert rows[0]["user_input"] == "Local question"
+    assert rows[0]["response"] == "Grounded answer"
+    assert rows[0]["retrieved_contexts"] == ["local evidence"]
+    assert rows[0]["answer_style"] == "direct"
+    assert rows[0]["context_relevance"] == 0.42
+    assert rows[0]["answer_relevance"] == 0.73
 
 
 def test_generation_metrics_report_paraphrase_divergence() -> None:

@@ -2564,6 +2564,7 @@ class AnswerNodesMixin:
             "generated": generated,
             "grounded": grounded,
             "grounding_reason": reason_code,
+            "answer_relevance": answer_relevance,
             "coverage_expected": len(population_expected),
             "coverage_covered": len(population_expected) - len(population_missing),
             "coverage_missing": population_missing,
