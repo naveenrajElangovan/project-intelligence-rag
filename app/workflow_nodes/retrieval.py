@@ -41,10 +41,12 @@ from app.workflow_support.query_analysis import (
     _low_information_project_document,
     _project_overview_evidence_order,
     _required_evidence_source_types,
+    _safe_translation_variant,
     _source_authority_valid,
     _source_diverse_order,
     _source_identity,
     _source_type_count,
+    retrieval_terminology_variant,
 )
 from app.retrieval_pipeline import (
     BM25Retriever,
@@ -362,6 +364,23 @@ class RetrievalNodesMixin:
         began = started()
         self._last_source_type_scope_bypassed = False
         source_types = state.get("source_types", ())
+        queries = list(state["queries"])
+        translation_slot = state.get("translation_slot")
+        translation_task = None
+        if translation_slot is not None:
+            planner = self._query_planner_factory(
+                self._settings, self._request.model_profile
+            )
+            translate = getattr(planner, "translate_to_spanish", None)
+            if translate is not None:
+                translation_task = asyncio.create_task(
+                    translate(
+                        state.get("resolved_question", self._request.question)
+                    )
+                )
+            else:
+                queries.pop(translation_slot)
+                translation_slot = None
         # One dense query per source type keeps a small family from being buried
         # by a large one. With no scope at all that fan-out has nothing to iterate,
         # and an empty `scopes` silently produced zero dense requests: retrieval
@@ -385,9 +404,13 @@ class RetrievalNodesMixin:
         requests = list(
             dict.fromkeys(
                 (query, scope)
-                for query in state["queries"]
+                for index, query in enumerate(queries)
+                if index != translation_slot
                 for scope in scopes
             )
+        )
+        base_results_task = asyncio.gather(
+            *(self._retrieve_scope(query, scope) for query, scope in requests)
         )
         resolved_question = state.get("resolved_question", self._request.question)
         exact_identifiers = _exact_identifier_tokens(
@@ -419,9 +442,40 @@ class RetrievalNodesMixin:
         )
         if exact_loader is not None and rare_lookups:
             anchored.extend(await exact_loader(rare_lookups, source_types))
-        results = await asyncio.gather(
-            *(self._retrieve_scope(query, scope) for query, scope in requests)
-        )
+        results = list(await base_results_task)
+        if translation_task is not None and translation_slot is not None:
+            try:
+                translated = await translation_task
+            except Exception:
+                translated = ""
+            if _safe_translation_variant(
+                resolved_question, translated, self._vocabulary.entities
+            ) and translated not in queries:
+                queries[translation_slot] = translated
+                terminology = retrieval_terminology_variant(translated)
+                if (
+                    terminology
+                    and len(queries) < self._settings.max_query_variants
+                    and _safe_translation_variant(
+                        resolved_question, terminology, self._vocabulary.entities
+                    )
+                ):
+                    queries.append(terminology)
+                additional = list(
+                    dict.fromkeys(
+                        (query, scope)
+                        for query in queries[translation_slot:]
+                        for scope in scopes
+                    )
+                )
+                requests.extend(additional)
+                results.extend(
+                    await asyncio.gather(
+                        *(self._retrieve_scope(query, scope) for query, scope in additional)
+                    )
+                )
+            else:
+                queries.pop(translation_slot)
         unique: dict[str, Document] = {}
         if state.get("preserve_candidates"):
             for document in state.get("candidates", []):
@@ -429,7 +483,7 @@ class RetrievalNodesMixin:
                     (document.page_content + str(document.metadata.get("reference"))).encode()
                 ).hexdigest()
                 unique[identity] = document
-        query_indexes = {query: index for index, query in enumerate(state["queries"])}
+        query_indexes = {query: index for index, query in enumerate(queries)}
         for (query, _scope), group in zip(requests, results, strict=True):
             for rank, document in enumerate(group, start=1):
                 identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
@@ -624,7 +678,7 @@ class RetrievalNodesMixin:
                 "fused_candidate_count": len(fused_candidates),
                 "prefiltered_count": len(fused_candidates) - len(responsive),
                 "prefiltered_reasons": prefilter_reasons,
-                "query_variant_count": len(state["queries"]),
+                "query_variant_count": len(queries),
                 "queries_with_preserved_candidates": len(preserved_query_indexes),
                 "preserved_candidate_count": preserved_candidate_count,
                 "entity_vocabulary_size": len(self._vocabulary.entities),
@@ -634,6 +688,11 @@ class RetrievalNodesMixin:
             },
         )
         return {
+            "queries": tuple(queries),
+            "rerank_queries": tuple(
+                dict.fromkeys((*state.get("rerank_queries", ()), *queries))
+            ),
+            "translation_slot": None,
             "candidates": candidates,
             "preserve_candidates": False,
             "lexical_candidate_count": len(lexical_candidates),

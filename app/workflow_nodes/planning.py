@@ -648,11 +648,39 @@ class PlanningNodesMixin:
             reason_code = "NOISY_QUERY_NORMALIZED"
         planner = None
         translation_used = False
+        translation_slot: int | None = None
+        expansion_needed = (
+            self._settings.adaptive_query_enabled
+            and self._settings.query_expansion_enabled
+            and (
+                query_quality != "GOOD"
+                or _multi_part_question(question)
+                or _code_location_query(question)
+            )
+        )
+        # A direct English question does not depend on translation to decide
+        # whether planner expansion is needed. Reserve its translated query's
+        # index now; retrieval replaces this empty slot after running the
+        # translation alongside the untranslated dense request.
+        defer_english_translation = (
+            detected_language == "en"
+            and self._settings.translation_enabled
+            and not expansion_needed
+        )
+        if defer_english_translation:
+            translation_slot = len(queries)
+            queries.append("")
+            translation_used = True
+            reason_code = "DIRECT_WITH_TRANSLATION"
         # Both directions, not just Spanish->English. The corpus is bilingual, so
         # whichever language the question arrives in, the other one has to be
         # offered to retrieval or the reranker is asked to match across a gap it
         # cannot close on its own.
-        if detected_language in ("es", "en") and self._settings.translation_enabled:
+        if (
+            detected_language in ("es", "en")
+            and self._settings.translation_enabled
+            and not defer_english_translation
+        ):
             try:
                 planner = self._query_planner_factory(
                     self._settings, self._request.model_profile
@@ -686,15 +714,7 @@ class PlanningNodesMixin:
         # planner call because they materially improve recall before generation.
         needs_planner = (
             (detected_language == "es" and not translation_used)
-            or (
-            self._settings.adaptive_query_enabled
-            and self._settings.query_expansion_enabled
-            and (
-                query_quality != "GOOD"
-                or _multi_part_question(question)
-                or _code_location_query(question)
-            )
-            )
+            or expansion_needed
         )
         if needs_planner:
             try:
@@ -730,6 +750,8 @@ class PlanningNodesMixin:
             except Exception:
                 reason_code = "PLANNER_FALLBACK"
         planned = tuple(queries[: self._settings.max_query_variants])
+        if translation_slot is not None and translation_slot >= len(planned):
+            translation_slot = None
         # The multilingual cross-encoder must score against the user's original
         # wording. English translations remain retrieval expansions, but using
         # them for final reranking can demote an exact Spanish symptom heading in
@@ -767,6 +789,7 @@ class PlanningNodesMixin:
             "query_quality": query_quality,
             "query_quality_reason": quality_reason,
             "uncertain_entity_token": uncertain_entity,
+            "translation_slot": translation_slot,
         }
 
     async def _resolve_conversation_question(

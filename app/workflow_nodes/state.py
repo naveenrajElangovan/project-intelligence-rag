@@ -29,6 +29,7 @@ class RagState(TypedDict, total=False):
     overview_entity: str
     rerank_query: str
     rerank_queries: tuple[str, ...]
+    translation_slot: int | None
     project_rerank_queries: tuple[str, ...]
     source_types: tuple[str, ...]
     source_route: str

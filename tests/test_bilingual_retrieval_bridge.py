@@ -74,13 +74,14 @@ def _planned(question: str) -> dict:
     return asyncio.run(workflow._plan_queries({"request": request}))
 
 
-def test_english_question_gains_a_spanish_retrieval_variant() -> None:
-    """The direction that was missing entirely."""
+def test_english_translation_preallocates_its_retrieval_slot() -> None:
+    """Retrieval fills this stable index while the original query is in flight."""
 
     planned = _planned(ENGLISH_QUESTION)
 
-    assert RecordingPlanner.directions == ["to_spanish"]
-    assert any(SPANISH_VARIANT in query for query in planned["queries"])
+    assert RecordingPlanner.directions == []
+    assert planned["translation_slot"] == 1
+    assert planned["queries"] == (ENGLISH_QUESTION, "")
 
 
 def test_spanish_question_still_gains_an_english_variant() -> None:

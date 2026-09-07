@@ -228,7 +228,8 @@ def test_direct_english_plan_does_not_multiply_retrieval_queries(monkeypatch) ->
 
     planned = asyncio.run(workflow._plan_queries({"request": request}))
 
-    assert planned["queries"] == (request.question,)
+    assert planned["queries"] == (request.question, "")
+    assert planned["translation_slot"] == 1
 
 
 def test_multi_part_english_question_is_decomposed_before_retrieval(monkeypatch) -> None:
