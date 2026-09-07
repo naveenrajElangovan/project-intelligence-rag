@@ -9,6 +9,7 @@ the corpus answers.
 
 import asyncio
 
+import pytest
 from langchain_core.documents import Document
 
 from app.config import Settings
@@ -129,7 +130,12 @@ def test_relevance_bar_default_is_unchanged() -> None:
     assert evaluator.evaluate("q", [_document(0.26)]).quality == "SUFFICIENT"
 
 
-def _router(attempt: int, documents: list[Document], missing: tuple[str, ...] = ("x",)):
+def _router(
+    attempt: int,
+    documents: list[Document],
+    missing: tuple[str, ...] = ("x",),
+    relevance: float = 0.009,
+):
     from app.workflow_nodes.retrieval import RetrievalNodesMixin
 
     router = RetrievalNodesMixin.__new__(RetrievalNodesMixin)
@@ -138,6 +144,7 @@ def _router(attempt: int, documents: list[Document], missing: tuple[str, ...] = 
         "missing_requirements": missing,
         "retrieval_attempt": attempt,
         "documents": documents,
+        "context_relevance": relevance,
     }
     return router._route_after_evidence_completeness(state)
 
@@ -147,6 +154,30 @@ def test_exhausted_retries_still_attempt_an_answer_when_evidence_exists() -> Non
 
     settings = _settings()
     assert _router(settings.max_retrieval_attempts, [_document(0.009)]) == "generate"
+
+
+def test_exhausted_noise_ends_below_the_derived_floor_only() -> None:
+    settings = _settings()
+    documents = [_document(0.0009)]
+
+    assert _router(
+        settings.max_retrieval_attempts, documents, relevance=0.0009
+    ) == "end"
+    assert _router(
+        settings.max_retrieval_attempts, documents, relevance=0.0011
+    ) == "generate"
+
+
+@pytest.mark.parametrize("floor", (-0.1, 0.25, 0.5, 1.1))
+def test_context_relevance_floor_must_be_bounded_below_repair_threshold(
+    floor: float,
+) -> None:
+    with pytest.raises(ValueError, match="CONTEXT_RELEVANCE_FLOOR"):
+        Settings(
+            _env_file=None,
+            environment="development",
+            context_relevance_floor=floor,
+        )
 
 
 def test_an_empty_evidence_pool_still_fails_closed() -> None:

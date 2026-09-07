@@ -189,6 +189,12 @@ class Settings(BaseSettings):
     # before an answer is attempted. Every other threshold is configurable; this
     # one was a literal inside HeuristicContextEvaluator.
     context_relevance_threshold: float = 0.25
+    # Termination floor, NOT the repair-worthiness threshold above. Derived from
+    # the 2026-09-07 Layer 1 run in .run/step4-before-schema3.generation.jsonl:
+    # strictly below the minimum context_relevance that produced an answered,
+    # grounded outcome (27 successful cases; minimum 0.005). Raising it to that
+    # minimum would make it a truth gate, which grounding -- not reranking -- owns.
+    context_relevance_floor: float = 0.001
     grounding_verification_enabled: bool = True
     incremental_verified_streaming_enabled: bool = True
     # Supported event claims measured 0.880-0.965; false claims peaked at 0.242.
@@ -368,6 +374,15 @@ class Settings(BaseSettings):
             )
         if not 0 <= self.prefilter_min_dense_score <= 1:
             raise ValueError("PI_RAG_PREFILTER_MIN_DENSE_SCORE must be between 0 and 1")
+        if not 0 <= self.context_relevance_floor <= 1:
+            raise ValueError(
+                "PI_RAG_CONTEXT_RELEVANCE_FLOOR must be between 0 and 1"
+            )
+        if self.context_relevance_floor >= self.context_relevance_threshold:
+            raise ValueError(
+                "PI_RAG_CONTEXT_RELEVANCE_FLOOR must be below "
+                "PI_RAG_CONTEXT_RELEVANCE_THRESHOLD"
+            )
         if not 0 <= self.prefilter_max_removed_fraction <= 0.5:
             raise ValueError(
                 "PI_RAG_PREFILTER_MAX_REMOVED_FRACTION must be between 0 and 0.5: a "

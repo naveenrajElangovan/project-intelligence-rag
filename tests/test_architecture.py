@@ -44,6 +44,7 @@ def test_only_grounding_may_end_a_request_that_holds_documents() -> None:
                 "grounded": grounded,
                 "missing_requirements": ("term:checkout",),
                 "retrieval_attempt": settings.max_retrieval_attempts,
+                "context_relevance": settings.context_relevance_floor,
             }
         ) != "end"
 

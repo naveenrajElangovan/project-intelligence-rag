@@ -1524,12 +1524,12 @@ class RetrievalNodesMixin:
             return "generate"
         if state.get("retrieval_attempt", 1) < self._settings.max_retrieval_attempts:
             return "repair_completeness"
-        # Retries are spent, but this node is a heuristic prefilter -- a rerank
-        # score and a lexical hit -- not the truth gate. Generation, citation
-        # validation and grounding are, and they judge the evidence itself.
-        # Ending here refused without ever attempting an answer while the
-        # documents sat in state unseen, which is the same mistake the rerank
-        # threshold made before it was demoted to a prefilter. Attempt the
-        # answer: if the evidence really does not support it, grounding rejects
-        # every claim and the refusal is reached honestly, after trying.
+        # This floor is derived below every answered-and-grounded Layer 1 case.
+        # It is consulted only after bounded repair is exhausted, so borderline
+        # evidence still gets the same repair and truth-gate path as before.
+        if (
+            float(state.get("context_relevance") or 0.0)
+            < self._settings.context_relevance_floor
+        ):
+            return "end"
         return "generate" if state.get("documents") else "end"
