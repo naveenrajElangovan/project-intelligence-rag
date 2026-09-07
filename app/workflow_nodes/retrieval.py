@@ -333,6 +333,24 @@ def _fuse_reranked_groups(
         document.metadata["multilingual_rerank_rrf_score"] = rrf
     return [document for document, _score, _rrf in ordered]
 
+
+def _candidate_id(document: Document) -> str:
+    """Return the stable identity used to prove rerank inputs are unchanged."""
+
+    return str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
+        (document.page_content + str(document.metadata.get("reference"))).encode()
+    ).hexdigest()
+
+
+def _same_rerank_inputs(state: RagState, query: str, candidates: list[Document]) -> bool:
+    """Only identical scorer pairs permit reuse of the previous ranked result."""
+
+    return (
+        state.get("scored_query") == query
+        and set(state.get("scored_candidate_ids", ()))
+        == {_candidate_id(document) for document in candidates}
+    )
+
 class RetrievalNodesMixin:
     """RetrievalNodes responsibilities."""
 
@@ -718,6 +736,30 @@ class RetrievalNodesMixin:
         all_candidates = list(candidates)
         rerank_query = state.get("rerank_query", self._request.question)
         rerank_queries = state.get("rerank_queries", (rerank_query,))
+        candidate_ids = tuple(sorted(_candidate_id(document) for document in all_candidates))
+        if state.get("prior_documents") is not None and _same_rerank_inputs(
+            state, rerank_query, all_candidates
+        ):
+            documents = list(state.get("prior_documents", []))
+            stage_complete(
+                "rerank",
+                self._request.project_id,
+                began,
+                input_count=len(all_candidates),
+                output_count=len(documents),
+                reason_code="IDENTICAL_REPAIR_INPUTS",
+                model_provider="deterministic",
+                model_name="prior-rerank-result",
+                model_profile="rerank",
+                language=state.get("language", "und"),
+                extra={"repair_rerank_skipped": True},
+            )
+            return {
+                "documents": documents,
+                "scored_query": rerank_query,
+                "scored_candidate_ids": candidate_ids,
+                "rerank_skipped": True,
+            }
         # CODE_ASSISTED is the default route -- anything that is not an overview,
         # an inventory, an implementation or a delivery question lands here -- so a
         # hard-coded 4 was the tightest evidence limit in the system and applied to
@@ -1181,6 +1223,9 @@ class RetrievalNodesMixin:
         )
         return {
             "documents": documents,
+            "scored_query": rerank_query,
+            "scored_candidate_ids": candidate_ids,
+            "rerank_skipped": False,
             "entity_mismatch_requested": mismatch_requested,
             "entity_mismatch_suggested": mismatch_suggested,
         }

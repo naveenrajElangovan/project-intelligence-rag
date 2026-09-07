@@ -2071,6 +2071,8 @@ class AnswerNodesMixin:
         )
         return {
             "queries": (query,),
+            "rerank_query": query,
+            "rerank_queries": (query,),
             "retrieval_attempt": state.get("retrieval_attempt", 1) + 1,
             "preserve_candidates": True,
             "missing_requirements": (),
