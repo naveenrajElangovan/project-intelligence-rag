@@ -1,0 +1,9 @@
+{
+  "releaseId": "YYYY-MM-DD.N",
+  "effectiveDate": "YYYY-MM-DD",
+  "declaredActiveSkuCount": 0,
+  "categoryTotals": {"CATEGORY_CODE": 0},
+  "sourceCsvSha256": "CALCULATE_FROM_THE_IMMUTABLE_INTERNAL_EXPORT",
+  "approver": "CATALOG_PUBLISHER_ID",
+  "sourceSystemVersion": "INTERNAL_CATALOG_VERSION"
+}

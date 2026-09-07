@@ -261,9 +261,32 @@ def validate_authorized_candidates(
     required_policy = f"project:{project_id}"
     if required_policy not in access_policy_ids:
         raise PermissionError("Authorized project policy is required.")
+    allowed_policies = frozenset(
+        authorized_project_policies(project_id, access_policy_ids)
+    )
     return [
         document
         for document in documents
         if document.metadata.get("project_id") in (None, "", project_id)
-        and document.metadata.get("access_policy_id") in (None, "", required_policy)
+        and document.metadata.get("access_policy_id") in (None, "", *allowed_policies)
     ]
+
+
+def authorized_project_policies(
+    project_id: str, access_policy_ids: Sequence[str]
+) -> tuple[str, ...]:
+    """Discard scopes for other projects before any retrieval boundary."""
+
+    required = f"project:{project_id}"
+    if required not in access_policy_ids:
+        raise PermissionError("Authorized project policy is required.")
+    prefixes = (f"department:{project_id}:", f"role:{project_id}:")
+    return tuple(
+        dict.fromkeys(
+            policy
+            for policy in access_policy_ids
+            if policy == required
+            or policy.startswith(prefixes)
+            or policy.startswith("user:")
+        )
+    )

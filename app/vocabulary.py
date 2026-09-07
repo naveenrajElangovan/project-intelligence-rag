@@ -47,6 +47,31 @@ class CorpusVocabulary:
             languages=_normalized_values(values.get("languages"), casefold=True),
         )
 
+    @classmethod
+    def merge(cls, values: Iterable["CorpusVocabulary"]) -> "CorpusVocabulary":
+        """Merge only vocabulary records already filtered to caller-visible policies."""
+
+        vocabularies = tuple(values)
+        return cls(
+            **{
+                field: tuple(
+                    dict.fromkeys(
+                        item
+                        for vocabulary in vocabularies
+                        for item in getattr(vocabulary, field)
+                    )
+                )
+                for field in (
+                    "entities",
+                    "doc_categories",
+                    "providers",
+                    "source_types",
+                    "code_extensions",
+                    "languages",
+                )
+            }
+        )
+
 def _raw_values(value: Any) -> Iterable[Any]:
     if isinstance(value, str):
         stripped = value.strip()

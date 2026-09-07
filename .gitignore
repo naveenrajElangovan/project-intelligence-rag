@@ -28,3 +28,8 @@ secrets*.json
 # Local scratch, never committed
 _to_delete/
 .pi-stage.tar.gz
+.codex-build/
+.codex-finalizer/
+.pytest-output.txt
+Claude outputs/
+output/

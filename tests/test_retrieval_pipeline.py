@@ -5,6 +5,7 @@ from app.retrieval_pipeline import (
     BM25Retriever,
     HeuristicContextEvaluator,
     ReciprocalRankFusion,
+    authorized_project_policies,
     deduplicate_candidate_bodies,
     validate_authorized_candidates,
 )
@@ -72,6 +73,54 @@ def test_authorization_filter_fails_closed_and_excludes_cross_project_documents(
     assert result == [allowed]
     with pytest.raises(PermissionError):
         validate_authorized_candidates([allowed], project_id="DEMO", access_policy_ids=[])
+
+
+def test_authorization_filter_allows_only_explicit_department_policies() -> None:
+    shared = document(
+        "shared", "Company evidence", project_id="DEMO", access_policy_id="project:DEMO"
+    )
+    store = document(
+        "store",
+        "Store evidence",
+        project_id="DEMO",
+        access_policy_id="department:DEMO:STORE_OPERATIONS",
+    )
+    finance = document(
+        "finance",
+        "Finance evidence",
+        project_id="DEMO",
+        access_policy_id="department:DEMO:FINANCE_AND_ACCOUNTING",
+    )
+
+    result = validate_authorized_candidates(
+        [shared, store, finance],
+        project_id="DEMO",
+        access_policy_ids=[
+            "project:DEMO",
+            "department:DEMO:STORE_OPERATIONS",
+        ],
+    )
+
+    assert result == [shared, store]
+
+
+def test_cross_project_policy_is_removed_before_retrieval() -> None:
+    assert authorized_project_policies(
+        "DEMO",
+        [
+            "project:DEMO",
+            "project:OTHER",
+            "department:DEMO:STORE_OPERATIONS",
+            "department:OTHER:FINANCE_AND_ACCOUNTING",
+            "role:DEMO:EMPLOYEE",
+            "user:user-id",
+        ],
+    ) == (
+        "project:DEMO",
+        "department:DEMO:STORE_OPERATIONS",
+        "role:DEMO:EMPLOYEE",
+        "user:user-id",
+    )
 
 
 def test_context_evaluator_reports_no_results_and_sufficient_context() -> None:

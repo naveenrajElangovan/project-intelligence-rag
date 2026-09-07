@@ -1,0 +1,45 @@
+{
+  "observedAt": "2026-09-06",
+  "sources": [
+    {
+      "sourceId": "SEC-20F-2025",
+      "url": "https://www.sec.gov/Archives/edgar/data/1978954/000119312526140232/tbbb-20251231.htm",
+      "publicationDate": "2026-04-02",
+      "publicationDateAuthority": "SEC submissions API",
+      "reviewBy": "2027-04-02",
+      "use": "Reported company structure, hierarchy, assortment range, and spot-product model"
+    },
+    {
+      "sourceId": "T3B-CATEGORIES",
+      "url": "https://tiendas3b.com/categorias/",
+      "publicationDate": null,
+      "publicationDateStatus": "NOT_DISPLAYED_BY_SOURCE",
+      "reviewBy": "2026-12-05",
+      "use": "Customer-facing category terminology and non-exhaustive public assortment context"
+    },
+    {
+      "sourceId": "T3B-HISTORY",
+      "url": "https://www.tiendas3b.com/algo-de-nuestra-historia-3-b/",
+      "publicationDate": null,
+      "publicationDateStatus": "NOT_DISPLAYED_BY_SOURCE",
+      "reviewBy": "2026-12-05",
+      "use": "Company-history terminology"
+    },
+    {
+      "sourceId": "T3B-HARD-DISCOUNT",
+      "url": "https://www.tiendas3b.com/modelo-hard-discount-3-b/",
+      "publicationDate": null,
+      "publicationDateStatus": "NOT_DISPLAYED_BY_SOURCE",
+      "reviewBy": "2026-12-05",
+      "use": "Business-model terminology"
+    },
+    {
+      "sourceId": "T3B-2Q26",
+      "url": "https://investorstiendas3b.com/news/news-details/2026/Tiendas-3B-2Q26-Earnings-Release/default.aspx",
+      "publicationDate": "2026-08-12",
+      "publicationDateAuthority": "Official Tiendas 3B investor-relations release",
+      "reviewBy": "2026-11-15",
+      "use": "Current investor and operating facts after manual date verification"
+    }
+  ]
+}

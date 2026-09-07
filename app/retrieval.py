@@ -45,8 +45,23 @@ class _CachedVocabulary:
     value: CorpusVocabulary
 
 
-_VOCABULARY_CACHE: dict[tuple[str, str], _CachedVocabulary] = {}
+_VOCABULARY_CACHE: dict[tuple[object, ...], _CachedVocabulary] = {}
 _VOCABULARY_CACHE_LOCK = threading.Lock()
+
+
+def _authorized_policy_filter(
+    access_policy_ids: tuple[str, ...],
+) -> dict[str, dict[str, str | list[str]]]:
+    policies = tuple(dict.fromkeys(value for value in access_policy_ids if value))
+    if not policies:
+        raise PermissionError("At least one authorized access policy is required.")
+    return {
+        "access_policy_id": (
+            {"$eq": policies[0]}
+            if len(policies) == 1
+            else {"$in": list(policies)}
+        )
+    }
 
 
 async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
@@ -201,7 +216,7 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         filters: list[dict[str, dict[str, str | list[str]]]] = [
             {"project_id": {"$eq": self.project_id}},
-            {"access_policy_id": {"$eq": f"project:{self.project_id}"}},
+            _authorized_policy_filter(self.access_policy_ids),
             # The vocabulary record is control metadata, not evidence. Filtering
             # by its reserved canonical id preserves compatibility with existing
             # chunks that predate the record_kind field while ensuring it cannot
@@ -249,6 +264,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 "chunk_ordinal",
                 "parent_id",
                 "content_hash",
+                "source_content_hash",
                 "structure_path",
                 "structure_root",
                 "structure_leaf",
@@ -348,17 +364,19 @@ class ChromaAccessRetriever(BaseRetriever):
         if not text:
             drop("empty_text_field")
             return None
-        required_policy = f"project:{self.project_id}"
         strict = bool(self.required_schema_version or self.required_embedding_model)
         project_value = fields.get("project_id")
         policy_value = fields.get("access_policy_id")
-        if strict and (project_value != self.project_id or policy_value != required_policy):
+        if strict and (
+            project_value != self.project_id
+            or policy_value not in self.access_policy_ids
+        ):
             drop("project_or_policy_mismatch")
             return None
         if not strict and project_value not in (None, "", self.project_id):
             drop("project_or_policy_mismatch")
             return None
-        if not strict and policy_value not in (None, "", required_policy):
+        if not strict and policy_value not in (None, "", *self.access_policy_ids):
             drop("project_or_policy_mismatch")
             return None
         found_schema = str(fields.get("schema_version") or "")
@@ -436,13 +454,23 @@ class ChromaAccessRetriever(BaseRetriever):
                 "entity": str(fields.get("entity") or "").casefold(),
                 "entity_key": str(fields.get("entity_key") or ""),
                 "record_kind": str(fields.get("record_kind") or ""),
+                "source_content_hash": str(fields.get("source_content_hash") or ""),
+                "product_sku": str(fields.get("product_sku") or ""),
+                "catalog_release_id": str(fields.get("catalog_release_id") or ""),
+                "catalog_item_count": int(fields.get("catalog_item_count") or 0),
+                "catalog_category_totals": fields.get("catalog_category_totals") or {},
+                "category_code": str(fields.get("category_code") or ""),
             },
         )
 
     def corpus_vocabulary(self) -> CorpusVocabulary:
         """Load the reserved project record without admitting it as evidence."""
 
-        key = (self.collection_name, self.project_id)
+        key = (
+            self.collection_name,
+            self.project_id,
+            *sorted(self.access_policy_ids),
+        )
         now = time.monotonic()
         with _VOCABULARY_CACHE_LOCK:
             cached = _VOCABULARY_CACHE.get(key)
@@ -453,22 +481,20 @@ class ChromaAccessRetriever(BaseRetriever):
                 where={
                     "$and": [
                         {"project_id": {"$eq": self.project_id}},
-                        {
-                            "access_policy_id": {
-                                "$eq": f"project:{self.project_id}"
-                            }
-                        },
+                        _authorized_policy_filter(self.access_policy_ids),
                         {"record_kind": {"$eq": VOCABULARY_RECORD_KIND}},
                     ]
                 },
-                limit=1,
+                limit=max(1, len(self.access_policy_ids)),
                 include=["documents", "metadatas"],
             )
             documents = response.get("documents", [])
             metadatas = response.get("metadatas", [])
-            vocabulary = CorpusVocabulary.from_record(
-                dict(metadatas[0] or {}) if metadatas else {},
-                str(documents[0] or "") if documents else "",
+            vocabulary = CorpusVocabulary.merge(
+                CorpusVocabulary.from_record(
+                    dict(metadata or {}), str(document or "")
+                )
+                for document, metadata in zip(documents, metadatas, strict=True)
             )
         except Exception:
             vocabulary = CorpusVocabulary()
@@ -583,7 +609,7 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         filters: list[dict[str, object]] = [
             {"project_id": {"$eq": self.project_id}},
-            {"access_policy_id": {"$eq": f"project:{self.project_id}"}},
+            _authorized_policy_filter(self.access_policy_ids),
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
             {
                 "$or": [
@@ -638,7 +664,7 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         filters: list[dict[str, object]] = [
             {"project_id": {"$eq": self.project_id}},
-            {"access_policy_id": {"$eq": f"project:{self.project_id}"}},
+            _authorized_policy_filter(self.access_policy_ids),
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
         ]
         normalized_types = tuple(
@@ -850,7 +876,7 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> tuple[list[Document], bool]:
         base_filters: list[dict[str, object]] = [
             {"project_id": {"$eq": self.project_id}},
-            {"access_policy_id": {"$eq": f"project:{self.project_id}"}},
+            _authorized_policy_filter(self.access_policy_ids),
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
         ]
         normalized_types = tuple(

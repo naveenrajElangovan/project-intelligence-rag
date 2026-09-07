@@ -14,12 +14,13 @@ from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedA
                      LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator,
                      TokenUsage, insufficient_evidence_answer)
 from app.models import ConversationContextUpdate, ConversationEntity, RagRequest, RagResponse, SourceReference
+from app.catalog_answers import deterministic_catalog_response
 from app.grounding import LocalCitationGroundingVerifier
 from app.embedding import build_embedder
 from app.reranking import build_reranker
 from app.retrieval import ChromaAccessRetriever
 from app.vocabulary import CorpusVocabulary
-from app.retrieval_pipeline import ReciprocalRankFusion
+from app.retrieval_pipeline import ReciprocalRankFusion, authorized_project_policies
 from app.telemetry import request_complete, stage_complete, started
 from app.workflow_support.json_transform import json_transform_response
 from app.workflow_support.execution import invoke_bounded_graph
@@ -70,22 +71,6 @@ from app.workflow_support.query_analysis import (
     _entity_overview_source_ids,
     _code_location_query,
 )
-
-
-def _degradation_reasons(state: dict[str, object], *, unverified: bool = False) -> list[str]:
-    reasons: list[str] = []
-    fallback_count = state.get(
-        "fallback_candidate_count", state.get("lexical_fallback_count", 0)
-    )
-    if int(fallback_count or 0) > 0:
-        reasons.append("LEXICAL_RETRIEVAL_FALLBACK")
-    if state.get("repaired"):
-        reasons.append("GROUNDING_REPAIR")
-    if unverified:
-        reasons.append("UNVERIFIED_EVIDENCE")
-    if state.get("stream_truncated"):
-        reasons.append("ANSWER_STREAM_TRUNCATED")
-    return reasons
 from app.workflow_support.completeness import (
     _answer_requirements,
     _code_answer_complete,
@@ -119,6 +104,7 @@ from app.workflow_support.deterministic_answers import (
     _code_inventory_answer_verified,
 )
 from app.workflow_support.presentation import (
+    _degradation_reasons,
     _expand_candidate_neighbors,
     _highest_rerank_score,
     _stream_progress,
@@ -150,6 +136,9 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
         required_policy = f"project:{request.project_id}"
         if required_policy not in request.access_policy_ids:
             raise PermissionError("Authorized project policy is required.")
+        policies = authorized_project_policies(request.project_id, request.access_policy_ids)
+        request = request.model_copy(update={"access_policy_ids": list(policies)})
+        self._request = request
         if request.collection_name != settings.chroma_collection:
             raise ValueError("The project collection does not match the configured Chroma collection.")
         self._retriever = ChromaAccessRetriever.create(
@@ -158,7 +147,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
             collection_name=request.collection_name,
             text_field=request.text_field,
             project_id=request.project_id,
-            access_policy_ids=(required_policy,),
+            access_policy_ids=tuple(dict.fromkeys(request.access_policy_ids)),
             top_k=settings.retrieval_top_k,
             score_threshold=settings.retrieval_score_threshold,
             required_schema_version=request.schema_version,
@@ -191,6 +180,9 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
 
         began = started()
         deterministic = json_transform_response(self._request, began)
+        deterministic = deterministic or await deterministic_catalog_response(
+            self._request, getattr(self, "_retriever", None)
+        )
         if deterministic is not None:
             return deterministic
         clarification = clarification_response(
@@ -215,6 +207,9 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
 
         began = started()
         deterministic = json_transform_response(self._request, began)
+        deterministic = deterministic or await deterministic_catalog_response(
+            self._request, getattr(self, "_retriever", None)
+        )
         if deterministic is not None:
             async for event in verified_answer_events(deterministic.answer):
                 yield event

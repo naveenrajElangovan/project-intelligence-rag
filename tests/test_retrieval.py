@@ -152,7 +152,11 @@ def test_langchain_retriever_always_applies_project_and_access_filters() -> None
     assert index.query_args["where"] == {
         "$and": [
             {"project_id": {"$eq": "DEMO"}},
-            {"access_policy_id": {"$eq": "project:DEMO"}},
+            {
+                "access_policy_id": {
+                    "$in": ["project:DEMO", "user:user-id"]
+                }
+            },
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
         ]
     }
@@ -180,6 +184,47 @@ def test_scoped_retrieval_adds_source_filter_without_weakening_authorization() -
             {"source_type": {"$eq": "CODE"}},
         ]
     }
+
+
+def test_department_policy_is_accepted_and_other_department_is_rejected() -> None:
+    retriever = ChromaAccessRetriever(
+        index=FakeIndex(),
+        collection_name="project-intelligence",
+        embedder=FakeEmbedder(),
+        project_id="DEMO",
+        access_policy_ids=(
+            "project:DEMO",
+            "department:DEMO:STORE_OPERATIONS",
+        ),
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+    )
+    common = {
+        "chunk_text": "restricted evidence",
+        "project_id": "DEMO",
+        "schema_version": "3",
+        "embedding_model": "multilingual-e5-large",
+    }
+
+    allowed = retriever._document_from_fields(
+        {
+            **common,
+            "access_policy_id": "department:DEMO:STORE_OPERATIONS",
+        },
+        "allowed",
+        1.0,
+    )
+    rejected = retriever._document_from_fields(
+        {
+            **common,
+            "access_policy_id": "department:DEMO:FINANCE_AND_ACCOUNTING",
+        },
+        "rejected",
+        1.0,
+    )
+
+    assert allowed is not None
+    assert rejected is None
 
 
 def test_retrieval_boundary_canonicalizes_separatorless_page_tables() -> None:

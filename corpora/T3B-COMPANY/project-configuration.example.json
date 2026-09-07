@@ -1,0 +1,38 @@
+{
+  "displayName": "Tiendas 3B Company",
+  "active": true,
+  "jiraProjects": [],
+  "confluenceSpaces": [
+    {
+      "siteUrl": "https://YOUR-SITE.atlassian.net",
+      "spaceKey": "T3B",
+      "spaceId": "000000",
+      "rootPageIds": []
+    }
+  ],
+  "githubRepositories": [],
+  "sourceAccessRules": [
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[STORE_OPERATIONS]","accessPolicyId":"department:T3B-COMPANY:STORE_OPERATIONS"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[REGIONAL_OPERATIONS_AND_REAL_ESTATE]","accessPolicyId":"department:T3B-COMPANY:REGIONAL_OPERATIONS_AND_REAL_ESTATE"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[DISTRIBUTION_AND_LOGISTICS]","accessPolicyId":"department:T3B-COMPANY:DISTRIBUTION_AND_LOGISTICS"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[PURCHASING_AND_MERCHANDISING]","accessPolicyId":"department:T3B-COMPANY:PURCHASING_AND_MERCHANDISING"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[PEOPLE_AND_UNIVERSIDAD_3B]","accessPolicyId":"department:T3B-COMPANY:PEOPLE_AND_UNIVERSIDAD_3B"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[FINANCE_AND_ACCOUNTING]","accessPolicyId":"department:T3B-COMPANY:FINANCE_AND_ACCOUNTING"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[IT_AND_DIGITAL_PLATFORMS]","accessPolicyId":"department:T3B-COMPANY:IT_AND_DIGITAL_PLATFORMS"},
+    {"provider":"CONFLUENCE","matchField":"TITLE","prefix":"[CORPORATE_COMPLIANCE]","accessPolicyId":"department:T3B-COMPANY:CORPORATE_COMPLIANCE"}
+  ],
+  "vectorStore": {
+    "collectionName": "project-intelligence",
+    "textField": "chunk_text",
+    "embeddingField": "embedding_text",
+    "embeddingModel": "multilingual-e5-large",
+    "schemaVersion": "4"
+  },
+  "ingestionSchedule": {
+    "githubMergedPrEnabled": false,
+    "dailyEnabled": true,
+    "dailyAt": "00:00",
+    "timezone": "America/Mexico_City",
+    "manualEnabled": true
+  }
+}

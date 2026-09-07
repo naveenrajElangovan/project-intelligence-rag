@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     chroma_port: int = 8000
     chroma_collection: str = "project-intelligence"
     supported_embedding_models: tuple[str, ...] = ("multilingual-e5-large",)
-    supported_schema_versions: tuple[str, ...] = ("3",)
+    supported_schema_versions: tuple[str, ...] = ("4", "3")
     llm_provider: str = "ollama"
     ollama_base_url: str = "http://host.docker.internal:11434"
     ollama_model: str = "qwen3.5:latest"

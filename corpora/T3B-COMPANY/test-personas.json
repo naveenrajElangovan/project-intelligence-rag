@@ -1,0 +1,19 @@
+{
+  "syntheticOnly": true,
+  "projectId": "T3B-COMPANY",
+  "personas": [
+    {"id":"shared-employee","projectRole":"EMPLOYEE","departmentScopes":[]},
+    {"id":"store-operations-user","projectRole":"EMPLOYEE","departmentScopes":["STORE_OPERATIONS"]},
+    {"id":"regional-real-estate-user","projectRole":"EMPLOYEE","departmentScopes":["REGIONAL_OPERATIONS_AND_REAL_ESTATE"]},
+    {"id":"distribution-logistics-user","projectRole":"EMPLOYEE","departmentScopes":["DISTRIBUTION_AND_LOGISTICS"]},
+    {"id":"purchasing-merchandising-user","projectRole":"EMPLOYEE","departmentScopes":["PURCHASING_AND_MERCHANDISING"]},
+    {"id":"people-u3b-user","projectRole":"EMPLOYEE","departmentScopes":["PEOPLE_AND_UNIVERSIDAD_3B"]},
+    {"id":"finance-accounting-user","projectRole":"EMPLOYEE","departmentScopes":["FINANCE_AND_ACCOUNTING"]},
+    {"id":"it-digital-user","projectRole":"EMPLOYEE","departmentScopes":["IT_AND_DIGITAL_PLATFORMS"]},
+    {"id":"compliance-user","projectRole":"EMPLOYEE","departmentScopes":["CORPORATE_COMPLIANCE"]},
+    {"id":"multi-department-manager","projectRole":"MANAGER","departmentScopes":["STORE_OPERATIONS","REGIONAL_OPERATIONS_AND_REAL_ESTATE","DISTRIBUTION_AND_LOGISTICS"]},
+    {"id":"catalog-publisher","projectRole":"CATALOG_PUBLISHER","departmentScopes":["PURCHASING_AND_MERCHANDISING"]},
+    {"id":"technical-lead","projectRole":"TECHNICAL_LEAD","departmentScopes":["IT_AND_DIGITAL_PLATFORMS"]},
+    {"id":"unauthorized-user","projectRole":null,"departmentScopes":[]}
+  ]
+}

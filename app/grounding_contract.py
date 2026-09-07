@@ -236,6 +236,7 @@ def validate_output(
     generated: GroundedAnswer,
     semantically_supported: bool,
     required_policy: str,
+    authorized_policies: Sequence[str] = (),
     expected_identifiers: Sequence[str] = (),
     coverage_missing: Sequence[str] | None = None,
     expected_fields: Sequence[str] = (),
@@ -245,8 +246,9 @@ def validate_output(
 
     facts = evidence_facts(documents)
     claims = grounded_claims(generated, facts)
+    allowed_policies = frozenset((required_policy, *authorized_policies))
     permissions_ok = all(
-        document.metadata.get("access_policy_id") in (None, "", required_policy)
+        document.metadata.get("access_policy_id") in (None, "", *allowed_policies)
         for document in documents
     )
     allowed = set(resolved_request.allowed_source_categories)

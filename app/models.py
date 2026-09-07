@@ -145,6 +145,18 @@ class SourceReference(BaseModel):
     language: str | None = None
 
 
+class ArtifactReference(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: str
+    release_id: str = Field(alias="releaseId")
+    file_name: str = Field(alias="fileName")
+    format: str
+    item_count: int = Field(alias="itemCount", ge=0)
+    sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
+    url: str
+
+
 class AnswerStatus(StrEnum):
     """The only externally observable outcomes of a factual request."""
 
@@ -207,6 +219,7 @@ class RagResponse(BaseModel):
     project_id: str = Field(alias="projectId")
     sources: list[SourceReference]
     citations: list[SourceReference] = Field(default_factory=list)
+    artifacts: list[ArtifactReference] = Field(default_factory=list)
     resolved_intent: str = Field(default="", alias="resolvedIntent")
     resolved_entities: list[ResolvedEntity] = Field(
         default_factory=list, alias="resolvedEntities"

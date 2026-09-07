@@ -9,6 +9,24 @@ from app.llm import GroundedAnswer
 from app.grounding import _material_claims
 
 
+def _degradation_reasons(
+    state: dict[str, object], *, unverified: bool = False
+) -> list[str]:
+    reasons: list[str] = []
+    fallback_count = state.get(
+        "fallback_candidate_count", state.get("lexical_fallback_count", 0)
+    )
+    if int(fallback_count or 0) > 0:
+        reasons.append("LEXICAL_RETRIEVAL_FALLBACK")
+    if state.get("repaired"):
+        reasons.append("GROUNDING_REPAIR")
+    if unverified:
+        reasons.append("UNVERIFIED_EVIDENCE")
+    if state.get("stream_truncated"):
+        reasons.append("ANSWER_STREAM_TRUNCATED")
+    return reasons
+
+
 def _highest_rerank_score(documents: list[Document]) -> float:
     """Ignore context neighbours whose score was never cross-encoded."""
 

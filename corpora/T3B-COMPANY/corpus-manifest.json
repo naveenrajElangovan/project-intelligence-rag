@@ -1,0 +1,18 @@
+{
+  "projectId": "T3B-COMPANY",
+  "schemaVersion": "4",
+  "terminologyAuthority": "es",
+  "sharedPolicy": "project:T3B-COMPANY",
+  "departments": [
+    "STORE_OPERATIONS",
+    "REGIONAL_OPERATIONS_AND_REAL_ESTATE",
+    "DISTRIBUTION_AND_LOGISTICS",
+    "PURCHASING_AND_MERCHANDISING",
+    "PEOPLE_AND_UNIVERSIDAD_3B",
+    "FINANCE_AND_ACCOUNTING",
+    "IT_AND_DIGITAL_PLATFORMS",
+    "CORPORATE_COMPLIANCE"
+  ],
+  "productAuthority": "MANUALLY_APPROVED_INTERNAL_ACTIVE_SKU_EXPORT",
+  "publicWebMayDefineCompleteness": false
+}
