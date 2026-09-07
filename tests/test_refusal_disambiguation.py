@@ -145,7 +145,12 @@ def _run(monkeypatch, documents: list[Document]):
     )
     return asyncio.run(
         workflow_module.AuthorizedRagWorkflow(
-            Settings(_env_file=None, environment="development"), request
+            Settings(
+                _env_file=None,
+                environment="development",
+                generated_refusals_enabled=True,
+            ),
+            request,
         ).run()
     )
 

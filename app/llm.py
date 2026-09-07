@@ -169,6 +169,47 @@ def pipeline_unavailable_answer(language: str) -> str:
     return PIPELINE_UNAVAILABLE_ANSWER_ES if language == "es" else PIPELINE_UNAVAILABLE_ANSWER
 
 
+_REFUSAL_ANSWERS = {
+    "en": {
+        "NO_ACCESS": NO_ACCESS_ANSWER,
+        "INSUFFICIENT_EVIDENCE": INSUFFICIENT_EVIDENCE_ANSWER,
+        "UNVERIFIED_EVIDENCE": "Related material was found, but the requested details could not be verified.",
+        "POPULATION_RETRIEVAL_MISS": "An indexed registry was found, but its complete expected source set could not be retrieved reliably.",
+        "UNRESOLVED_SOURCE_CONFLICT": "Current authoritative sources conflict, so the answer cannot be resolved reliably.",
+        "SOURCE_SCOPE_VIOLATION": "The request cannot be answered from the sources allowed for this request.",
+        "PERMISSIONS_NOT_SATISFIED": "The available sources do not satisfy the permissions required for this request.",
+        "FRESHNESS_NOT_VERIFIABLE": "The currentness of the available information could not be verified.",
+        "REQUESTED_COVERAGE_INCOMPLETE": "The complete requested set could not be verified from the available information.",
+        "UNSUPPORTED_CLAIM": "The specific answer could not be fully supported by the retrieved evidence.",
+        "INVALID_DERIVATION": "The requested conclusion could not be reproduced from the available evidence.",
+        "TEMPORARILY_UNAVAILABLE": PIPELINE_UNAVAILABLE_ANSWER,
+    },
+    "es": {
+        "NO_ACCESS": NO_ACCESS_ANSWER_ES,
+        "INSUFFICIENT_EVIDENCE": INSUFFICIENT_EVIDENCE_ANSWER_ES,
+        "UNVERIFIED_EVIDENCE": "Se encontró material relacionado, pero no fue posible verificar los detalles solicitados.",
+        "POPULATION_RETRIEVAL_MISS": "Se encontró un registro indexado, pero no fue posible recuperar de forma confiable el conjunto completo de fuentes esperado.",
+        "UNRESOLVED_SOURCE_CONFLICT": "Las fuentes autorizadas actuales se contradicen, por lo que no es posible resolver la respuesta de forma confiable.",
+        "SOURCE_SCOPE_VIOLATION": "La solicitud no puede responderse con las fuentes permitidas para esta consulta.",
+        "PERMISSIONS_NOT_SATISFIED": "Las fuentes disponibles no satisfacen los permisos requeridos para esta solicitud.",
+        "FRESHNESS_NOT_VERIFIABLE": "No fue posible verificar que la información disponible esté vigente.",
+        "REQUESTED_COVERAGE_INCOMPLETE": "No fue posible verificar el conjunto completo solicitado con la información disponible.",
+        "UNSUPPORTED_CLAIM": "La respuesta específica no pudo sustentarse por completo con la evidencia recuperada.",
+        "INVALID_DERIVATION": "La conclusión solicitada no pudo reproducirse a partir de la evidencia disponible.",
+        "TEMPORARILY_UNAVAILABLE": PIPELINE_UNAVAILABLE_ANSWER_ES,
+    },
+}
+
+
+def refusal_answer(reason: str, language: str) -> str:
+    """Deterministic user-facing refusal per (reason_code, language)."""
+
+    resolved_language = "es" if language == "es" else "en"
+    return _REFUSAL_ANSWERS[resolved_language].get(
+        reason, insufficient_evidence_answer(resolved_language)
+    )
+
+
 class QueryPlan(BaseModel):
     language: Literal["en", "es", "mixed"]
     translated_query: str = Field(default="", max_length=4000)

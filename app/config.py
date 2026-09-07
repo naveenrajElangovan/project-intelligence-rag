@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     local_accelerator_retry_attempts: int = 2
     warm_local_models_on_startup: bool = True
     local_max_concurrency: int = 1
+    generated_refusals_enabled: bool = False
     max_inflight_requests: int = 4
     load_shed_wait_seconds: float = 0.05
     openai_api_key: str = ""

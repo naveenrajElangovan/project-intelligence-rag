@@ -12,7 +12,7 @@ from langchain_core.documents import Document
 from app.config import Settings
 from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedAnswer,
                      LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator,
-                     TokenUsage, insufficient_evidence_answer)
+                     TokenUsage, insufficient_evidence_answer, refusal_answer)
 from app.models import ConversationContextUpdate, ConversationEntity, RagRequest, RagResponse, SourceReference
 from app.catalog_answers import deterministic_catalog_response
 from app.grounding import LocalCitationGroundingVerifier
@@ -294,16 +294,15 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
             try:
                 if refusal_reason == "ENTITY_MISMATCH":
                     raise ValueError("deterministic clarification")
-                responder = LangChainSafeResponseGenerator(
-                    self._settings, self._request.model_profile
-                )
-                refusal = await responder.generate(
-                    self._request.question, language, refusal_reason
-                )
-                usage = responder.last_usage
-                model_provider = self._settings.llm_provider
-                model_name = responder.model_name
-                reason_code = f"GENERATED_{refusal_reason}"
+                if self._settings.generated_refusals_enabled:
+                    responder = LangChainSafeResponseGenerator(self._settings, self._request.model_profile)
+                    refusal = await responder.generate(self._request.question, language, refusal_reason)
+                    usage = responder.last_usage
+                    model_provider = self._settings.llm_provider
+                    model_name = responder.model_name
+                    reason_code = f"GENERATED_{refusal_reason}"
+                else:
+                    refusal, reason_code = refusal_answer(refusal_reason, language), f"TEMPLATED_{refusal_reason}"
             except Exception:
                 pass
             stage_complete(

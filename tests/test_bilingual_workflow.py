@@ -319,7 +319,12 @@ def test_no_evidence_uses_model_written_safe_response_without_sources(monkeypatc
 
     response = asyncio.run(
         workflow_module.AuthorizedRagWorkflow(
-            Settings(_env_file=None, environment="development"), request
+            Settings(
+                _env_file=None,
+                environment="development",
+                generated_refusals_enabled=True,
+            ),
+            request,
         ).run()
     )
 
