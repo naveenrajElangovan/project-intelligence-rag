@@ -8,6 +8,7 @@ repository path are content: the live logs contained
 """
 
 import json
+from pathlib import Path
 
 from langchain_core.documents import Document
 
@@ -58,3 +59,12 @@ def test_the_digest_is_stable_so_repeats_still_correlate() -> None:
 def test_a_missing_title_produces_no_digest() -> None:
     assert _content_digest(None) == ""
     assert _content_digest("   ") == ""
+
+
+def test_coverage_identifiers_are_not_named_in_stage_telemetry() -> None:
+    source = (
+        Path(__file__).parents[1] / "app" / "workflow_nodes" / "answering.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"coverage_missing": list(' not in source
+    assert '"field_coverage_missing": list(' not in source

@@ -26,19 +26,23 @@ def _answer_requirements(
         requirements.extend(("count:files", "count:lines"))
 
     enumerated = re.search(
-        r"\bwhich\s+([a-z][a-z\s,-]*?(?:,|\band\b)[a-z\s,-]+?)\s+screen\s+types?\b",
+        r"\b(?:which\s+([a-záéíóúñ][a-záéíóúñ\s,-]*?(?:,|\band\b)[a-záéíóúñ\s,-]+?)\s+screen\s+types?|"
+        r"cuáles?\s+(?:son\s+)?(?:los\s+)?tipos?\s+de\s+pantalla\s+"
+        r"([a-záéíóúñ][a-záéíóúñ\s,-]*?(?:,|\by\b)[a-záéíóúñ\s,-]+?)(?:\?|$))",
         lowered,
     )
     enumerated_values: list[str] = []
     if enumerated:
+        enumerated_group = next(group for group in enumerated.groups() if group)
         enumerated_values.extend(
             value.strip()
-            for value in re.split(r"\s*(?:,|\band\b)\s*", enumerated.group(1))
+            for value in re.split(r"\s*(?:,|\band\b|\by\b)\s*", enumerated_group)
             if value.strip()
         )
-    if "screen" in lowered:
+    if "screen" in lowered or "pantalla" in lowered:
         flow_list = re.search(
-            r"\b([a-z]+)\s*,\s*([a-z]+)\s*,?\s*(?:and|y)\s+([a-z]+)\s+flows?\b",
+            r"\b([a-záéíóúñ]+)\s*,\s*([a-záéíóúñ]+)\s*,?\s*(?:and|y)\s+"
+            r"([a-záéíóúñ]+)\s+(?:flows?|flujos?)\b",
             lowered,
         )
         if flow_list:
@@ -52,9 +56,9 @@ def _answer_requirements(
         requirements.append("code:implementation")
 
     entity_pattern = "|".join(re.escape(entity) for entity in entities)
-    boundary = rf"\s+in\s+(?:{entity_pattern})\b" if entity_pattern else r"(?!)"
+    boundary = rf"\s+(?:in|en)\s+(?:{entity_pattern})\b" if entity_pattern else r"(?!)"
     listed_for = re.search(
-        rf"\blisted\s+for\s+(?:the\s+)?(.+?)(?:{boundary}|\?|$)", lowered
+        rf"\b(?:listed\s+for\s+(?:the\s+)?|listados?\s+para\s+(?:el|la|los|las)?\s*)(.+?)(?:{boundary}|\?|$)", lowered
     )
     if (
         listed_for
@@ -73,7 +77,7 @@ def _answer_requirements(
             words = tuple(
                 _singular_key(word)
                 for word in _normalized_words(item)
-                if word not in {"the", "a", "an"}
+                if word not in {"the", "a", "an", "el", "la", "los", "las", "un", "una"}
             )
             if 2 <= len(words) <= 4:
                 requirements.append("identifier:" + "+".join(words))
@@ -227,18 +231,22 @@ def _code_output_requested(question: str) -> bool:
     """Recognize an explicit request to display code, not a request about behavior."""
 
     normalized = " ".join(_normalized_words(question))
-    if re.search(r"\b(?:which|what)\s+(?:source\s+)?files?\b|\bwhere\b", normalized):
+    if re.search(
+        r"\b(?:which|what)\s+(?:source\s+)?files?\b|\bwhere\b|"
+        r"\b(?:qué|que|cuáles|cuales)\s+archivos?(?:\s+fuente)?\b|\b(?:dónde|donde)\b",
+        normalized,
+    ):
         return False
     action = re.search(
         r"\b(?:show|give|provide|write|generate|display|include|share|return|"
-        r"muestra|dame|proporciona|escribe|genera|incluye|comparte)\b",
+        r"muestra|dame|proporciona|escribe|genera|incluye|comparte|devuelve)\b",
         normalized,
     )
     # A request for “important functions” means an inventory/explanation, not
     # full source. Require an explicit code/source/implementation artifact (or
     # “function bodies”) before enforcing fenced, complete implementation code.
     artifact = re.search(
-        r"\b(?:code|source|implementation|codigo|fuente|implementacion|"
+        r"\b(?:code|source|implementation|código|codigo|fuente|implementación|implementacion|"
         r"function\s+bodies|method\s+bodies|cuerpo(?:s)?\s+de\s+funcion(?:es)?)\b",
         normalized,
     )

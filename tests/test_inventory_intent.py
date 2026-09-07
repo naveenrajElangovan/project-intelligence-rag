@@ -110,6 +110,33 @@ def test_named_event_renderer_uses_complete_serialized_payload_declaration() -> 
     assert generated.missing_information == []
 
 
+def test_named_event_renderer_uses_spanish_contract_labels() -> None:
+    documents = [
+        Document(
+            page_content="| `CHECKOUT_EVENT` | `CHECKOUT_WIRE` | 101 | 1 | publishes |",
+            metadata={"title": "Registro de eventos"},
+        ),
+        Document(
+            page_content=(
+                '@SerialName("CHECKOUT_WIRE")\n'
+                "data class CheckoutEvent(\n"
+                '  @SerialName("event_id") val eventId: Int\n'
+                ")"
+            ),
+            metadata={"title": "CheckoutEvent.kt"},
+        ),
+    ]
+
+    generated = _deterministic_structured_inventory_answer(
+        "Dame todos los campos de CHECKOUT_EVENT", documents, "es"
+    )
+
+    assert generated is not None
+    assert "### Campos del payload" in generated.answer
+    assert "Campo serializado" in generated.answer
+    assert "Serialized field" not in generated.answer
+
+
 def test_named_event_schema_without_registry_does_not_invent_metadata() -> None:
     model = Document(
         page_content=(
@@ -255,6 +282,25 @@ def test_partial_coverage_is_reported_without_replacing_the_answer() -> None:
     assert reported.answer == answer.answer
     assert reported.missing_information == [
         "1 of 2 identifiers confirmed; not confirmed: LOGOUT_EVENT."
+    ]
+
+
+def test_partial_coverage_note_uses_the_response_language() -> None:
+    answer = GroundedAnswer(
+        answer="LOGIN_EVENT está documentado. [SOURCE 1]",
+        citations=[1],
+        missing_information=[],
+    )
+
+    reported = _note_coverage_shortfall(
+        answer,
+        ("LOGIN_EVENT", "LOGOUT_EVENT"),
+        ("LOGOUT_EVENT",),
+        "es",
+    )
+
+    assert reported.missing_information == [
+        "1 de 2 identificadores confirmados; no confirmados: LOGOUT_EVENT."
     ]
 
 

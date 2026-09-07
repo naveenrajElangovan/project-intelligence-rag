@@ -127,6 +127,7 @@ def apply_output_gate(
     if not documents or generated is None or state.get("grounded") is False:
         return
     began = started()
+    language = state.get("language") or resolve_response_language(request.question)
     expected_identifiers = tuple(state.get("coverage_expected_identifiers", ()))
     coverage_missing = (
         tuple(state.get("coverage_missing", ()))
@@ -171,9 +172,17 @@ def apply_output_gate(
         )
         if removed_claims and material_claims(pruned_answer):
             note = (
-                "One unsupported statement was removed."
-                if removed_claims == 1
-                else f"{removed_claims} unsupported statements were removed."
+                (
+                    "Se eliminó una afirmación sin respaldo."
+                    if removed_claims == 1
+                    else f"Se eliminaron {removed_claims} afirmaciones sin respaldo."
+                )
+                if language == "es"
+                else (
+                    "One unsupported statement was removed."
+                    if removed_claims == 1
+                    else f"{removed_claims} unsupported statements were removed."
+                )
             )
             generated = generated.model_copy(
                 update={
@@ -208,10 +217,21 @@ def apply_output_gate(
             if resolved.completeness.all_fields
             else "population contract"
         )
-        note = (
-            "The available evidence supports these details, but no authoritative "
-            f"{contract_kind} was available to verify that the set is exhaustive."
-        )
+        if language == "es":
+            contract_kind = (
+                "definición de campos"
+                if resolved.completeness.all_fields
+                else "contrato de población"
+            )
+            note = (
+                "La evidencia disponible respalda estos detalles, pero no había una "
+                f"{contract_kind} autoritativa para verificar que el conjunto fuera exhaustivo."
+            )
+        else:
+            note = (
+                "The available evidence supports these details, but no authoritative "
+                f"{contract_kind} was available to verify that the set is exhaustive."
+            )
         if note not in generated.missing_information:
             generated = generated.model_copy(
                 update={
@@ -224,13 +244,20 @@ def apply_output_gate(
         if resolved.completeness.all_fields:
             missing = tuple(field_coverage_missing or ())
             note = (
-                f"{len(expected_fields) - len(missing)} of {len(expected_fields)} "
+                f"Se verificaron {len(expected_fields) - len(missing)} de "
+                f"{len(expected_fields)} campos declarados; no verificados: {', '.join(missing)}."
+                if language == "es"
+                else f"{len(expected_fields) - len(missing)} of {len(expected_fields)} "
                 f"declared fields were verified; not verified: {', '.join(missing)}."
             )
         else:
             missing = tuple(coverage_missing or ())
             note = (
-                f"{len(expected_identifiers) - len(missing)} of "
+                f"Se verificaron {len(expected_identifiers) - len(missing)} de "
+                f"{len(expected_identifiers)} identificadores; no verificados: "
+                f"{', '.join(missing)}."
+                if language == "es"
+                else f"{len(expected_identifiers) - len(missing)} of "
                 f"{len(expected_identifiers)} identifiers were verified; not verified: "
                 f"{', '.join(missing)}."
             )

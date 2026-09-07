@@ -58,16 +58,6 @@ def test_a_standalone_question_is_unaffected(question: str) -> None:
     assert _conversation_resolution_decision(question, VOCABULARY)[0] is False
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Known gap 2c: a question that is neither a wh-question with an "
-        "auxiliary nor an explicit imperative falls through to the vocabulary "
-        "fallback and inherits the previous subject. 'is there a flow for "
-        "reprints' is standalone but is classified as a follow-up. Fixing the "
-        "fallback flips this green; it is recorded here so the gap stays visible."
-    ),
-    strict=True,
-)
 def test_an_existential_question_should_be_standalone() -> None:
     assert _conversation_resolution_decision(
         "is there a flow for reprints", VOCABULARY

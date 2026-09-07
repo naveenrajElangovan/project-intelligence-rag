@@ -351,6 +351,31 @@ def test_generation_metrics_are_separate_from_retrieval_survival() -> None:
     assert summary["refusal_reason_accuracy"] == 1
 
 
+def test_generation_metrics_count_uncited_claims_dropped() -> None:
+    summary = score_generation(
+        [
+            {
+                "answerable": True,
+                "answered": True,
+                "grounding_accepted": True,
+                "cited_source_ids": ["page:1"],
+                "valid_citation_count": 1,
+                "uncited_claims_dropped": 2,
+            },
+            {
+                "answerable": True,
+                "answered": True,
+                "grounding_accepted": True,
+                "cited_source_ids": ["page:2"],
+                "valid_citation_count": 1,
+                "uncited_claims_dropped": 1,
+            },
+        ]
+    )
+
+    assert summary["uncited_claims_dropped"] == 3
+
+
 def test_metrics_are_split_by_query_language() -> None:
     settings = Settings(_env_file=None, retrieval_top_k=25, rerank_top_n=8)
     rows = [

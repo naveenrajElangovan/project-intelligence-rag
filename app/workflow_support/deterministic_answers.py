@@ -114,12 +114,19 @@ def _deterministic_structured_inventory_answer(
         direct = ""
     else:
         direct = (
-            f"The indexed implementation declares payload assignments for `{target}` "
+            f"La implementación indexada declara asignaciones de payload para `{target}` "
+            f"[SOURCE {field_source}]."
+            if language == "es"
+            else f"The indexed implementation declares payload assignments for `{target}` "
             f"[SOURCE {field_source}]."
         )
     if declared_fields:
         citations.extend(source for *_values, source in declared_fields)
-        header = "| Serialized field | Code property | Type | Source |"
+        header = (
+            "| Campo serializado | Propiedad de código | Tipo | Fuente |"
+            if language == "es"
+            else "| Serialized field | Code property | Type | Source |"
+        )
         separator = "|---|---|---|---|"
         rows = [
             f"| `{serialized}` | `{property_name}` | `{field_type}` | [SOURCE {source}] |"
@@ -128,22 +135,37 @@ def _deterministic_structured_inventory_answer(
         missing: list[str] = []
     elif best_fields:
         citations.append(field_source)
-        header = "| Field | Type | Required | Description | Source |"
+        header = (
+            "| Campo | Tipo | Obligatorio | Descripción | Fuente |"
+            if language == "es"
+            else "| Field | Type | Required | Description | Source |"
+        )
         separator = "|---|---|---|---|---|"
         rows = [
             f"| `{name}` | — | — | `{name} = {value}` | [SOURCE {field_source}] |"
             for name, value in best_fields
         ]
         missing = [
-            "The selected evidence contains payload assignments but not the authoritative field types."
+            (
+                "La evidencia seleccionada contiene asignaciones de payload, pero no los tipos "
+                "de campo autoritativos."
+                if language == "es"
+                else "The selected evidence contains payload assignments but not the authoritative field types."
+            )
         ]
     else:
         header = separator = ""
         rows = []
         missing = [
-            "No authoritative payload-field definition was present in the selected evidence."
+            (
+                "La evidencia seleccionada no contenía una definición autoritativa de los "
+                "campos del payload."
+                if language == "es"
+                else "No authoritative payload-field definition was present in the selected evidence."
+            )
         ]
-    table = ("", "### Payload fields", header, separator, *rows) if rows else ()
+    table_title = "### Campos del payload" if language == "es" else "### Payload fields"
+    table = ("", table_title, header, separator, *rows) if rows else ()
     return GroundedAnswer(
         answer="\n".join(part for part in (direct, *table) if part),
         citations=list(dict.fromkeys(citations)),

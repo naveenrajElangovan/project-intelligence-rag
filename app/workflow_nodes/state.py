@@ -55,6 +55,7 @@ class RagState(TypedDict, total=False):
     coverage_missing_fields: tuple[str, ...]
     population_retrieval_miss: bool
     stream_truncated: bool
+    uncited_claims_dropped: int
     output_gate_applied: bool
     reconstruct_parent_records: bool
     entity_mismatch_requested: str

@@ -339,6 +339,34 @@ def test_unknown_coverage_is_published_with_an_explicit_limitation() -> None:
     assert "authoritative population contract" in state["generated"].missing_information[0]
 
 
+def test_unknown_coverage_limitation_uses_the_response_language() -> None:
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="Lista todos los registros",
+        accessPolicyIds=["project:DEMO"],
+    )
+    resolved = resolve_request(
+        request.question, intent="LIST", allowed_source_categories=("RECORD",)
+    )
+    state = {
+        "documents": [_document("Uno")],
+        "generated": GroundedAnswer(
+            answer="- uno [SOURCE 1]", citations=[1], missing_information=[]
+        ),
+        "grounded": True,
+        "language": "es",
+        "coverage_expected_identifiers": (),
+        "coverage_missing": (),
+    }
+
+    apply_output_gate(state, request, resolved, state["generated"])
+
+    note = state["generated"].missing_information[0]
+    assert "contrato de población" in note
+    assert "authoritative" not in note
+
+
 def test_gate_prunes_uncited_claim_and_keeps_grounded_sibling() -> None:
     request = RagRequest(
         projectId="DEMO",

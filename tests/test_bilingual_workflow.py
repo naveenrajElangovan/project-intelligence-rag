@@ -1368,6 +1368,36 @@ def test_single_jira_details_tolerates_one_character_identifier_typo() -> None:
     assert "medium priority" in answer.answer
 
 
+def test_single_jira_details_are_assembled_in_spanish() -> None:
+    document = _document(
+        "issue-1", "T0-1", "Implementación del buscador - T20-0001", "es", 0.88
+    )
+    document.metadata.update(
+        {
+            "source_type": "ISSUE",
+            "title": "Implementación del buscador - T20-0001",
+            "issue_key": "T0-1",
+            "reference": "T0-1",
+            "issue_type": "Historia",
+            "status": "Pendiente",
+            "priority": "Media",
+            "assignee": "Equipo Uno",
+            "due_date": "2026-09-30",
+        }
+    )
+
+    answer = workflow_module._deterministic_delivery_answer(
+        "Dame los detalles de Jira para T20-0001", [document], "es"
+    )
+
+    assert answer is not None
+    assert "El issue de Jira 'T0-1'" in answer.answer
+    assert "responsable: Equipo Uno" in answer.answer
+    assert "fecha límite: 2026-09-30" in answer.answer
+    assert "assignee" not in answer.answer
+    assert "due date" not in answer.answer
+
+
 def test_single_jira_details_rejects_unrelated_identifier() -> None:
     document = _document(
         "issue-1",

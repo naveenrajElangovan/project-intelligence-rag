@@ -153,7 +153,9 @@ def _overview_style_repair_needed(question: str, answer: str) -> bool:
     """Detect audit or code-inventory output that a broad overview did not request."""
 
     if re.search(
-        r"\b(?:count|counts|files?|lines?|symbols?|tests?|percentage|metrics?|status|maturity)\b",
+        r"\b(?:count|counts|files?|lines?|symbols?|tests?|percentage|metrics?|status|maturity|"
+        r"conteo|archivos?|líneas?|simbolos?|símbolos?|pruebas?|porcentaje|métricas?|"
+        r"metricas?|estado|madurez)\b",
         question,
         flags=re.IGNORECASE,
     ):
@@ -162,8 +164,8 @@ def _overview_style_repair_needed(question: str, answer: str) -> bool:
     return bool(
         re.search(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w.])", claim_text)
         or re.search(
-            r"\b(?:implemented\s+by\s+the\s+following|files?\s+and\s+symbols?|"
-            r"imports?\s+and\s+(?:classes|functions|symbols))\b",
+            r"\b(?:implemented\s+by\s+the\s+following|implementado\s+por|"
+            r"files?\s+and\s+symbols?|imports?\s+and\s+(?:classes|functions|symbols))\b",
             claim_text,
             flags=re.IGNORECASE,
         )
@@ -175,7 +177,8 @@ def _overview_style_repair_needed(question: str, answer: str) -> bool:
         )
         >= 3
         or re.search(
-            r"\b(?:draft|production-ready|maturity|lifecycle status)\b",
+            r"\b(?:draft|production-ready|maturity|lifecycle status|borrador|"
+            r"listo\s+para\s+producción|listo\s+para\s+produccion|ciclo\s+de\s+vida)\b",
             claim_text,
             flags=re.IGNORECASE,
         )

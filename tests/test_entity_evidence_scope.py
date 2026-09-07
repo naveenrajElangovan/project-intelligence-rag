@@ -47,7 +47,7 @@ def test_total_entity_mismatch_fails_closed() -> None:
     assert excluded == 1
     assert diagnostics == [
         {
-            "title": "",
+            "title_digest": "",
             "resolved_entities": ["bot"],
             "exclusion_reason": "not_in_entities",
         }
@@ -73,7 +73,7 @@ def test_entity_scope_still_excludes_mismatches_when_some_evidence_remains() -> 
     assert excluded == 1
     assert diagnostics == [
         {
-            "title": "",
+            "title_digest": "",
             "resolved_entities": ["bot"],
             "exclusion_reason": "not_in_entities",
         }

@@ -73,3 +73,31 @@ def test_an_elliptical_follow_up_still_resolves_against_the_conversation() -> No
     needed, _reason = _conversation_resolution_decision("tell me more", vocabulary)
 
     assert needed is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "price checking flow for products",
+        "flujo de consulta de precios para productos",
+        "is there a flow for reprints",
+        "hay un flujo para reimpresiones",
+    ),
+)
+def test_non_vocabulary_multiword_topics_are_standalone(question: str) -> None:
+    needed, reason = _conversation_resolution_decision(
+        question, ("checkout", "inventory")
+    )
+
+    assert needed is False
+    assert reason == "EXPLICIT_SUBJECT"
+
+
+@pytest.mark.parametrize("question", ("reprints", "reimpresiones"))
+def test_one_word_non_vocabulary_fragments_still_inherit_context(question: str) -> None:
+    needed, reason = _conversation_resolution_decision(
+        question, ("checkout", "inventory")
+    )
+
+    assert needed is True
+    assert reason == "NON_VOCABULARY_SUBJECT"

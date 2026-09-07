@@ -186,3 +186,12 @@ def test_note_helper_is_idempotent_and_pluralises():
 def test_note_helper_is_a_no_op_when_nothing_was_removed():
     answer = GroundedAnswer(answer="a [SOURCE 1].", citations=[1], missing_information=[])
     assert _note_removed_claims(answer, 0) is answer
+
+
+def test_removed_claim_note_uses_the_response_language() -> None:
+    answer = GroundedAnswer(answer="a [SOURCE 1].", citations=[1], missing_information=[])
+
+    note = _note_removed_claims(answer, 2, "es").missing_information[0]
+
+    assert note.startswith("2 afirmaciones")
+    assert "statements" not in note

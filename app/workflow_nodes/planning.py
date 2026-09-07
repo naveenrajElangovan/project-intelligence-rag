@@ -56,7 +56,7 @@ def _implementation_flow_requested(value: str) -> bool:
     normalized = re.sub(r"\s+", " ", value).strip().casefold()
     asks_for_mechanism = bool(
         re.search(
-            r"\b(?:how|where|which|what|como|donde|cual|que)\b",
+            r"\b(?:how|where|which|what|como|cómo|donde|dónde|cual|cuál|que|qué)\b",
             normalized,
         )
     )
@@ -64,7 +64,10 @@ def _implementation_flow_requested(value: str) -> bool:
         re.search(
             r"\b(?:implement(?:ed|ation)?|validat(?:e|es|ed|ing|ion)?|"
             r"authenticat(?:e|es|ed|ing|ion)?|login|logins|password|passwords|"
-            r"credential|credentials|workflow|call flow|code flow|works|handled)\b",
+            r"credential|credentials|workflow|call flow|code flow|works|handled|"
+            r"implementa(?:do|ción|cion|r)?|valida(?:r|do|ción|cion)?|"
+            r"autentica(?:r|do|ción|cion)?|inicio\s+de\s+sesión|inicio\s+de\s+sesion|"
+            r"contraseñas?|credenciales?|flujo|funciona|gestiona(?:do|r)?)\b",
             normalized,
         )
     )
@@ -95,10 +98,11 @@ def _structured_inventory_requested(value: str) -> bool:
     return bool(
         re.search(
             r"\b(?:list|show|give|provide|return|enumerate|inventory|catalog|"
-            r"catalogue|need|want|request)\b",
+            r"catalogue|need|want|request|lista|listar|muestra|mostrar|dame|"
+            r"proporciona|devuelve|enumera|inventario|catálogo|catalogo|necesito|quiero)\b",
             normalized,
         )
-        and re.search(r"\b(?:all|every|complete|full)\b", normalized)
+        and re.search(r"\b(?:all|every|complete|full|todos?|todas?|cada|completo|completa)\b", normalized)
     )
 
 
@@ -107,7 +111,10 @@ def _structured_inventory_subject(value: str) -> str:
     subject = re.sub(
         r"\b(?:can|could|would|you|please|me|i|list|show|give|provide|return|"
         r"enumerate|need|want|request|all|every|complete|full|inventory|catalog|"
-        r"catalogue|the|a|an|of|in|from|for|with|details|only)\b",
+        r"catalogue|the|a|an|of|in|from|for|with|details|only|puedes|podrías|"
+        r"podrias|por\s+favor|lista|listar|muestra|mostrar|dame|proporciona|devuelve|"
+        r"enumera|necesito|quiero|todos?|todas?|cada|completo|completa|inventario|"
+        r"catálogo|catalogo|el|la|los|las|de|en|desde|para|con|detalles|solo)\b",
         " ",
         normalized,
     )
@@ -123,10 +130,10 @@ def _single_record_details_requested(value: str) -> bool:
             r"\b(?:send|give|show|provide|return|select|choose|dame|muestra)\b",
             normalized,
         )
-        and re.search(r"\b(?:one|single|example|sample|uno|una)\b", normalized)
+        and re.search(r"\b(?:one|single|example|sample|uno|una|ejemplo|muestra)\b", normalized)
         and re.search(
             r"\b(?:full|complete|details?|record|schema|fields?|"
-            r"completo|completa|detalles?|registro|campos?)\b",
+            r"completo|completa|detalles?|registro|esquema|campos?)\b",
             normalized,
         )
     )
@@ -137,7 +144,9 @@ def _single_record_subject(value: str) -> str:
     subject = re.sub(
         r"\b(?:can|could|would|you|please|me|send|give|show|provide|return|"
         r"select|choose|one|single|example|sample|full|complete|details?|the|"
-        r"a|an|of|in|from|for|with)\b",
+        r"a|an|of|in|from|for|with|puedes|podrías|podrias|por\s+favor|envía|envia|"
+        r"dame|muestra|mostrar|proporciona|devuelve|selecciona|elige|uno|una|ejemplo|"
+        r"completo|completa|detalles?|el|la|los|las|de|en|desde|para|con)\b",
         " ",
         normalized,
     )
@@ -157,7 +166,8 @@ def _entity_attribute_value_requested(value: str) -> bool:
         )
         and re.search(
             r"\b(?:pass|passes|passed|passing|set|sets|assigned|populate|populated|"
-            r"send|sent|contain|contains|will|what|which|how|pasa|asigna|envia|envía)\b",
+            r"send|sent|contain|contains|will|what|which|how|pasa|asigna|asignado|"
+            r"rellena|completa|envia|envía|contiene|tendrá|tendra|qué|cuál|como|cómo)\b",
             value,
             re.IGNORECASE,
         )

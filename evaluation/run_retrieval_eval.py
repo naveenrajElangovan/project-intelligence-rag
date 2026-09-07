@@ -1205,6 +1205,7 @@ async def _run_generation_lane(
             "grounding_accepted": response.evidence_status == "SUFFICIENT",
             "cited_source_ids": cited,
             "valid_citation_count": len(cited),
+            "uncited_claims_dropped": evaluation_result.uncited_claims_dropped,
             "refusal_reason": response.refusal_reason,
             "expected_refusal_reason": case.get("expected_refusal_reason"),
         }

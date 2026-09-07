@@ -162,10 +162,37 @@ def test_complete_evidence_goes_straight_to_generation() -> None:
     assert _router(1, [_document(0.9)], missing=()) == "generate"
 
 
-def test_an_ungrounded_request_still_ends() -> None:
+def test_a_populated_ungrounded_request_still_reaches_the_truth_gate() -> None:
     from app.workflow_nodes.retrieval import RetrievalNodesMixin
 
     router = RetrievalNodesMixin.__new__(RetrievalNodesMixin)
     router._settings = _settings()
     state = {"grounded": False, "missing_requirements": (), "documents": [_document(0.9)]}
-    assert router._route_after_evidence_completeness(state) == "end"
+    assert router._route_after_evidence_completeness(state) == "generate"
+
+
+def test_context_quality_prose_does_not_become_a_repair_requirement() -> None:
+    from app.workflow_nodes.retrieval import RetrievalNodesMixin
+
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="Explain the checkout flow",
+        accessPolicyIds=["project:DEMO"],
+    )
+    workflow = RetrievalNodesMixin.__new__(RetrievalNodesMixin)
+    workflow._request = request
+    workflow._settings = _settings()
+    workflow._vocabulary = CorpusVocabulary()
+    result = asyncio.run(
+        workflow._validate_evidence_completeness(
+            {
+                "documents": [_document(0.01)],
+                "retrieval_attempt": 1,
+                "language": "en",
+            }
+        )
+    )
+
+    assert result["missing_requirements"] == ()
+    assert result["context_failure_reason"] == "LOW_RELEVANCE"

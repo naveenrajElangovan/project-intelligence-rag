@@ -18,6 +18,7 @@ class WorkflowEvaluationResult:
     response: RagResponse
     retrieved_contexts: tuple[str, ...]
     query_language: str
+    uncited_claims_dropped: int = 0
 
 
 class EvaluationWorkflowMixin:
@@ -59,4 +60,5 @@ class EvaluationWorkflowMixin:
                 state.get("language")
                 or resolve_response_language(self._request.question)
             ),
+            uncited_claims_dropped=int(state.get("uncited_claims_dropped", 0)),
         )

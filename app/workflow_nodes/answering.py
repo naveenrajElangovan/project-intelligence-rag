@@ -1949,11 +1949,11 @@ class AnswerNodesMixin:
                 "answer_shape_claims_removed": answer_shape_claims_removed,
                 "coverage_expected": len(coverage_expected_keys),
                 "coverage_covered": len(coverage_expected_keys) - len(coverage_missing),
-                "coverage_missing": list(coverage_missing),
+                "coverage_missing_count": len(coverage_missing),
                 "field_coverage_expected": len(coverage_expected_fields),
                 "field_coverage_covered": len(coverage_expected_fields)
                 - len(coverage_missing_fields),
-                "field_coverage_missing": list(coverage_missing_fields),
+                "field_coverage_missing_count": len(coverage_missing_fields),
                 "population_retrieval_miss": population_retrieval_miss,
                 "documents_dropped": int(
                     getattr(self._generator, "last_documents_dropped", 0)
@@ -2044,12 +2044,12 @@ class AnswerNodesMixin:
 
     def _route_after_completeness(self, state: RagState) -> str:
         if state.get("grounded") is False:
-            return "end"
+            return "verify_grounding" if state.get("documents") else "end"
         if not state.get("missing_requirements"):
             return "verify_grounding"
         if state.get("retrieval_attempt", 1) < self._settings.max_retrieval_attempts:
             return "repair_completeness"
-        return "end"
+        return "verify_grounding" if state.get("documents") else "end"
 
     async def _repair_completeness(self, state: RagState) -> RagState:
         began = started()
@@ -2083,7 +2083,14 @@ class AnswerNodesMixin:
         began = started()
         generated = state["generated"]
         if _citations_valid(generated, len(state["documents"])):
-            stage_complete("validate_citations", self._request.project_id, began, input_count=len(generated.citations), output_count=len(generated.citations))
+            stage_complete(
+                "validate_citations",
+                self._request.project_id,
+                began,
+                input_count=len(generated.citations),
+                output_count=len(generated.citations),
+                language=state.get("language", "und"),
+            )
             return {"repaired": False}
         stage_complete(
             "validate_citations",
@@ -2092,6 +2099,7 @@ class AnswerNodesMixin:
             input_count=len(generated.citations),
             output_count=0,
             reason_code=_citation_failure_reason(generated, len(state["documents"])),
+            language=state.get("language", "und"),
         )
         repair_kwargs = (
             {"answer_style": state["answer_style"]}
@@ -2134,8 +2142,11 @@ class AnswerNodesMixin:
                     **self._generator.last_usage.model_dump(),
                 )
                 return {
-                    "generated": _note_removed_claims(salvaged, dropped),
+                    "generated": _note_removed_claims(
+                        salvaged, dropped, state.get("language", "en")
+                    ),
                     "repaired": True,
+                    "uncited_claims_dropped": dropped,
                 }
             stage_complete(
                 "citation_repair",
@@ -2144,9 +2155,18 @@ class AnswerNodesMixin:
                 input_count=len(repaired.citations),
                 output_count=0,
                 reason_code=_citation_failure_reason(repaired, len(state["documents"])),
+                language=state.get("language", "und"),
             )
             return {"generated": repaired, "repaired": True, "grounded": False}
-        stage_complete("validate_citations", self._request.project_id, began, input_count=len(generated.citations), output_count=len(repaired.citations), reason_code="REPAIRED")
+        stage_complete(
+            "validate_citations",
+            self._request.project_id,
+            began,
+            input_count=len(generated.citations),
+            output_count=len(repaired.citations),
+            reason_code="REPAIRED",
+            language=state.get("language", "und"),
+        )
         stage_complete(
             "citation_repair",
             self._request.project_id,
@@ -2418,7 +2438,9 @@ class AnswerNodesMixin:
                     # Say so in the response. An answer that quietly lost a
                     # claim looks complete, and the reader cannot tell what was omitted.
                     state = {**state, "generated": _note_removed_claims(
-                        pruned, claim_fallback_removed_count
+                        pruned,
+                        claim_fallback_removed_count,
+                        state.get("language", "en"),
                     )}
                 else:
                     reason_code = fallback_verdict.reason_code
@@ -2471,7 +2493,10 @@ class AnswerNodesMixin:
             re.search(r"\bsuch as\b", state["generated"].answer, flags=re.IGNORECASE)
         )
         generated = _note_coverage_shortfall(
-            state["generated"], population_expected, population_missing
+            state["generated"],
+            population_expected,
+            population_missing,
+            state.get("language", "en"),
         )
         if grounded and population_summary_violation:
             grounded = False
@@ -2479,18 +2504,19 @@ class AnswerNodesMixin:
         # Last gate, and the one that was missing: an answer can be perfectly
         # grounded and still be about something else entirely. Scored against the
         # resolved question so a follow-up is judged on what it resolved to.
-        answer_relevance = -1.0
-        if grounded:
-            addresses, answer_relevance = (
-                await self._grounding_verifier.answer_addresses_question(
-                    answer_question,
-                    generated.answer,
-                    threshold=self._settings.answer_relevance_threshold,
-                )
+        # Score topicality for accepted and rejected grounding outcomes alike.
+        # Restricting this to supported answers biased calibration data toward
+        # the population that had already passed the preceding gate.
+        addresses, answer_relevance = (
+            await self._grounding_verifier.answer_addresses_question(
+                answer_question,
+                generated.answer,
+                threshold=self._settings.answer_relevance_threshold,
             )
-            if not addresses:
-                grounded = False
-                reason_code = "ANSWER_NOT_RELEVANT"
+        )
+        if grounded and not addresses:
+            grounded = False
+            reason_code = "ANSWER_NOT_RELEVANT"
         stage_complete(
             "verify_grounding",
             self._request.project_id,
@@ -2510,10 +2536,10 @@ class AnswerNodesMixin:
                 "claim_pruning_bypassed": claim_pruning_bypassed,
                 "coverage_expected": len(population_expected),
                 "coverage_covered": len(population_expected) - len(population_missing),
-                "coverage_missing": list(population_missing),
+                "coverage_missing_count": len(population_missing),
                 "field_coverage_expected": len(field_expected),
                 "field_coverage_covered": len(field_expected) - len(field_missing),
-                "field_coverage_missing": list(field_missing),
+                "field_coverage_missing_count": len(field_missing),
                 "population_summary_violation": population_summary_violation,
                 "query_intent": state.get("query_intent", "DIRECT"),
                 "source_route": state.get("source_route", "MIXED"),
@@ -2548,18 +2574,27 @@ class AnswerNodesMixin:
         }
 
 
-def _note_removed_claims(value, removed: int):
+def _note_removed_claims(value, removed: int, language: str = "en"):
     """Record in missing_information that a claim was dropped, not answered."""
 
     if removed < 1:
         return value
-    note = (
-        "One statement drafted from the sources could not be verified against them "
-        "and was removed."
-        if removed == 1
-        else f"{removed} statements drafted from the sources could not be verified "
-        "against them and were removed."
-    )
+    if language == "es":
+        note = (
+            "Una afirmación redactada a partir de las fuentes no pudo verificarse "
+            "con ellas y se eliminó."
+            if removed == 1
+            else f"{removed} afirmaciones redactadas a partir de las fuentes no pudieron "
+            "verificarse con ellas y se eliminaron."
+        )
+    else:
+        note = (
+            "One statement drafted from the sources could not be verified against them "
+            "and was removed."
+            if removed == 1
+            else f"{removed} statements drafted from the sources could not be verified "
+            "against them and were removed."
+        )
     if note in value.missing_information:
         return value
     return value.model_copy(
@@ -2567,13 +2602,21 @@ def _note_removed_claims(value, removed: int):
     )
 
 
-def _note_coverage_shortfall(value, expected: tuple[str, ...], missing: tuple[str, ...]):
+def _note_coverage_shortfall(
+    value,
+    expected: tuple[str, ...],
+    missing: tuple[str, ...],
+    language: str = "en",
+):
     """Report incomplete inventory coverage without rejecting grounded claims."""
 
     if not missing:
         return value
     note = (
-        f"{len(expected) - len(missing)} of {len(expected)} identifiers confirmed; "
+        f"{len(expected) - len(missing)} de {len(expected)} identificadores confirmados; "
+        f"no confirmados: {', '.join(missing)}."
+        if language == "es"
+        else f"{len(expected) - len(missing)} of {len(expected)} identifiers confirmed; "
         f"not confirmed: {', '.join(missing)}."
     )
     if note in value.missing_information:

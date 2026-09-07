@@ -231,6 +231,9 @@ def score_generation(
         "answerable_cases": len(answerable),
         "no_answer_cases": len(no_answer),
         "citation_count": citations_total,
+        "uncited_claims_dropped": sum(
+            int(row.get("uncited_claims_dropped") or 0) for row in rows
+        ),
         "refusal_cases": refusals,
         "refusal_reason_cases": len(reason_cases),
         "grounding_acceptance_rate": accepted / len(answerable) if answerable else 0,

@@ -350,6 +350,13 @@ def _conversation_resolution_decision(
     if topic_words:
         if _complete_explicit_question(normalized):
             return False, "EXPLICIT_SUBJECT"
+        # A multiword topic supplies enough subject of its own even when none
+        # of its nouns appear in the project vocabulary.  Keep one-word
+        # fragments conservative: they may still be elliptical references to
+        # the active subject.  Explicit referential forms have already returned
+        # through the dedicated guards above.
+        if len(topic_words) >= 2 and not words & pronouns:
+            return False, "EXPLICIT_SUBJECT"
         if vocabulary is not None and not _subject_matches_vocabulary(
             " ".join(topic_words), vocabulary
         ):

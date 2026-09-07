@@ -1428,8 +1428,11 @@ class RetrievalNodesMixin:
             state.get("documents", []),
             relevance_threshold=self._settings.context_relevance_threshold,
         )
-        if quality.retry_recommended and not missing:
-            missing = (*missing, *quality.missing_information)
+        # ``missing_information`` is explanatory prose from the cheap context
+        # heuristic, not a machine-readable requirement.  Keep it as a quality
+        # signal, but never let a sentence such as "more specific supporting
+        # evidence" enter the repair requirement loop.
+        context_missing_signal_count = len(quality.missing_information)
         exhausted = bool(missing) and state.get("retrieval_attempt", 1) >= self._settings.max_retrieval_attempts
         stage_complete(
             "evidence_completeness",
@@ -1451,6 +1454,7 @@ class RetrievalNodesMixin:
                 "context_relevance": quality.relevance,
                 "context_completeness": quality.completeness,
                 "context_failure_reason": quality.failure_reason,
+                "context_missing_signal_count": context_missing_signal_count,
             },
         )
         result: RagState = {
@@ -1470,7 +1474,7 @@ class RetrievalNodesMixin:
 
     def _route_after_evidence_completeness(self, state: RagState) -> str:
         if state.get("grounded") is False:
-            return "end"
+            return "generate" if state.get("documents") else "end"
         if not state.get("missing_requirements"):
             return "generate"
         if state.get("retrieval_attempt", 1) < self._settings.max_retrieval_attempts:
