@@ -152,9 +152,7 @@ def test_langchain_retriever_always_applies_project_and_access_filters() -> None
     assert index.query_args["where"] == {
         "$and": [
             {"project_id": {"$eq": "DEMO"}},
-            {
-                "access_policy_id": {"$eq": "project:DEMO"}
-            },
+            {"access_policy_id": {"$eq": "project:DEMO"}},
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
         ]
     }

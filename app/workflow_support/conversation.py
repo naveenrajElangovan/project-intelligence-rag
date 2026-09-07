@@ -4,6 +4,7 @@ import re
 import unicodedata
 from collections.abc import Iterable
 
+from app.workflow_support.language import fold
 from app.workflow_support.query_analysis import _normalized_words
 
 
@@ -99,13 +100,54 @@ def _contextual_subtopic_followup(
     return bool(topic_words & set(_normalized_words(previous_answer)))
 
 
+_ANCHOR_TOKEN = re.compile(r"\b[A-Z][A-Z0-9]{1,}(?:[_-][A-Z0-9]+)*\b")
+_SECTION_ID = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+
+
+def conversation_anchor_terms(
+    history: Iterable[tuple[str, str]], question: str, *, limit: int = 6
+) -> tuple[str, ...]:
+    """Identifiers a follow-up is asking about, taken from the last answer.
+
+    Follow-up resolution carries a *subject* forward but not the terms the
+    previous answer introduced. "what is MC, MP here" is answerable only if
+    retrieval can reach the section that defines those codes, and two bare
+    two-letter tokens carry no signal on their own -- the live trace showed that
+    request retrieving twelve weakly related documents and refusing.
+
+    Two kinds of anchor are returned: codes the question and the previous answer
+    both name, and section identifiers the previous answer cited. A completed
+    assistant turn has already passed citation and grounding, so its identifiers
+    are safe to retrieve on -- which is why the caller may use these without
+    _safe_query_variant, unlike a model-generated variant.
+    """
+
+    answer = next(
+        (
+            content
+            for role, content in reversed(list(history))
+            if role == "assistant" and str(content).strip()
+        ),
+        "",
+    )
+    if not answer:
+        return ()
+    answer_tokens = list(dict.fromkeys(_ANCHOR_TOKEN.findall(str(answer))))
+    asked = set(_ANCHOR_TOKEN.findall(str(question)))
+    shared = [token for token in answer_tokens if token in asked]
+    sections = [token for token in answer_tokens if _SECTION_ID.fullmatch(token)]
+    return tuple(dict.fromkeys([*shared, *sections]))[:limit]
+
+
 def _complete_explicit_question(value: str) -> bool:
     """Return whether a turn supplies its own predicate and non-referential topic."""
 
     normalized = unicodedata.normalize("NFKC", value).casefold().strip()
     if re.search(
         r"\b(?:it|its|that|this|these|those|their|them|same|above|previous|"
-        r"eso|esto|esa|ese|esos|esas|mismo|misma|anterior)\b",
+        r"here|earlier|previously|"
+        r"eso|esto|esa|ese|esos|esas|mismo|misma|anterior|"
+        r"aqui|aqu\u00ed|arriba|antes|previamente)\b",
         normalized,
     ):
         return False
@@ -116,9 +158,21 @@ def _complete_explicit_question(value: str) -> bool:
         r"están|puede|pueden|hace|hacen)\b",
         normalized,
     )
+    # A request that names its own subject is a new topic, whatever verb opens
+    # it. This list used to hold eight verbs, so "Give me the flow for checking a
+    # price for leche" fell through to the vocabulary test below, was classed as
+    # a follow-up, and inherited the previous turn's entity -- which then scoped
+    # every retrieved document to that entity and discarded the ones that could
+    # have answered it. The pronoun guard above still keeps genuine follow-ups
+    # ("give me the same answer", "tell me more about that") out of here.
     explicit_imperative = re.match(
-        r"^(?:describe|explain|summarize|define|document|explica|"
-        r"describe|resume|define)\s+(?!more\b|further\b|again\b|más\b|mas\b)",
+        r"^(?:describe|explain|summarize|summarise|define|document|outline|"
+        r"detail|give|show|tell|list|provide|share|walk|name|find|get|"
+        r"i\s+(?:need|want)|"
+        r"explica|explicame|expl\u00edcame|resume|detalla|documenta|dame|dime|"
+        r"muestra|muestrame|mu\u00e9strame|enumera|lista|comparte|indica|"
+        r"cuentame|cu\u00e9ntame|proporciona|necesito|quiero)"
+        r"\s+(?!(?:(?:me|us|nos)\s+)?(?:more|further|again|m\u00e1s|mas)\b)",
         normalized,
     )
     return bool(complete_interrogative or explicit_imperative)
@@ -159,6 +213,14 @@ def _conversation_resolution_decision(
         "same",
         "above",
         "previous",
+        "here",
+        "earlier",
+        "previously",
+        "aqui",
+        "aqu\u00ed",
+        "arriba",
+        "antes",
+        "previamente",
         "eso",
         "esto",
         "esa",
@@ -221,7 +283,12 @@ def _conversation_resolution_decision(
     # example, “what is cluster that you know?” has its own topic (cluster),
     # while “what is it?” does not. Carrying the previous subject in the first
     # case contaminates retrieval and can switch the source route incorrectly.
-    if normalized.startswith(followup_prefixes):
+    # Accent-insensitive as well: people type "dime mas" and "que mas" far more
+    # often than "dime más". Matching only the accented form made every Spanish
+    # follow-up prefix a coin flip on the user's keyboard.
+    if normalized.startswith(followup_prefixes) or fold(normalized).startswith(
+        tuple(fold(prefix) for prefix in followup_prefixes)
+    ):
         return True, "FOLLOWUP_PREFIX"
     # An elliptical conjunction carries the previous predicate, not a new
     # question: "and the other app?" carries the prior predicate. Retrieving on the bare
@@ -243,6 +310,12 @@ def _conversation_resolution_decision(
         "clarify", "compare", "continue", "describe", "detail", "elaborate",
         "explain", "expand", "give", "help", "include", "list", "need",
         "provide", "show", "tell", "use", "want",
+        # Same set in Spanish, so an elliptical request behaves identically in
+        # both languages rather than only being caught in English.
+        "aclara", "compara", "continua", "contin\u00faa", "describe", "detalla",
+        "elabora", "explica", "amplia", "ampl\u00eda", "dame", "ayuda",
+        "incluye", "lista", "necesito", "proporciona", "muestra", "dime",
+        "usa", "quiero",
     }
     if (
         0 < len(normalized.split()) < 8
@@ -254,6 +327,15 @@ def _conversation_resolution_decision(
         "a", "an", "and", "are", "be", "do", "does", "explain", "for", "how",
         "is", "know", "me", "of", "please", "tell", "the", "to", "what", "you",
         "implemented", "implementation", "funciona", "funcion", "como", "que", "sabes",
+        # Spanish function words. Without these a Spanish question keeps its
+        # articles and prepositions as "topic words", which changes whether it
+        # looks like a fresh subject and therefore whether it inherits the
+        # previous one.
+        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
+        "al", "para", "por", "con", "sobre", "es", "son", "esta", "estan",
+        "cual", "cuales", "cuando", "donde", "quien", "y", "o", "en", "lo",
+        "se", "su", "sus", "dame", "dime", "muestra", "muestrame", "necesito",
+        "quiero", "explica", "describe", "resume",
     }
     # A demonstrative plus nothing but attribute words is a follow-up about the
     # previous subject, not a new topic. Checked before the topic-word test

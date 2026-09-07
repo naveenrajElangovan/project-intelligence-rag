@@ -18,7 +18,7 @@ from app.workflow_support.answer_structure import (
     prune_unsupported_claims,
 )
 from app.workflow_support.conversation import _conversation_resolution_decision
-from app.workflow_support.query_analysis import detect_query_language
+from app.workflow_support.query_analysis import resolve_response_language
 
 
 def clarification_response(
@@ -52,7 +52,7 @@ def clarification_response(
         )
     )
     if overloaded_record and not delivery_context and not document_context:
-        language = detect_query_language(request.question)
+        language = resolve_response_language(request.question)
         return RagResponse(
             status="NEEDS_CLARIFICATION",
             answer=(
@@ -87,7 +87,7 @@ def clarification_response(
         or request.conversation_history
     ):
         return None
-    language = detect_query_language(request.question)
+    language = resolve_response_language(request.question)
     return RagResponse(
         status="NEEDS_CLARIFICATION",
         answer=(

@@ -8,43 +8,27 @@ from langchain_core.documents import Document
 
 from app.llm import GroundedAnswer, TokenUsage
 from app.lexical_tokens import subtokens
+from app.workflow_support.language import (
+    autocorrect_question,
+    correction_count,
+    is_unclassifiable,
+    language_name,
+    resolve_response_language,
+)
+from app.workflow_support.language import detect_query_language as _detect_query_language
 from app.workflow_support.identifiers import member_identifiers
 
 
 def detect_query_language(value: str) -> str:
-    lowered = f" {value.lower()} "
-    spanish = sum(
-        lowered.count(f" {word} ")
-        for word in ("el", "la", "de", "que", "para", "cómo", "cual", "estado", "sobre")
-    )
-    english = sum(
-        lowered.count(f" {word} ")
-        for word in (
-            "the",
-            "of",
-            "that",
-            "for",
-            "how",
-            "what",
-            "status",
-            "tell",
-            "about",
-            "describe",
-            "explain",
-            "overview",
-            "list",
-            "all",
-            "every",
-            "feature",
-            "features",
-            "have",
-        )
-    )
-    if spanish > english or re.search(r"[áéíóúñ¿¡]", lowered):
-        return "es"
-    if english > spanish:
-        return "en"
-    return "mixed"
+    """Classify a question as 'en', 'es', or 'mixed'.
+
+    Delegates to app.workflow_support.language, which autocorrects the question
+    before scoring so a misspelling no longer zeroes both counters. Callers that
+    put the result into a prompt must use resolve_response_language instead:
+    'mixed' is a classification, not a language the assistant can answer in.
+    """
+
+    return _detect_query_language(value)
 
 
 def _identifiers(value: str) -> set[str]:

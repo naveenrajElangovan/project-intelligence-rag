@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import hashlib
 import re
 
 from langgraph.config import get_stream_writer
@@ -1237,6 +1238,15 @@ def _document_entities(document: object) -> set[str]:
     return _entity_from_structural_label(title)
 
 
+def _content_digest(value: object) -> str:
+    """A short, stable, non-reversible reference to a piece of corpus content."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def _scope_documents_to_entity(
     documents: list[object], requested_entity: str
 ) -> tuple[list[object], int, list[dict[str, object]], bool]:
@@ -1250,9 +1260,15 @@ def _scope_documents_to_entity(
         if entities and requested_entity not in entities:
             excluded += 1
             metadata = getattr(document, "metadata", {})
+            # A Confluence page title and a repository path are corpus content,
+            # and this list is emitted in stage telemetry that reaches Loki and
+            # Phoenix. SECURITY_AND_PRIVACY requires content to be kept out at
+            # the source, so correlate on a digest instead: repeated exclusions
+            # of the same document still line up across requests, without
+            # putting the document in the log.
             entity_excluded_titles.append(
                 {
-                    "title": str(metadata.get("title") or ""),
+                    "title_digest": _content_digest(metadata.get("title")),
                     "resolved_entities": sorted(entities),
                     "exclusion_reason": "not_in_entities",
                 }
@@ -1474,7 +1490,9 @@ class AnswerNodesMixin:
             answer_shape_reason = (
                 "PROCEDURAL_OR_CAUSAL_QUESTION"
                 if re.search(
-                    r"\b(?:how|why|procedure|process|steps?|flow)\b",
+                    r"\b(?:how|why|procedure|process|steps?|flow|"
+                    r"c[o\u00f3]mo|por\s+qu[e\u00e9]|procedimiento|proceso|"
+                    r"pasos?|flujos?)\b",
                     answer_question,
                     flags=re.IGNORECASE,
                 )
@@ -2458,6 +2476,21 @@ class AnswerNodesMixin:
         if grounded and population_summary_violation:
             grounded = False
             reason_code = "INSUFFICIENT_EVIDENCE"
+        # Last gate, and the one that was missing: an answer can be perfectly
+        # grounded and still be about something else entirely. Scored against the
+        # resolved question so a follow-up is judged on what it resolved to.
+        answer_relevance = -1.0
+        if grounded:
+            addresses, answer_relevance = (
+                await self._grounding_verifier.answer_addresses_question(
+                    answer_question,
+                    generated.answer,
+                    threshold=self._settings.answer_relevance_threshold,
+                )
+            )
+            if not addresses:
+                grounded = False
+                reason_code = "ANSWER_NOT_RELEVANT"
         stage_complete(
             "verify_grounding",
             self._request.project_id,
@@ -2470,6 +2503,7 @@ class AnswerNodesMixin:
             model_profile="grounding",
             language=state.get("language", "und"),
             extra={
+                "answer_relevance": round(answer_relevance, 4),
                 "claim_fallback_removed_count": claim_fallback_removed_count,
                 "post_prune_regenerated": post_prune_regenerated,
                 "post_prune_below_floor": post_prune_below_floor,

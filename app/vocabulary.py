@@ -47,7 +47,6 @@ class CorpusVocabulary:
             languages=_normalized_values(values.get("languages"), casefold=True),
         )
 
-
 def _raw_values(value: Any) -> Iterable[Any]:
     if isinstance(value, str):
         stripped = value.strip()

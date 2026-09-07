@@ -114,6 +114,13 @@ class FakeGenerator:
     async def repair(self, *args) -> GroundedAnswer:
         raise AssertionError("Citation repair should not run for a valid answer.")
 
+    async def answer_addresses_question(
+        self, question: str, answer: str, *, threshold: float
+    ) -> tuple[bool, float]:
+        """Topicality is a separate gate; this double exercises support only."""
+    
+        return True, 1.0
+
     async def verify(self, *args, **kwargs) -> GroundingVerdict:
         return GroundingVerdict(supported=True, reason_code="SUPPORTED")
 
@@ -122,6 +129,13 @@ class FakeGroundingVerifier:
     def __init__(self, *args) -> None:
         self.last_usage = TokenUsage()
         self.model_name = "fake-grounding"
+
+    async def answer_addresses_question(
+        self, question: str, answer: str, *, threshold: float
+    ) -> tuple[bool, float]:
+        """Topicality is a separate gate; this double exercises support only."""
+    
+        return True, 1.0
 
     async def verify(self, *args, **kwargs) -> GroundingVerdict:
         return GroundingVerdict(supported=True, reason_code="SUPPORTED")
@@ -439,6 +453,13 @@ class ClaimFallbackVerifier(FakeGroundingVerifier):
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
+
+    async def answer_addresses_question(
+        self, question: str, answer: str, *, threshold: float
+    ) -> tuple[bool, float]:
+        """Topicality is a separate gate; this double exercises support only."""
+    
+        return True, 1.0
 
     async def verify(
         self, question, documents, answer, *, answer_language=""

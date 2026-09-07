@@ -273,6 +273,9 @@ class LocalCitationGroundingVerifier:
         *,
         answer_language: str = "",
     ) -> GroundingVerdict:
+        # Support is judged per claim against cited evidence. Whether the answer
+        # is *about* the question is a separate property, checked by
+        # answer_addresses_question below.
         del question
         claims = structured_material_claims(answer.answer)
         invalid_claims: list[str] = []
@@ -418,6 +421,34 @@ class LocalCitationGroundingVerifier:
         )
 
 
+    async def answer_addresses_question(
+        self, question: str, answer: str, *, threshold: float
+    ) -> tuple[bool, float]:
+        """Does the finished answer address the question it claims to answer?
+
+        Every other gate checks support: citations resolve, claims are entailed
+        by their evidence, coverage is complete. None of them checks topicality,
+        so an answer assembled from correctly-cited but unrelated chunks passed
+        all of them and reached the user with MEDIUM confidence attached. The
+        same cross-encoder that scores retrieval and grounding answers this one,
+        over the whole answer rather than per claim.
+        """
+
+        text = sanitize_evidence(
+            re.sub(r"\s*\[SOURCE \d+\]", "", answer)
+        ).strip()
+        prompt = " ".join(str(question or "").split())
+        if not text or not prompt:
+            # Nothing to judge. Inventing a refusal here would be worse than
+            # deferring to the gates that already passed.
+            return True, 1.0
+        pair = (prompt, self._scored(text))
+        await self._ensure_scores([pair])
+        score = self._pair_score_cache[pair]
+        self._pair_score_cache.clear()
+        return score >= threshold, score
+
+
 def _material_claims(answer: str) -> list[str]:
     return [claim.text for claim in structured_material_claims(answer)]
 
@@ -449,7 +480,14 @@ def _canonical_number(value: str) -> str:
 
 
 def _negation_supported(claim: str, evidence: str) -> bool:
-    pattern = r"\b(?:no|not|never|none|without|zero|0)\b"
+    # Both languages, or a Spanish claim ("sin impuestos", "nunca se registra")
+    # can never find its negation in Spanish evidence and is rejected as
+    # unsupported. "no" is shared by both and was already here.
+    pattern = (
+        r"\b(?:no|not|never|none|without|zero|0|"
+        r"ni|nunca|jam[a\u00e1]s|ning[u\u00fa]n|ninguno|ninguna|ningunos|"
+        r"ningunas|sin|tampoco|cero)\b"
+    )
     return not re.search(pattern, claim, flags=re.IGNORECASE) or bool(
         re.search(pattern, evidence, flags=re.IGNORECASE)
     )

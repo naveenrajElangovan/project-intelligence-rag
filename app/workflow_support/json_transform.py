@@ -27,7 +27,7 @@ from app.models import (
     RagResponse,
 )
 from app.telemetry import request_complete, stage_complete
-from app.workflow_support.query_analysis import detect_query_language
+from app.workflow_support.query_analysis import resolve_response_language
 
 
 # Bounds. A chat message is not a file-upload channel, and an unbounded nesting
@@ -359,7 +359,7 @@ def json_transform_response(request: RagRequest, began: float) -> RagResponse | 
     construction.
     """
 
-    language = detect_query_language(request.question)
+    language = resolve_response_language(request.question)
     detected = detect_json_transform_request(request.question, language)
     if detected is None:
         return None

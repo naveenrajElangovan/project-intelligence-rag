@@ -203,6 +203,13 @@ def test_stream_withholds_factual_text_until_final_gate_then_emits_verified_delt
             }
 
     class Verifier:
+        async def answer_addresses_question(
+            self, question: str, answer: str, *, threshold: float
+        ) -> tuple[bool, float]:
+            """Topicality is a separate gate; this double exercises support only."""
+        
+            return True, 1.0
+
         async def verify(self, _question, _documents, answer, **_kwargs):
             supported = answer.answer.startswith("Supported")
             return GroundingVerdict(

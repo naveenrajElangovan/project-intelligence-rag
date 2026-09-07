@@ -17,7 +17,8 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from app.config import Settings
+from app.config import Settings, get_settings
+from app.workflow_support.language import DEFAULT_RESPONSE_LANGUAGE, language_name
 from app.reranking import sanitize_evidence
 from app.retry import with_transient_retry
 from app.table_evidence import contains_table
@@ -461,6 +462,39 @@ class BilingualQueryPlanner:
                     "details. Return only the schema.",
                 ),
                 ("human", "SPANISH QUERY:\n{question}"),
+            ]
+        )
+        async with _model_slot(self._settings):
+            value, usage = await _invoke_with_usage(
+                prompt | self._model.with_structured_output(RetrievalTranslation),
+                {"question": question},
+                self._settings,
+            )
+        self.last_usage = usage
+        return re.sub(r"\s+", " ", value.translated_query).strip()
+
+    async def translate_to_spanish(self, question: str) -> str:
+        """The mirror of translate_to_english, for an English question.
+
+        Without this the bridge ran one way only: a Spanish question gained an
+        English retrieval variant, but an English question was reranked as-is
+        against Spanish evidence. The cross-encoder scored that pool near zero
+        and the pre-generation relevance gate refused before anything was
+        written, which reads to the user as "we could not confirm the details"
+        for a question the corpus answers.
+        """
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "Translate the English project-search query into concise Spanish for retrieval. "
+                    "Preserve project and application identifiers, filenames, code symbols, Jira keys, "
+                    "API names, numbers, "
+                    "and quoted text exactly. Do not answer, explain, add facts, or remove requested "
+                    "details. Return only the schema.",
+                ),
+                ("human", "ENGLISH QUERY:\n{question}"),
             ]
         )
         async with _model_slot(self._settings):
@@ -1565,4 +1599,18 @@ def _truncate_estimated_tokens(value: str, maximum_tokens: int) -> str:
 
 
 def _language_name(value: str) -> str:
-    return "Spanish" if value == "es" else "English" if value == "en" else "the query's language"
+    """Name the response language for a prompt. Always English or Spanish.
+
+    This used to return "the query's language" for anything unclassified, which
+    handed the choice to the model: a Spanglish question with a typo in it came
+    back in Dutch. The supported set is closed, so an unclassified question
+    falls back to the configured default rather than to the model's guess.
+    """
+
+    if value in ("en", "es"):
+        return language_name(value)
+    try:
+        default = get_settings().default_response_language
+    except Exception:  # Settings unavailable (tests, tooling): use the module default.
+        default = DEFAULT_RESPONSE_LANGUAGE
+    return language_name(value, default=default)

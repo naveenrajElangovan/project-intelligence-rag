@@ -74,6 +74,13 @@ class _RejectingVerifier:
         self.model_name = "fake-grounding"
         self.last_rejections = []
 
+    async def answer_addresses_question(
+        self, question: str, answer: str, *, threshold: float
+    ) -> tuple[bool, float]:
+        """Topicality is a separate gate; this double exercises support only."""
+    
+        return True, 1.0
+
     async def verify(self, *args, **kwargs) -> GroundingVerdict:
         return GroundingVerdict(
             supported=False,

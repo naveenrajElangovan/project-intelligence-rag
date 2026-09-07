@@ -35,7 +35,7 @@ from app.workflow_support.citations import (
     _overview_style_repair_needed,
 )
 from app.workflow_support.query_analysis import (
-    detect_query_language,
+    detect_query_language, resolve_response_language,
     _identifiers,
     _safe_query_variant,
     _multi_part_question,
@@ -136,11 +136,11 @@ from app.workflow_support.conversation import (
     _safe_conversation_rewrite,
 )
 from app.workflow_support.fail_closed import apply_output_gate, clarification_response, resolved_request_for_state
+from app.workflow_evaluation import EvaluationWorkflowMixin
 
 
-class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
+class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
     """Bounded graph whose authorization inputs are immutable and never LLM-generated."""
-
     def __init__(self, settings: Settings, request: RagRequest) -> None:
         self._settings = settings
         self._request = request
@@ -252,7 +252,7 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
         apply_output_gate(state, self._request, resolved, generated)
         generated = state.get("generated")
         if not documents or generated is None or state.get("grounded") is False:
-            language = state.get("language", detect_query_language(self._request.question))
+            language = state.get("language") or resolve_response_language(self._request.question, default=self._settings.default_response_language)
             refusal_began = started()
             refusal = insufficient_evidence_answer(language)
             reason_code = "STATIC_FALLBACK"
@@ -263,7 +263,7 @@ class AuthorizedRagWorkflow(PlanningNodesMixin, RetrievalNodesMixin, AnswerNodes
             # written from it could not be verified" are different failures with
             # different fixes -- indexing versus phrasing -- and used to produce
             # the same message, which made the second look like the first.
-            unverified = bool(documents) and state.get("grounded") is False
+            unverified = bool(documents) and state.get("grounded") is False and state.get("grounding_reason") != "INCOMPLETE_EVIDENCE"
             population_miss = bool(state.get("coverage_expected")) and bool(
                 state.get("population_retrieval_miss")
             )

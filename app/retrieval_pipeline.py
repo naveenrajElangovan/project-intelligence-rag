@@ -30,7 +30,13 @@ class CandidateFusion(Protocol):
 
 
 class ContextEvaluator(Protocol):
-    def evaluate(self, question: str, documents: Sequence[Document]) -> "ContextQuality": ...
+    def evaluate(
+        self,
+        question: str,
+        documents: Sequence[Document],
+        *,
+        relevance_threshold: float = 0.25,
+    ) -> "ContextQuality": ...
 
 
 def deduplicate_candidate_bodies(documents: Sequence[Document]) -> list[Document]:
@@ -221,7 +227,13 @@ class ContextQuality:
 class HeuristicContextEvaluator:
     """Cheap pre-generation gate; semantic verification remains downstream."""
 
-    def evaluate(self, question: str, documents: Sequence[Document]) -> ContextQuality:
+    def evaluate(
+        self,
+        question: str,
+        documents: Sequence[Document],
+        *,
+        relevance_threshold: float = 0.25,
+    ) -> ContextQuality:
         if not documents:
             return ContextQuality("INSUFFICIENT", 0.0, 0.0, ("relevant evidence",), True, "NO_RESULTS")
         relevance = max(
@@ -230,7 +242,7 @@ class HeuristicContextEvaluator:
         )
         exact = max((float(document.metadata.get("lexical_score") or 0) for document in documents), default=0.0)
         completeness = min(1.0, len(documents) / 2 + min(exact / 4, 0.5))
-        sufficient = relevance >= 0.25 or exact > 0
+        sufficient = relevance >= relevance_threshold or exact > 0
         return ContextQuality(
             "SUFFICIENT" if sufficient else "INSUFFICIENT",
             round(min(relevance, 1.0), 3),

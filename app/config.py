@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     max_request_body_bytes: int = 262_144
     rate_limit_per_minute: int = 120
     internal_api_key: str = ""
+    # The assistant answers in English or Spanish only. This is the tie-break
+    # for a question that carries no recognisable signal in either language.
+    default_response_language: str = "es"
     openinference_enabled: bool = False
     openinference_otlp_endpoint: str = "http://127.0.0.1:4318/v1/traces"
     chroma_host: str = "chroma"
@@ -181,9 +184,18 @@ class Settings(BaseSettings):
     factual_temperature: float = 0.0
     synthesis_temperature: float = 0.1
     translation_enabled: bool = True
+    # Pre-generation gate: the best rerank score the evidence pool must reach
+    # before an answer is attempted. Every other threshold is configurable; this
+    # one was a literal inside HeuristicContextEvaluator.
+    context_relevance_threshold: float = 0.25
     grounding_verification_enabled: bool = True
     incremental_verified_streaming_enabled: bool = True
     # Supported event claims measured 0.880-0.965; false claims peaked at 0.242.
+    # Topicality, not support. Grounding checks each claim against its cited
+    # evidence and deliberately ignores the question, so an answer whose every
+    # sentence is correctly cited can still be about something else. This is the
+    # bar the finished answer must clear against the question it answers.
+    answer_relevance_threshold: float = 0.10
     grounding_score_threshold: float = 0.65
     grounding_cross_language_score_threshold: float = 0.60
     # The cross-encoder scores running text. Rewriting Markdown tables as one

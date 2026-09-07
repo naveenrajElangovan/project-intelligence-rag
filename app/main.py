@@ -28,7 +28,8 @@ from app.reranking import build_reranker
 from app.retrieval import warm_authorized_lexical_corpora
 from app.security import ProjectRateLimiter, RequestSizeLimitMiddleware, SecurityHeadersMiddleware
 from app.security import require_internal_caller
-from app.workflow import AuthorizedRagWorkflow, detect_query_language
+from app.workflow import AuthorizedRagWorkflow
+from app.workflow_support.language import resolve_response_language
 from app.telemetry import (
     configure_telemetry_logging,
     new_request_id,
@@ -358,7 +359,9 @@ async def answer(request: RagRequest, settings: Settings = Depends(get_settings)
 
     began = started()
     await app.state.project_rate_limiter.acquire(request.project_id)
-    language = detect_query_language(request.question)
+    language = resolve_response_language(
+        request.question, default=settings.default_response_language
+    )
     required_project_policy = f"project:{request.project_id}"
     if required_project_policy not in request.access_policy_ids:
         refusal_began = started()
@@ -515,10 +518,10 @@ async def answer_stream(
                 outcome="FAILED",
                 confidence="NONE",
                 model_profile=request.model_profile,
-                language=detect_query_language(request.question),
+                language=resolve_response_language(request.question),
                 reason_code=failure_code,
             )
-            language = detect_query_language(request.question)
+            language = resolve_response_language(request.question)
             message = pipeline_unavailable_answer(language)
             yield json.dumps(
                 {"type": "error", "message": message},

@@ -63,6 +63,13 @@ class _PartialVerifier:
         self.last_rejections = []
         self.calls = 0
 
+    async def answer_addresses_question(
+        self, question: str, answer: str, *, threshold: float
+    ) -> tuple[bool, float]:
+        """Topicality is a separate gate; this double exercises support only."""
+    
+        return True, 1.0
+
     async def verify(self, question, documents, answer, **k):
         self.calls += 1
         if BAD.split(" [SOURCE")[0] in answer.answer:

@@ -8,9 +8,11 @@ from app.grounding_contract import resolve_request
 from app.source_policy import SourcePolicyRegistry
 from app.workflow_support.identifiers import member_identifiers
 from app.workflow_support.inventory_intent import is_exhaustive_entity_detail_question
+from app.workflow_support.language import resolve_conversation_response_language
 from app.workflow_nodes.state import RagState
 from app.workflow_support.conversation import (
     _bounded_history,
+    conversation_anchor_terms,
     _contextual_subtopic_followup,
     _conversation_resolution_decision,
     _conversation_subject,
@@ -30,8 +32,8 @@ from app.workflow_support.query_analysis import (
     _safe_translation_variant,
     _source_route_intent,
     _query_quality,
+    autocorrect_question,
     _code_location_query,
-    detect_query_language,
     corrected_query_variant,
     retrieval_terminology_variant,
     uncertain_entity_token,
@@ -192,15 +194,26 @@ class PlanningNodesMixin:
         """Resolve bounded follow-ups, classify intent, and create retrieval queries."""
 
         began = started()
-        original_question = self._request.question
-        language = detect_query_language(original_question)
-        question = await self._resolve_conversation_question(original_question, language)
-        query_quality, quality_reason = _query_quality(question)
-        detected_language = language
+        # Correct the question once, here, so every downstream consumer -- language
+        # detection, conversation resolution, intent routing and the retrieval
+        # queries -- sees the same repaired text. Correction is dictionary-bounded
+        # and never touches identifiers, acronyms or project entities.
+        original_question = autocorrect_question(
+            self._request.question,
+            vocabulary=getattr(self._vocabulary, "entities", ()),
+        )
         history = [
             (message.role, message.content)
             for message in self._request.conversation_history[-6:]
         ]
+        language = resolve_conversation_response_language(
+            original_question,
+            history,
+            default=getattr(self._settings, "default_response_language", "es"),
+        )
+        question = await self._resolve_conversation_question(original_question, language)
+        query_quality, quality_reason = _query_quality(question)
+        detected_language = language
         contextual_parent = (
             _resolved_conversation_subject(question)
             if question != original_question
@@ -591,6 +604,18 @@ class PlanningNodesMixin:
         source_types, source_route = _intent_source_scope(query_intent)
         queries = [question]
         rerank_queries = [question]
+        # A follow-up inherits the previous subject but not the identifiers the
+        # previous answer introduced, so a question about codes that answer named
+        # retrieved on the bare codes and found nothing. Only fires when the
+        # resolver actually rewrote the question, so a standalone question is
+        # never polluted by the turn before it.
+        if question != original_question:
+            anchor_terms = conversation_anchor_terms(history, original_question)
+            if anchor_terms:
+                anchored = f"{question} {' '.join(anchor_terms)}"
+                if anchored not in queries:
+                    queries.append(anchored)
+                    rerank_queries.append(anchored)
         reason_code = "DIRECT_RETRIEVE_FIRST"
         usage = TokenUsage()
         corrected = corrected_query_variant(question, self._vocabulary.entities)
@@ -613,12 +638,20 @@ class PlanningNodesMixin:
             reason_code = "NOISY_QUERY_NORMALIZED"
         planner = None
         translation_used = False
-        if detected_language == "es" and self._settings.translation_enabled:
+        # Both directions, not just Spanish->English. The corpus is bilingual, so
+        # whichever language the question arrives in, the other one has to be
+        # offered to retrieval or the reranker is asked to match across a gap it
+        # cannot close on its own.
+        if detected_language in ("es", "en") and self._settings.translation_enabled:
             try:
                 planner = self._query_planner_factory(
                     self._settings, self._request.model_profile
                 )
-                translated = await planner.translate_to_english(question)
+                translated = (
+                    await planner.translate_to_english(question)
+                    if detected_language == "es"
+                    else await planner.translate_to_spanish(question)
+                )
                 usage = _combined_usage(usage, planner.last_usage)
                 if (
                     _safe_translation_variant(

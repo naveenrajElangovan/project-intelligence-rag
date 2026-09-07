@@ -1426,6 +1426,7 @@ class RetrievalNodesMixin:
         quality = self._context_evaluator.evaluate(
             state.get("resolved_question", self._request.question),
             state.get("documents", []),
+            relevance_threshold=self._settings.context_relevance_threshold,
         )
         if quality.retry_recommended and not missing:
             missing = (*missing, *quality.missing_information)
@@ -1459,7 +1460,10 @@ class RetrievalNodesMixin:
             "context_completeness": quality.completeness,
             "context_failure_reason": quality.failure_reason,
         }
-        if exhausted:
+        # Only a genuinely empty pool is a fail-closed condition here. Marking a
+        # populated pool ungrounded ends the request before generation, so the
+        # gates that actually judge truth never see the evidence.
+        if exhausted and not state.get("documents"):
             result["grounded"] = False
             result["grounding_reason"] = "INCOMPLETE_EVIDENCE"
         return result
@@ -1471,4 +1475,12 @@ class RetrievalNodesMixin:
             return "generate"
         if state.get("retrieval_attempt", 1) < self._settings.max_retrieval_attempts:
             return "repair_completeness"
-        return "end"
+        # Retries are spent, but this node is a heuristic prefilter -- a rerank
+        # score and a lexical hit -- not the truth gate. Generation, citation
+        # validation and grounding are, and they judge the evidence itself.
+        # Ending here refused without ever attempting an answer while the
+        # documents sat in state unseen, which is the same mistake the rerank
+        # threshold made before it was demoted to a prefilter. Attempt the
+        # answer: if the evidence really does not support it, grounding rejects
+        # every claim and the refusal is reached honestly, after trying.
+        return "generate" if state.get("documents") else "end"
