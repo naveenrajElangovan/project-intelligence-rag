@@ -338,9 +338,7 @@ def _conversation_resolution_decision(
         and len(normalized.split()) <= _MAX_CONTINUATION_FRAGMENT_WORDS
         and not words & _INDEPENDENT_PREDICATE_WORDS
     ):
-        # Keep the telemetry value stable while avoiding a corpus fixture token
-        # in application source (the corpus-agnostic guard scans raw text).
-        return True, "PREPO" + "SITIONAL_CONTINUATION"
+        return True, "LEADING_FRAGMENT_CONTINUATION"
     topic_words = words - pronouns - {
         "a", "an", "and", "are", "be", "do", "does", "explain", "for", "how",
         "is", "know", "me", "of", "please", "tell", "the", "to", "what", "you",

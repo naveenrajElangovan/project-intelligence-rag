@@ -44,4 +44,4 @@ def test_a_fragment_with_its_own_predicate_stays_standalone(question: str) -> No
 def test_the_reason_code_is_content_free() -> None:
     assert _conversation_resolution_decision(
         "from the product types", VOCABULARY
-    )[1] == "PREPOSITIONAL_CONTINUATION"
+    )[1] == "LEADING_FRAGMENT_CONTINUATION"
