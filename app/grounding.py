@@ -44,6 +44,7 @@ class LocalCitationGroundingVerifier:
         self._accelerator_api_key = settings.internal_api_key
         self._accelerator_timeout_seconds = settings.local_accelerator_timeout_seconds
         self._accelerator_attempts = settings.local_accelerator_retry_attempts
+        self._accelerator_max_concurrency = settings.accelerator_max_concurrency
         self.last_usage = TokenUsage()
         self._pair_score_cache: dict[tuple[str, str], float] = {}
 
@@ -61,6 +62,7 @@ class LocalCitationGroundingVerifier:
                 timeout_seconds=self._accelerator_timeout_seconds,
                 max_length=self._max_length,
                 attempts=self._accelerator_attempts,
+                max_concurrency=self._accelerator_max_concurrency,
             )
             if len(scores) != len(pairs):
                 raise RuntimeError(

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 import time
+from functools import lru_cache
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -19,6 +21,13 @@ MAX_EMBED_TEXTS = 32
 MAX_RERANK_PAIRS = 64
 MAX_QUERY_CHARACTERS = 4_000
 MAX_EVIDENCE_CHARACTERS = 16_000
+
+
+@lru_cache(maxsize=8)
+def _accelerator_semaphore(capacity: int) -> threading.BoundedSemaphore:
+    """Share one process-wide bound across embedding and scoring callers."""
+
+    return threading.BoundedSemaphore(capacity)
 
 
 def _is_replayable(error: Exception) -> bool:
@@ -46,36 +55,38 @@ def accelerator_request(
     api_key: str,
     timeout_seconds: float,
     attempts: int = 1,
+    max_concurrency: int = 1,
 ) -> dict[str, Any]:
     """Call the loopback accelerator without exposing its credential in payloads."""
 
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     last_error: Exception | None = None
-    for attempt in range(max(1, attempts)):
-        request = Request(
-            f"{base_url.rstrip('/')}{path}",
-            data=body,
-            method="GET" if body is None else "P" + "OST",
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                **({"Content-Type": "application/json"} if body is not None else {}),
-            },
-        )
-        try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                value = json.loads(response.read())
-        except (HTTPError, URLError, TimeoutError) as error:
-            last_error = error
-            if attempt + 1 >= max(1, attempts) or not _is_replayable(error):
-                raise RuntimeError(
-                    f"Local accelerator request failed: {type(error).__name__}"
-                ) from error
-            time.sleep(0.2 * (2**attempt))
-            continue
-        if not isinstance(value, dict):
-            raise RuntimeError("Local accelerator returned an invalid response.")
-        return value
+    with _accelerator_semaphore(max_concurrency):
+        for attempt in range(max(1, attempts)):
+            request = Request(
+                f"{base_url.rstrip('/')}{path}",
+                data=body,
+                method="GET" if body is None else "P" + "OST",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    **({"Content-Type": "application/json"} if body is not None else {}),
+                },
+            )
+            try:
+                with urlopen(request, timeout=timeout_seconds) as response:
+                    value = json.loads(response.read())
+            except (HTTPError, URLError, TimeoutError) as error:
+                last_error = error
+                if attempt + 1 >= max(1, attempts) or not _is_replayable(error):
+                    raise RuntimeError(
+                        f"Local accelerator request failed: {type(error).__name__}"
+                    ) from error
+                time.sleep(0.2 * (2**attempt))
+                continue
+            if not isinstance(value, dict):
+                raise RuntimeError("Local accelerator returned an invalid response.")
+            return value
     raise RuntimeError(
         f"Local accelerator request failed: {type(last_error).__name__}"
     ) from last_error
@@ -89,6 +100,7 @@ def accelerator_embed(
     timeout_seconds: float,
     dimensions: int,
     attempts: int = 1,
+    max_concurrency: int = 1,
 ) -> list[list[float]]:
     """Embed any number of texts, in requests the worker will accept."""
 
@@ -102,6 +114,7 @@ def accelerator_embed(
             api_key=api_key,
             timeout_seconds=timeout_seconds,
             attempts=attempts,
+            max_concurrency=max_concurrency,
         )
         returned = response.get("vectors")
         if not isinstance(returned, list) or len(returned) != len(batch):
@@ -123,6 +136,7 @@ def accelerator_scores(
     timeout_seconds: float,
     max_length: int,
     attempts: int = 1,
+    max_concurrency: int = 1,
 ) -> list[float]:
     """Score any number of pairs, in requests the worker will accept.
 
@@ -151,6 +165,7 @@ def accelerator_scores(
             api_key=api_key,
             timeout_seconds=timeout_seconds,
             attempts=attempts,
+            max_concurrency=max_concurrency,
         )
         returned = response.get("scores")
         if not isinstance(returned, list) or len(returned) != len(batch):

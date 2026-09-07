@@ -1,8 +1,11 @@
 """Guardrails for the accelerator wire contract and the bounds around it."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import socket
+import threading
+import time
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -141,6 +144,52 @@ def test_embed_texts_are_split_into_acceptable_requests(monkeypatch) -> None:
         MAX_EMBED_TEXTS,
         70 - 2 * MAX_EMBED_TEXTS,
     ]
+
+
+def test_accelerator_http_calls_share_the_configured_concurrency_bound(
+    monkeypatch,
+) -> None:
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def urlopen(_request, timeout=None):  # noqa: ARG001
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            entered.set()
+        release.wait(timeout=1)
+        with lock:
+            active -= 1
+        return _Response({"status": "ok"})
+
+    monkeypatch.setattr("app.accelerator.urlopen", urlopen)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                accelerator_request,
+                "http://worker",
+                "/health",
+                None,
+                api_key="key",
+                timeout_seconds=1,
+                max_concurrency=1,
+            )
+            for _ in range(2)
+        ]
+        assert entered.wait(timeout=1)
+        time.sleep(0.05)
+        assert maximum_active == 1
+        release.set()
+        assert [future.result() for future in futures] == [
+            {"status": "ok"},
+            {"status": "ok"},
+        ]
+
+    assert maximum_active == 1
 
 
 def test_a_timed_out_call_is_never_replayed(monkeypatch) -> None:

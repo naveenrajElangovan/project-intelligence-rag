@@ -244,19 +244,30 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
     """Acquire capacity before retrieval or reject the request immediately."""
 
     loop = asyncio.get_running_loop()
-    # Every locally served request uses the shared MPS reranker, and local model
-    # generation is bounded by the same configured capacity. Admitting a wider
-    # request window only moves the queue inside expensive stages, where requests
-    # compete for unified memory and turn normal seconds into minute-long tail
-    # latency. Shed excess work at the request boundary instead.
+    # Preserve the conservative local clamp unless an operator explicitly opts
+    # into pipeline overlap. The accelerator and model have their own bounds, so
+    # the override changes admission only; it never widens either inference slot.
     capacity = settings.max_inflight_requests
-    if settings.local_inference_enabled:
+    if settings.admission_capacity_override is not None:
+        capacity = settings.admission_capacity_override
+        capacity_path = "override"
+    elif settings.local_inference_enabled:
         capacity = min(capacity, settings.local_max_concurrency)
+        capacity_path = "local-clamp"
+    else:
+        capacity_path = "configured-maximum"
     key = (id(loop), capacity)
     if key not in _REQUEST_SEMAPHORES:
         _REQUEST_SEMAPHORES[key] = asyncio.Semaphore(capacity)
         admission_capacity(capacity)
-        if capacity < settings.max_inflight_requests:
+        if capacity_path == "override":
+            LOGGER.info(
+                "Admission capacity is %d from PI_RAG_ADMISSION_CAPACITY_"
+                "OVERRIDE; accelerator and model concurrency remain independently "
+                "bounded.",
+                capacity,
+            )
+        elif capacity_path == "local-clamp":
             LOGGER.info(
                 "Admission capacity is %d, clamped from PI_RAG_MAX_INFLIGHT_"
                 "REQUESTS=%d by PI_RAG_LOCAL_MAX_CONCURRENCY=%d. Requests beyond "
@@ -264,6 +275,12 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
                 capacity,
                 settings.max_inflight_requests,
                 settings.local_max_concurrency,
+            )
+        else:
+            LOGGER.info(
+                "Admission capacity is %d from PI_RAG_MAX_INFLIGHT_REQUESTS; "
+                "the local-inference clamp is inactive.",
+                capacity,
             )
     semaphore = _REQUEST_SEMAPHORES[key]
     admission_began = started()

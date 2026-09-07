@@ -57,10 +57,12 @@ class Settings(BaseSettings):
     # probably still computing, and replaying that is what turned one slow
     # request into a CPU pile-up in the first place.
     local_accelerator_retry_attempts: int = 2
+    accelerator_max_concurrency: int = 1
     warm_local_models_on_startup: bool = True
     local_max_concurrency: int = 1
     generated_refusals_enabled: bool = False
     max_inflight_requests: int = 4
+    admission_capacity_override: int | None = None
     load_shed_wait_seconds: float = 0.05
     openai_api_key: str = ""
     openai_budget_model: str = "gpt-5-nano"
@@ -318,6 +320,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PI_RAG_LOCAL_ACCELERATOR_RETRY_ATTEMPTS must be between 1 and 3"
             )
+        if not 1 <= self.accelerator_max_concurrency <= 8:
+            raise ValueError(
+                "PI_RAG_ACCELERATOR_MAX_CONCURRENCY must be between 1 and 8"
+            )
         if not 0 <= self.max_answer_repairs <= 3:
             raise ValueError("PI_RAG_MAX_ANSWER_REPAIRS must be between 0 and 3")
         if self.request_timeout_seconds <= self.llm_stream_total_timeout_seconds:
@@ -397,6 +403,13 @@ class Settings(BaseSettings):
             )
         if self.max_inflight_requests < 1 or self.max_inflight_requests > 32:
             raise ValueError("PI_RAG_MAX_INFLIGHT_REQUESTS must be between 1 and 32")
+        if self.admission_capacity_override is not None and not (
+            1 <= self.admission_capacity_override <= self.max_inflight_requests
+        ):
+            raise ValueError(
+                "PI_RAG_ADMISSION_CAPACITY_OVERRIDE must be between 1 and "
+                "PI_RAG_MAX_INFLIGHT_REQUESTS"
+            )
         if self.load_shed_wait_seconds <= 0 or self.load_shed_wait_seconds > 5:
             raise ValueError(
                 "PI_RAG_LOAD_SHED_WAIT_SECONDS must be greater than 0 and at most 5"

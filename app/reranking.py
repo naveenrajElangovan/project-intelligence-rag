@@ -301,6 +301,7 @@ class RemoteMultilingualReranker(LocalMultilingualReranker):
         api_key: str,
         timeout_seconds: float,
         attempts: int = 1,
+        max_concurrency: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -308,6 +309,7 @@ class RemoteMultilingualReranker(LocalMultilingualReranker):
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._attempts = attempts
+        self._max_concurrency = max_concurrency
 
     def _predict(self, query: str, documents: list[Document]):
         pairs = [
@@ -331,6 +333,7 @@ class RemoteMultilingualReranker(LocalMultilingualReranker):
                 timeout_seconds=self._timeout_seconds,
                 max_length=self._max_length,
                 attempts=self._attempts,
+                max_concurrency=self._max_concurrency,
             ),
         )
         if len(scores) != len(documents):
@@ -365,6 +368,7 @@ def build_reranker(settings: Settings):
             "api_key": settings.internal_api_key,
             "timeout_seconds": settings.local_accelerator_timeout_seconds,
             "attempts": settings.local_accelerator_retry_attempts,
+            "max_concurrency": settings.accelerator_max_concurrency,
         }
         if settings.local_accelerator_url
         else {}

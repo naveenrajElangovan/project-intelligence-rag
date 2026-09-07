@@ -136,12 +136,14 @@ class RemoteMultilingualEmbedder(LocalMultilingualEmbedder):
         timeout_seconds: float,
         dimensions: int,
         attempts: int = 1,
+        max_concurrency: int = 1,
     ) -> None:
         super().__init__(model, device="remote", dimensions=dimensions)
         self._base_url = base_url
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._attempts = attempts
+        self._max_concurrency = max_concurrency
 
     def _encode(self, texts: list[str]) -> None:
         # Batched by the client: the worker caps one request's text count, and a
@@ -153,6 +155,7 @@ class RemoteMultilingualEmbedder(LocalMultilingualEmbedder):
             timeout_seconds=self._timeout_seconds,
             dimensions=self._dimensions,
             attempts=self._attempts,
+            max_concurrency=self._max_concurrency,
         )
         with self._cache_lock:
             for text, vector in zip(texts, embedded, strict=True):
@@ -177,6 +180,7 @@ def build_embedder(settings: Settings) -> LocalMultilingualEmbedder:
             ),
             dimensions=settings.embedding_dimensions,
             attempts=settings.local_accelerator_retry_attempts,
+            max_concurrency=settings.accelerator_max_concurrency,
         )
     return LocalMultilingualEmbedder(
         settings.local_embedding_model,

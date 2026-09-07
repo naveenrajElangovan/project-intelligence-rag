@@ -125,6 +125,46 @@ def test_local_inference_capacity_bounds_the_whole_request() -> None:
     asyncio.run(scenario())
 
 
+def test_admission_override_allows_four_while_model_slot_remains_one() -> None:
+    from app.llm import ModelSlotUnavailableError, _LOCAL_SEMAPHORES, _model_slot
+
+    async def scenario() -> None:
+        _LOCAL_SEMAPHORES.clear()
+        settings = Settings(
+            _env_file=None,
+            environment="development",
+            local_inference_enabled=True,
+            local_max_concurrency=1,
+            max_inflight_requests=4,
+            admission_capacity_override=4,
+            load_shed_wait_seconds=0.001,
+        )
+        slots = [await _acquire_request_slot(settings) for _ in range(4)]
+        try:
+            with pytest.raises(HTTPException):
+                await _acquire_request_slot(settings)
+            async with _model_slot(settings):
+                with pytest.raises(ModelSlotUnavailableError):
+                    async with _model_slot(settings):
+                        raise AssertionError("The second model slot must not open")
+        finally:
+            for slot in slots:
+                slot.release()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_admission_override_is_bounded_by_the_configured_request_limit() -> None:
+    with pytest.raises(ValueError, match="ADMISSION_CAPACITY_OVERRIDE"):
+        Settings(
+            _env_file=None,
+            environment="development",
+            max_inflight_requests=4,
+            admission_capacity_override=5,
+        )
+
+
 def test_degradation_is_explicit_and_defaults_to_empty() -> None:
     response = RagResponse(
         answer="Verified answer",
