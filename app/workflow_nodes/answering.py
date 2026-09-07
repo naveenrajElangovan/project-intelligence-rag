@@ -42,6 +42,7 @@ from app.workflow_support.completeness import (
 from app.workflow_support.deterministic_answers import (
     _code_inventory_answer_verified,
     _deterministic_code_inventory_answer,
+    _deterministic_canonical_route_answer,
     _deterministic_code_location_answer,
     _deterministic_delivery_answer,
     _deterministic_feature_inventory_answer,
@@ -1579,6 +1580,12 @@ class AnswerNodesMixin:
             )
         elif state.get("query_intent") == "DELIVERY":
             generated = _deterministic_delivery_answer(
+                answer_question,
+                documents,
+                state.get("language", "mixed"),
+            )
+        if generated is None:
+            generated = _deterministic_canonical_route_answer(
                 answer_question,
                 documents,
                 state.get("language", "mixed"),

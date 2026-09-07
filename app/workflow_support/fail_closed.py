@@ -22,9 +22,13 @@ from app.workflow_support.query_analysis import resolve_response_language
 
 
 def clarification_response(
-    request: RagRequest, known_entities: tuple[str, ...]
+    request: RagRequest,
+    known_entities: tuple[str, ...],
+    source_types: tuple[str, ...] = (),
 ) -> RagResponse | None:
-    normalized = " ".join(re.findall(r"[a-z0-9]+", request.question.casefold()))
+    normalized = " ".join(
+        re.findall(r"[a-z0-9à-ÿ]+", request.question.casefold())
+    )
     # Underscores are word separators to the tokenizer above, so an underscored
     # identifier arrives here as separate words and trips the overloaded-record
     # guard on whichever of them happens to be an overloaded noun. The identifier
@@ -34,24 +38,64 @@ def clarification_response(
     explicit_identifier = bool(
         re.search(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", request.question)
     )
-    overloaded_record = bool(
-        re.search(r"\b(?:tickets?|boletos?)\b", normalized)
-    ) and not explicit_identifier
-    delivery_context = bool(
+    available = {value.upper() for value in source_types}
+    issue_sources_available = not available or "ISSUE" in available
+    code_sources_available = not available or "CODE" in available
+    explicit_issue_system = bool(
+        re.search(r"\b(?:jira|issues?|bugs?|sprints?|backlog)\b", normalized)
+    )
+    explicit_developer_system = bool(
         re.search(
-            r"\b(?:jira|issue|bug|sprint|release|priority|status|assignee|backlog|"
-            r"incidencia|error|estado|prioridad|entrega)\b",
+            r"\b(?:github|source code|database|sql|terminal|secrets?|tokens?|logs?|"
+            r"código fuente|base de datos|secretos?)\b",
+            normalized,
+        )
+    )
+    if (
+        (explicit_issue_system and not issue_sources_available)
+        or (explicit_developer_system and not code_sources_available)
+    ):
+        language = resolve_response_language(request.question)
+        return RagResponse(
+            status="INSUFFICIENT_EVIDENCE",
+            answer=(
+                "No se encontró una guía verificada para esta solicitud de tienda. "
+                "Pregunta sobre una tarea visible de la aplicación de tienda, o contacta a soporte autorizado."
+                if language == "es"
+                else "Verified store guidance was not found for this request. "
+                "Ask about a visible store-application task, or contact authorized support."
+            ),
+            confidence="NONE",
+            projectId=request.project_id,
+            sources=[],
+            missingInformation=[],
+            evidenceStatus="UNVERIFIED",
+            contextQuality="NOT_APPLICABLE",
+            coverage="NOT_APPLICABLE",
+            failureReason="SOURCE_SCOPE_VIOLATION",
+            refusalReason="SOURCE_SCOPE_VIOLATION",
+        )
+    overloaded_record = (
+        issue_sources_available
+        and bool(re.search(r"\b(?:tickets?|boletos?)\b", normalized))
+        and not explicit_identifier
+    )
+    explicit_delivery_context = bool(
+        re.search(
+            r"\b(?:jira|issues?|bugs?|sprints?|releases?|priority|priorities|"
+            r"assignees?|backlog|incidencias?|prioridad(?:es)?|entrega)\b",
             normalized,
         )
     )
     document_context = bool(
         re.search(
-            r"\b(?:print|reprint|printer|receipt|paper|imprimir|reimprimir|"
-            r"impresora|recibo|comprobante|papel)\b",
+            r"\b(?:print\w*|reprint\w*|receipts?|paper|"
+            r"imprim\w*|reimprim\w*|impres\w*|recibos?|comprobantes?|papel|"
+            r"blank|come out|sali\w*|cortad\w*|cancel\w*)\b",
             normalized,
         )
     )
-    if overloaded_record and not delivery_context and not document_context:
+    if overloaded_record and not explicit_delivery_context and not document_context:
         language = resolve_response_language(request.question)
         return RagResponse(
             status="NEEDS_CLARIFICATION",
@@ -69,7 +113,11 @@ def clarification_response(
             coverage="NOT_APPLICABLE",
             failureReason="AMBIGUOUS_SOURCE_FAMILY",
         )
-    needed, _reason = _conversation_resolution_decision(request.question)
+    needed, reason = _conversation_resolution_decision(request.question)
+    # A leading fragment can continue only a preceding turn. In a fresh chat
+    # there is no preceding subject, so retrieval must treat it as standalone.
+    if reason == "LEADING_FRAGMENT_CONTINUATION":
+        return None
     named_entity = any(
         re.search(
             rf"(?<![A-Za-z0-9_]){re.escape(str(entity))}(?![A-Za-z0-9_])",

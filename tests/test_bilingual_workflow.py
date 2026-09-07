@@ -1482,6 +1482,68 @@ def test_natural_file_questions_extract_matching_paths_from_any_authorized_sourc
     assert "`aaos/home/AaoSHome.kt`" in aaos_answer.answer
 
 
+def test_multiple_code_location_matches_are_citation_complete() -> None:
+    first = _document(
+        "price-1",
+        "price-one",
+        "CheckPriceModule.kt implements the price check flow.",
+        "en",
+        0.9,
+    )
+    first.metadata.update({"source_type": "CODE", "path": "di/CheckPriceModule.kt"})
+    second = _document(
+        "price-2",
+        "price-two",
+        "CheckPriceViewModel.kt implements the price check flow.",
+        "en",
+        0.9,
+    )
+    second.metadata.update(
+        {"source_type": "CODE", "path": "ui/CheckPriceViewModel.kt"}
+    )
+
+    answer = workflow_module._deterministic_code_location_answer(
+        "which classes implement the price check flow",
+        [first, second],
+        "en",
+        (".kt",),
+    )
+
+    assert answer is not None
+    assert answer.answer.startswith("### Matching files\n")
+    assert workflow_module._citations_valid(answer, 2)
+
+
+def test_canonical_route_answer_copies_the_topical_instruction() -> None:
+    from app.workflow_support.deterministic_answers import (
+        _deterministic_canonical_route_answer,
+    )
+
+    document = _document(
+        "order-categories",
+        "order-categories",
+        (
+            "El pedido puede incluir varias categorías. "
+            "Usa búsqueda, Todo, Solo prioritarios u orden Prioritarios según la pantalla."
+        ),
+        "es",
+        0.9,
+    )
+    document.metadata["canonical_route_match"] = True
+
+    answer = _deterministic_canonical_route_answer(
+        "¿Cómo filtro prioridad?", [document], "es"
+    )
+
+    assert answer is not None
+    assert answer.answer == (
+        "### ¿Cómo filtro prioridad?\n"
+        "Usa búsqueda, Todo, Solo prioritarios u orden Prioritarios según la pantalla "
+        "[SOURCE 1]."
+    )
+    assert workflow_module._citations_valid(answer, 1)
+
+
 def test_general_code_question_keeps_relevant_source_file_ahead_of_readme(
     monkeypatch,
 ) -> None:

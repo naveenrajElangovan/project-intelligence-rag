@@ -50,6 +50,18 @@ def _combined_usage(first: TokenUsage, second: TokenUsage) -> TokenUsage:
     )
 
 
+def _narrow_source_types(
+    requested: tuple[str, ...], available: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Limit a planned source scope to families present in this project."""
+
+    if not available:
+        return requested
+    observed = {value.upper() for value in available}
+    narrowed = tuple(value for value in requested if value.upper() in observed)
+    return narrowed or ()
+
+
 def _implementation_flow_requested(value: str) -> bool:
     """Recognize questions whose answer may span documentation and source code."""
 
@@ -236,9 +248,14 @@ class PlanningNodesMixin:
                 f"{subtopic} specifically within {contextual_parent}?"
             )
             query_intent = _source_route_intent(
-                focused_question, self._vocabulary.source_types
+                focused_question,
+                self._vocabulary.source_types,
+                dict(self._vocabulary.intent_terms),
             )
             source_types, source_route = _intent_source_scope(query_intent)
+            source_types = _narrow_source_types(
+                source_types, self._vocabulary.source_types
+            )
             planned = (
                 focused_question,
                 f"{contextual_parent} {subtopic} relationship steps conditions rules",
@@ -272,7 +289,13 @@ class PlanningNodesMixin:
                 "query_quality": query_quality,
                 "query_quality_reason": quality_reason,
             }
-        if _code_inventory_requested(question):
+        code_sources_available = (
+            not self._vocabulary.source_types
+            or "CODE" in {
+                value.upper() for value in self._vocabulary.source_types
+            }
+        )
+        if _code_inventory_requested(question) and code_sources_available:
             planned = (
                 question,
                 "project source code modules classes functions files tests configuration",
@@ -450,7 +473,11 @@ class PlanningNodesMixin:
             }
         if (
             _implementation_flow_requested(question)
-            and _source_route_intent(question, self._vocabulary.source_types)
+            and _source_route_intent(
+                question,
+                self._vocabulary.source_types,
+                dict(self._vocabulary.intent_terms),
+            )
             == "CODE_ASSISTED"
         ):
             planned = _implementation_flow_queries(question)[
@@ -609,9 +636,14 @@ class PlanningNodesMixin:
                 "query_quality_reason": quality_reason,
             }
         query_intent = _source_route_intent(
-            question, self._vocabulary.source_types
+            question,
+            self._vocabulary.source_types,
+            dict(self._vocabulary.intent_terms),
         )
         source_types, source_route = _intent_source_scope(query_intent)
+        source_types = _narrow_source_types(
+            source_types, self._vocabulary.source_types
+        )
         queries = [question]
         rerank_queries = [question]
         # A follow-up inherits the previous subject but not the identifiers the
@@ -833,6 +865,35 @@ class PlanningNodesMixin:
                 },
             )
             return question
+        if (
+            predicate_reason == "LEADING_FRAGMENT_CONTINUATION"
+            and not history
+            and not self._request.conversation_context.active_subject.strip()
+        ):
+            fragment = question.strip().rstrip("?.!")
+            resolved = (
+                f"¿Cuál es el procedimiento {fragment}?"
+                if language == "es"
+                else f"What is the procedure {fragment}?"
+            )
+            stage_complete(
+                "resolve_conversation",
+                self._request.project_id,
+                began,
+                input_count=1,
+                output_count=1,
+                reason_code="LEADING_FRAGMENT_STANDALONE",
+                language=language,
+                model_provider="deterministic",
+                model_name="conversation-followup-predicate",
+                model_profile=self._request.model_profile,
+                extra={
+                    "history_message_count": 0,
+                    "predicate_result": True,
+                    "predicate_reason": predicate_reason,
+                },
+            )
+            return resolved
         # A new explicit subject wins even when the sentence also contains a
         # pronoun (for example, "How does authentication work and where is it used?").
         # When the project publishes a vocabulary, require the extracted subject

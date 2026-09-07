@@ -24,6 +24,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 ENTITY_HEADING = re.compile(
     r"^#{3}\s+`(?P<key>[A-Z][A-Z0-9_]*)`\s+[—-]\s+id\s+(?P<id>\d+),\s+version\s+(?P<version>[\d.]+)\s*$"
@@ -35,6 +36,15 @@ ROW_EVENT_ID = re.compile(r"\|\s*(?P<id>\d{3})\s*\|")
 ENTITY_HEADING_B = re.compile(
     r"^#{2,4}\s+[\d.]+\s+`(?P<key>[A-Z][A-Z0-9_]*)`\s+\(id\s+(?P<id>\d+)\)"
 )
+CANONICAL_QUESTION_HEADING = re.compile(
+    r"^##\s+\[(?P<qid>QUESTION-[A-Z0-9-]+)\]\s+.+$"
+)
+CANONICAL_QUESTION = re.compile(r"^-\s+[\u201c\"](?P<question>.+?)[\u201d\"]\s*$")
+CANONICAL_ROUTE = re.compile(
+    r"^(?:(?:Priority\s+)?Routes?|Rutas?(?:\s+prioritarias?)?):\s*(?P<routes>.*)$",
+    re.IGNORECASE,
+)
+CANONICAL_SECTION_ID = re.compile(r"\[([A-Z][A-Z0-9-]+)\]")
 
 
 def entity_heading(line: str):
@@ -101,6 +111,9 @@ def heading_paths(lines: list[str]) -> dict[int, list[str]]:
 
 
 _PROJECT_ID = ""
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_REGISTRY = Path(__file__).with_name("suites.json")
+_PARSER_KINDS = {"canonical_question_index", "qa_pairs", "section_titles"}
 
 
 def case(cid, suite, question, contains, note, role, extras=None):
@@ -201,12 +214,296 @@ def build(corpus: Path, project_id: str) -> tuple[list[dict], list[tuple[str, st
     return rows, classification
 
 
+def parse_store_canonical_index(
+    path: Path,
+    language: str,
+    *,
+    project_id: str = "T2.0-STORE",
+    suite_id: str = "store_canonical_questions",
+    department: str = "",
+) -> list[dict]:
+    """Turn one reviewed store question index into source-bound gold cases.
+
+    The question index is the authority for both the user wording and its
+    destination sections. Page ids are intentionally not used as gold: the
+    bracketed section ids survive Confluence moves and re-chunking.
+    """
+
+    if language not in {"en", "es"}:
+        raise ValueError(f"Unsupported canonical index language: {language!r}")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    groups: list[tuple[str, list[str], list[str], int]] = []
+    question_id: str | None = None
+    questions: list[str] = []
+    route_ids: list[str] = []
+    heading_line = 0
+    collecting_questions = False
+    collecting_routes = False
+
+    def finish_group() -> None:
+        nonlocal questions, route_ids
+        if question_id is None or not questions:
+            questions = []
+            route_ids = []
+            return
+        if not route_ids:
+            raise ValueError(
+                f"{path}:{heading_line} {question_id} has questions but no routed section ids"
+            )
+        groups.append((question_id, questions, route_ids, heading_line))
+        questions = []
+        route_ids = []
+
+    for line_number, line in enumerate(lines, 1):
+        heading = CANONICAL_QUESTION_HEADING.match(line)
+        if heading:
+            finish_group()
+            question_id = heading.group("qid")
+            heading_line = line_number
+            collecting_questions = False
+            collecting_routes = False
+            continue
+        if line.strip() in {"Equivalent questions:", "Preguntas equivalentes:"}:
+            collecting_questions = True
+            continue
+        route = CANONICAL_ROUTE.match(line)
+        if route and question_id is not None:
+            collecting_questions = False
+            collecting_routes = True
+            route_ids.extend(CANONICAL_SECTION_ID.findall(route.group("routes")))
+            route_ids = list(dict.fromkeys(route_ids))
+            continue
+        if collecting_routes:
+            if not line.strip():
+                if route_ids:
+                    collecting_routes = False
+            else:
+                route_ids.extend(CANONICAL_SECTION_ID.findall(line))
+                route_ids = list(dict.fromkeys(route_ids))
+            continue
+        if collecting_questions:
+            question = CANONICAL_QUESTION.match(line)
+            if question:
+                questions.append(question.group("question").strip())
+    finish_group()
+
+    rows: list[dict] = []
+    sequence = 0
+    for group_id, variants, sections, line_number in groups:
+        for question in variants:
+            sequence += 1
+            answerable = group_id != "QUESTION-OUT-OF-SCOPE"
+            row = {
+                "id": f"store-{language}-{sequence:03d}",
+                "suite": suite_id,
+                "role": "answer_evidence",
+                "project_id": project_id,
+                "department": department,
+                "question": question,
+                "query_language": language,
+                "target_evidence_language": language,
+                "answerable": answerable,
+                "gold_match": {
+                    "any_of": [
+                        {"field": "structure_path", "contains": f"[{section}]"}
+                        for section in sections
+                    ]
+                },
+                "canonical_group": group_id,
+                "gold_section_ids": sections,
+                "derivation": f"{path.name}:{line_number} {group_id} routes",
+                "evaluation_lane": "generation" if not answerable else "retrieval",
+            }
+            if not answerable:
+                row["expected_refusal_reason"] = "INSUFFICIENT_EVIDENCE"
+            rows.append(row)
+    return rows
+
+
+def build_store_canonical_suite(english: Path, spanish: Path) -> list[dict]:
+    rows = parse_store_canonical_index(english, "en") + parse_store_canonical_index(
+        spanish, "es"
+    )
+    counts = {
+        language: sum(row["query_language"] == language for row in rows)
+        for language in ("en", "es")
+    }
+    if counts != {"en": 184, "es": 184}:
+        raise ValueError(f"Store canonical indexes must contain 184 questions each: {counts}")
+    return rows
+
+
+def load_registry(path: Path = _DEFAULT_REGISTRY) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    suites = payload.get("suites")
+    if not isinstance(suites, list):
+        raise ValueError(f"{path} must contain a suites array")
+    identifiers: set[str] = set()
+    for suite in suites:
+        identifier = str(suite.get("id") or "")
+        kind = str((suite.get("source") or {}).get("kind") or "")
+        if not identifier or identifier in identifiers:
+            raise ValueError(f"Invalid or duplicate suite id: {identifier!r}")
+        if kind not in _PARSER_KINDS:
+            raise ValueError(f"Suite {identifier} has unsupported parser kind {kind!r}")
+        identifiers.add(identifier)
+    return suites
+
+
+def _resolve_patterns(patterns: list[str], language: str | None = None) -> list[Path]:
+    resolved: list[Path] = []
+    for pattern in patterns:
+        rendered = pattern.format(lang=language or "")
+        matches = sorted(_REPOSITORY_ROOT.glob(rendered))
+        if not matches:
+            raise ValueError(f"Suite source pattern matched no files: {rendered}")
+        resolved.extend(matches)
+    return list(dict.fromkeys(resolved))
+
+
+def _qa_pair_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix == ".jsonl":
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, list) else list(payload.get("cases", []))
+
+
+def _section_title_rows(
+    path: Path, *, suite_id: str, project_id: str, language: str, department: str
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        heading = ANY_HEADING.match(line)
+        if not heading or len(heading.group("hashes")) < 2:
+            continue
+        title = heading.group("text").strip()
+        rows.append(
+            {
+                "id": f"{suite_id}-{language}-{path.stem}-{line_number}",
+                "suite": suite_id,
+                "project_id": project_id,
+                "department": department,
+                "role": "answer_evidence",
+                "question": title if title.endswith("?") else f"Tell me about {title}.",
+                "query_language": language,
+                "target_evidence_language": language,
+                "answerable": True,
+                "gold_match": {"any_of": [{"field": "structure_path", "contains": title}]},
+                "derivation": f"{path.name}:{line_number} section title",
+            }
+        )
+    return rows
+
+
+def build_registered_suites(
+    *,
+    project_id: str,
+    suite_ids: set[str] | None = None,
+    department: str | None = None,
+    registry_path: Path = _DEFAULT_REGISTRY,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build all configured suites for a project; onboarding needs no parser edit."""
+
+    selected = [
+        suite
+        for suite in load_registry(registry_path)
+        if suite.get("project_id") == project_id
+        and (not suite_ids or suite.get("id") in suite_ids)
+        and (
+            department is None
+            or department in (suite.get("departments") or [])
+            or (not department and not (suite.get("departments") or []))
+        )
+    ]
+    if not selected:
+        raise ValueError(f"No registered suites for project={project_id!r}, suite={suite_ids}, department={department!r}")
+    cases: list[dict[str, Any]] = []
+    for suite in selected:
+        source = suite["source"]
+        kind = source["kind"]
+        departments = suite.get("departments") or [""]
+        if department is not None:
+            departments = [department]
+        for configured_department in departments:
+            for language in source.get("languages") or ["und"]:
+                paths = _resolve_patterns(source.get("paths") or [], language)
+                for path in paths:
+                    if kind == "canonical_question_index":
+                        parsed = parse_store_canonical_index(
+                            path,
+                            language,
+                            project_id=project_id,
+                            suite_id=suite["id"],
+                            department=configured_department,
+                        )
+                    elif kind == "qa_pairs":
+                        parsed = _qa_pair_rows(path)
+                    else:
+                        parsed = _section_title_rows(
+                            path,
+                            suite_id=suite["id"],
+                            project_id=project_id,
+                            language=language,
+                            department=configured_department,
+                        )
+                    for row in parsed:
+                        if row.get("project_id", project_id) != project_id:
+                            continue
+                        row = {**row, "suite": suite["id"], "project_id": project_id}
+                        row.setdefault("department", configured_department)
+                        row.setdefault("gold_granularity", (suite.get("gold") or {}).get("granularity", "chunk"))
+                        row.setdefault("suite_gates", suite.get("gates") or {})
+                        cases.append(row)
+    deduplicated = {str(row["id"]): row for row in cases}
+    return list(deduplicated.values()), selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--corpus", type=Path, required=True)
-    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--corpus", type=Path)
+    parser.add_argument("--project-id")
+    parser.add_argument("--registry", type=Path, default=_DEFAULT_REGISTRY)
+    parser.add_argument("--suite", action="append", dest="suite_ids")
+    parser.add_argument("--department")
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--store-canonical-root",
+        type=Path,
+        help="Build the 368-case bilingual T2.0-STORE suite from this documentation root.",
+    )
+    parser.add_argument(
+        "--store-out",
+        type=Path,
+        default=Path(__file__).with_name("store_gold_suites.jsonl"),
+    )
     arguments = parser.parse_args()
+    if arguments.project_id and not arguments.corpus and not arguments.store_canonical_root:
+        rows, _definitions = build_registered_suites(
+            project_id=arguments.project_id,
+            suite_ids=set(arguments.suite_ids or []),
+            department=arguments.department,
+            registry_path=arguments.registry,
+        )
+        output = arguments.out or Path(__file__).with_name(f"{arguments.project_id}.gold.jsonl")
+        output.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+        print(f"wrote {len(rows)} registered cases to {output}")
+        return
+    if arguments.store_canonical_root:
+        store_rows = build_store_canonical_suite(
+            arguments.store_canonical_root
+            / "en/topics/10_CANONICAL_QUESTION_INDEX.md",
+            arguments.store_canonical_root
+            / "es/topics/10_INDICE_DE_PREGUNTAS_CANONICAS.md",
+        )
+        arguments.store_out.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in store_rows) + "\n",
+            encoding="utf-8",
+        )
+        print(f"wrote {len(store_rows)} store cases to {arguments.store_out}")
+        if not arguments.corpus:
+            return
+    if arguments.corpus is None or not arguments.project_id:
+        parser.error("--corpus and --project-id are required unless only --store-canonical-root is used")
     rows, classification = build(arguments.corpus, arguments.project_id)
 
     print("INFERRED DOCUMENT CATEGORY")

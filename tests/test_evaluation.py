@@ -32,9 +32,11 @@ from evaluation.score import (
     score_generation,
 )
 from evaluation.build_bilingual_reference_template import build as build_reference_template
+from evaluation.build_gold_suites import build_registered_suites, build_store_canonical_suite
 
 
 EVALUATION = Path(__file__).parents[1] / "evaluation"
+STORE_DOCS = Path(__file__).parents[1] / "docs" / "store-assistant"
 
 
 def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None:
@@ -56,7 +58,7 @@ def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None
     workflow = object.__new__(AuthorizedRagWorkflow)
     workflow._request = SimpleNamespace(question="pregunta", project_id="T2.0")
     workflow._settings = SimpleNamespace(max_retrieval_attempts=2)
-    workflow._vocabulary = SimpleNamespace(entities=())
+    workflow._vocabulary = SimpleNamespace(entities=(), source_types=())
     workflow._graph = object()
 
     async def invoke(*_args, **_kwargs):
@@ -87,6 +89,72 @@ def test_quality_monitoring_does_not_change_runtime_gates() -> None:
     assert settings.grounding_cross_language_score_threshold == 0.60
     assert settings.grounding_table_evidence_score_threshold == 0.60
     assert _MINIMUM_GOLD_RESOLUTION_RATE == 0.95
+
+
+def test_store_canonical_suite_has_184_cases_per_language() -> None:
+    cases = build_store_canonical_suite(
+        STORE_DOCS / "en/topics/10_CANONICAL_QUESTION_INDEX.md",
+        STORE_DOCS / "es/topics/10_INDICE_DE_PREGUNTAS_CANONICAS.md",
+    )
+    assert len(cases) == 368
+    assert sum(case["query_language"] == "en" for case in cases) == 184
+    assert sum(case["query_language"] == "es" for case in cases) == 184
+    assert {case["project_id"] for case in cases} == {"T2.0-STORE"}
+    assert all(case["gold_match"]["any_of"] for case in cases)
+    assert all(
+        predicate["field"] == "structure_path"
+        and predicate["contains"].startswith("[")
+        for case in cases
+        for predicate in case["gold_match"]["any_of"]
+    )
+
+
+def test_ninth_department_suite_is_registry_only_configuration(tmp_path) -> None:
+    registry = tmp_path / "suites.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "suites": [
+                    {
+                        "id": "company_ninth_department",
+                        "project_id": "T3B-COMPANY",
+                        "departments": ["NINTH_DEPARTMENT"],
+                        "source": {
+                            "kind": "section_titles",
+                            "paths": ["docs/store-assistant/en/topics/09_*.md"],
+                            "languages": ["en"],
+                        },
+                        "gold": {"granularity": "section", "anchor_field": "structure_leaf"},
+                        "gates": {"cross_department_leakage": 0},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cases, suites = build_registered_suites(
+        project_id="T3B-COMPANY",
+        department="NINTH_DEPARTMENT",
+        registry_path=registry,
+    )
+
+    assert cases
+    assert {case["department"] for case in cases} == {"NINTH_DEPARTMENT"}
+    assert suites[0]["gates"]["cross_department_leakage"] == 0
+
+def test_store_out_of_scope_cases_feed_bilingual_refusal_metrics() -> None:
+    cases = build_store_canonical_suite(
+        STORE_DOCS / "en/topics/10_CANONICAL_QUESTION_INDEX.md",
+        STORE_DOCS / "es/topics/10_INDICE_DE_PREGUNTAS_CANONICAS.md",
+    )
+    negatives = [case for case in cases if case["answerable"] is False]
+
+    assert len(negatives) == 12
+    assert {case["query_language"] for case in negatives} == {"en", "es"}
+    assert {case["expected_refusal_reason"] for case in negatives} == {
+        "INSUFFICIENT_EVIDENCE"
+    }
 
 
 def test_reviewed_references_join_without_changing_gold_cases(tmp_path) -> None:
@@ -224,6 +292,35 @@ def test_precision_uses_fixed_k_when_rerank_list_is_short() -> None:
     assert summary["answerable_cases"] == 1
     assert summary["gold_resolved_cases"] == 1
     assert summary["answer_evidence_cases"] == 1
+
+
+def test_section_metrics_separate_candidate_recall_from_rerank_survival() -> None:
+    settings = Settings(
+        _env_file=None, environment="development", retrieval_top_k=25, rerank_top_n=16
+    )
+    summary = score(
+        [
+            {
+                "answerable": True,
+                "gold_chunk_ids": [f"gold-{index}" for index in range(30)],
+                "gold_section_chunk_ids": [
+                    [f"gold-{index}" for index in range(15)],
+                    [f"gold-{index}" for index in range(15, 30)],
+                ],
+                "retrieved_chunk_ids": ["gold-1", "gold-16"],
+                "reranked_chunk_ids": ["gold-1"],
+                "exposed_project_ids": ["T2.0-STORE"],
+            }
+        ],
+        settings=settings,
+        project_id="T2.0-STORE",
+    )
+
+    assert summary["candidate_hit_rate_at_25"] == 1
+    assert summary["section_hit_rate_at_16"] == 1
+    assert summary["section_recall_at_16"] == 0.5
+    assert summary["recall_at_25"] == 2 / 30
+    assert summary["recall_at_25_gold_size_ceiling"] == 25 / 30
 
 
 def test_retrieval_annotations_use_metric_population_denominators() -> None:
@@ -579,6 +676,31 @@ def test_generation_metrics_include_language_split_and_signed_gap() -> None:
     assert counts["citation_precision.overall"] == 0
 
 
+def test_refusal_quality_metrics_are_reported_per_language() -> None:
+    rows = [
+        {
+            "query_language": "en",
+            "answerable": False,
+            "answered": False,
+            "cited_source_ids": [],
+        },
+        {
+            "query_language": "es",
+            "answerable": False,
+            "answered": True,
+            "cited_source_ids": [],
+        },
+    ]
+
+    summary = score_generation(rows)
+    dashboard = generation_dashboard_scores(summary)
+
+    assert dashboard["refusal_precision.en"] == 1
+    assert dashboard["refusal_precision.es"] == 0
+    assert dashboard["out_of_scope_answer_rate.en"] == 0
+    assert dashboard["out_of_scope_answer_rate.es"] == 1
+
+
 def test_default_suite_has_bilingual_fast_lane_and_negative_reasons() -> None:
     cases = _load_evaluation_cases(EVALUATION / "gold_suites.jsonl")
     fast_lane = [case for case in cases if case.get("evaluation_lane") != "generation"]
@@ -612,3 +734,14 @@ def test_generation_sample_always_includes_every_paraphrase_case() -> None:
         "cross_source",
     }
     assert {case.get("query_language") for case in sample} >= {"en", "es"}
+
+
+def test_store_generation_sample_never_injects_developer_paraphrases() -> None:
+    cases = _load_evaluation_cases(EVALUATION / "store_gold_suites.jsonl")
+    sample = _generation_sample(cases, 30, project_id="T2.0-STORE")
+
+    assert len(sample) == 30
+    assert {case["project_id"] for case in sample} == {"T2.0-STORE"}
+    assert not any(case.get("paraphrase_group") for case in sample)
+    assert {case.get("query_language") for case in sample} == {"en", "es"}
+    assert {case.get("answerable") for case in sample} == {True, False}

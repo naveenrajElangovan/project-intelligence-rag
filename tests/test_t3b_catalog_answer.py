@@ -28,7 +28,7 @@ def test_all_products_uses_complete_verified_artifact_instead_of_inline_list() -
     ]
 
     result = _catalog_artifact(
-        "T3B-COMPANY", "¿Cuáles son todos los productos?", documents
+        "T3B-COMPANY", "¿Cuáles son todos los productos?", documents, enabled=True
     )
 
     assert result is not None
@@ -58,6 +58,7 @@ def test_all_products_fails_closed_when_population_is_truncated() -> None:
                 },
             )
         ],
+        enabled=True,
     )
 
     assert result is None
@@ -88,6 +89,7 @@ def test_exhaustive_request_bypasses_generation_and_returns_artifact() -> None:
                 collectionName="project-intelligence",
                 question="List all products",
                 accessPolicyIds=["project:T3B-COMPANY"],
+                catalogReleasesEnabled=True,
             ),
             Retriever(),
         )

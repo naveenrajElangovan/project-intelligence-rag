@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import hashlib
 from pathlib import Path
@@ -7,7 +6,6 @@ import re
 import unicodedata
 from collections.abc import AsyncIterator
 from typing import TypedDict
-
 from langchain_core.documents import Document
 from app.config import Settings
 from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedAnswer,
@@ -124,10 +122,11 @@ from app.workflow_support.conversation import (
 from app.workflow_support.fail_closed import apply_output_gate, clarification_response, resolved_request_for_state
 from app.workflow_evaluation import EvaluationWorkflowMixin
 
-
 class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
     """Bounded graph whose authorization inputs are immutable and never LLM-generated."""
     def __init__(self, settings: Settings, request: RagRequest) -> None:
+        if request.retrieval_profile is not None:
+            settings = settings.model_copy(update=request.retrieval_profile.settings_overrides())
         self._settings = settings
         self._request = request
         # Keep planning dependencies injectable at this composition boundary.
@@ -157,6 +156,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
             lexical_fallback_enabled=settings.lexical_fallback_enabled,
             lexical_fallback_max_records=settings.lexical_fallback_max_records,
             lexical_fallback_cache_ttl_seconds=settings.lexical_fallback_cache_ttl_seconds,
+            lexical_fallback_cache_max_entries=settings.lexical_fallback_cache_max_entries,
             vocabulary_cache_ttl_seconds=settings.vocabulary_cache_ttl_seconds,
             embedder=build_embedder(settings),
         )
@@ -186,7 +186,9 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
         if deterministic is not None:
             return deterministic
         clarification = clarification_response(
-            self._request, self._vocabulary.entities
+            self._request,
+            self._vocabulary.entities,
+            getattr(self._vocabulary, "source_types", ()),
         )
         if clarification is not None:
             return clarification
@@ -218,7 +220,11 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
                 "response": deterministic.model_dump(by_alias=True),
             }
             return
-        clarification = clarification_response(self._request, self._vocabulary.entities)
+        clarification = clarification_response(
+            self._request,
+            self._vocabulary.entities,
+            getattr(self._vocabulary, "source_types", ()),
+        )
         if clarification is not None:
             async for event in verified_answer_events(clarification.answer):
                 yield event

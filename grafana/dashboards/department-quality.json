@@ -1,0 +1,23 @@
+{
+  "title": "RAG quality by department",
+  "uid": "rag-department-quality",
+  "schemaVersion": 39,
+  "tags": ["rag", "quality", "department"],
+  "templating": {
+    "list": [
+      {"name": "project_id", "type": "query", "query": "label_values(rag_quality_score, project_id)"},
+      {"name": "department", "type": "query", "query": "label_values(rag_quality_score{project_id=\"$project_id\"}, department)"},
+      {"name": "query_language", "type": "query", "query": "label_values(rag_quality_score{project_id=\"$project_id\",department=\"$department\"}, query_language)"}
+    ]
+  },
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Section hit rate", "targets": [{"expr": "rag_quality_score{metric=~\"section_hit_rate_at_.*\",project_id=\"$project_id\",department=\"$department\",query_language=\"$query_language\"}"}]},
+    {"id": 2, "type": "timeseries", "title": "Candidate hit rate at 25", "targets": [{"expr": "rag_quality_score{metric=\"candidate_hit_rate_at_25\",project_id=\"$project_id\",department=\"$department\",query_language=\"$query_language\"}"}]},
+    {"id": 3, "type": "timeseries", "title": "Out-of-scope answer rate", "targets": [{"expr": "rag_quality_score{metric=\"out_of_scope_answer_rate\",project_id=\"$project_id\",department=\"$department\",query_language=\"$query_language\"}"}]},
+    {"id": 4, "type": "timeseries", "title": "Refusal precision", "targets": [{"expr": "rag_quality_score{metric=\"refusal_precision\",project_id=\"$project_id\",department=\"$department\",query_language=\"$query_language\"}"}]},
+    {"id": 5, "type": "stat", "title": "Cross-project leakage", "targets": [{"expr": "rag_quality_score{metric=\"cross_project_leakage\",project_id=\"$project_id\",department=\"$department\"}"}]},
+    {"id": 6, "type": "stat", "title": "Cross-department leakage", "targets": [{"expr": "rag_quality_score{metric=\"cross_department_leakage\",project_id=\"$project_id\",department=\"$department\"}"}]},
+    {"id": 7, "type": "timeseries", "title": "Stage duration", "targets": [{"expr": "histogram_quantile(0.95, sum by (le,stage,project_id,department) (rate(rag_stage_duration_ms_bucket{project_id=\"$project_id\",department=\"$department\"}[5m])))"}]},
+    {"id": 8, "type": "stat", "title": "Lexical cache entries", "targets": [{"expr": "pi_rag_lexical_cache_entries"}]}
+  ]
+}

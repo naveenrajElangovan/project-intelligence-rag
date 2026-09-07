@@ -109,6 +109,10 @@ _ADMISSION_CAPACITY = Gauge(
     "pi_rag_admission_capacity",
     "Requests this replica will admit concurrently, after clamping.",
 )
+_LEXICAL_CACHE_ENTRIES = Gauge(
+    "pi_rag_lexical_cache_entries",
+    "Bounded authorized lexical corpus cache entries.",
+)
 
 
 def configure_telemetry_logging(level: str = "INFO") -> None:
@@ -155,6 +159,10 @@ def admission_capacity(capacity: int) -> None:
     """
 
     _ADMISSION_CAPACITY.set(capacity)
+
+
+def lexical_cache_entries(size: int) -> None:
+    _LEXICAL_CACHE_ENTRIES.set(max(0, size))
 
 
 def request_admitted(began: float) -> None:

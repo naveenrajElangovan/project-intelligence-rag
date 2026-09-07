@@ -94,6 +94,52 @@ def _forced_anchor_tokens(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys([*labels, *quoted]))
 
 
+def _canonical_route_tokens(
+    question: str, documents: list[Document], *, limit: int = 12
+) -> tuple[str, ...]:
+    """Read section routes from an authorized canonical-question index hit.
+
+    The route is only followed when the index chunk contains the user's full
+    normalized wording and identifies itself structurally as a QUESTION entry.
+    Returned identifiers are subsequently loaded through the same project,
+    access-policy, and source-type filters as every other exact lookup.
+    """
+
+    normalized_question = " ".join(
+        re.findall(r"[a-z0-9à-ÿ]+", question.casefold())
+    )
+    if len(normalized_question.split()) < 3:
+        return ()
+    tokens: list[str] = []
+    for document in documents:
+        structure = " ".join(
+            str(value) for value in document.metadata.get("structure_path") or ()
+        )
+        if "QUESTION-" not in structure.upper():
+            continue
+        normalized_body = " ".join(
+            re.findall(r"[a-z0-9à-ÿ]+", document.page_content.casefold())
+        )
+        quoted_questions = {
+            " ".join(re.findall(r"[a-z0-9à-ÿ]+", value.casefold()))
+            for value in re.findall(
+                r'["“]([^"”]{3,200})["”]', document.page_content
+            )
+        }
+        if (
+            normalized_question not in quoted_questions
+            and normalized_body != normalized_question
+        ):
+            continue
+        for token in re.findall(r"\[([A-Z][A-Z0-9_-]{2,})\]", document.page_content):
+            if token.startswith("QUESTION-") or token in tokens:
+                continue
+            tokens.append(token)
+            if len(tokens) >= limit:
+                return tuple(tokens)
+    return tuple(tokens)
+
+
 def _retain_explicit_identifier_anchors(
     documents: list[Document], explicit_identifiers: tuple[str, ...]
 ) -> list[Document]:
@@ -269,8 +315,16 @@ def _preserve_identifier_anchors(
     ranked: list[Document], candidates: list[Document], *, top_n: int
 ) -> list[Document]:
     anchors = sorted(
-        (document for document in candidates if document.metadata.get("identifier_anchor")),
-        key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),
+        (
+            document
+            for document in candidates
+            if document.metadata.get("identifier_anchor")
+            or document.metadata.get("canonical_route_match")
+        ),
+        key=lambda item: max(
+            float(item.metadata.get("identifier_anchor_score") or 0),
+            float(item.metadata.get("canonical_route_match_score") or 0),
+        ),
         reverse=True,
     )[: min(3, top_n)]
     combined: list[Document] = []
@@ -280,7 +334,9 @@ def _preserve_identifier_anchors(
         if identity in seen:
             continue
         seen.add(identity)
-        if document.metadata.get("identifier_anchor"):
+        if document.metadata.get("identifier_anchor") or document.metadata.get(
+            "canonical_route_match"
+        ):
             document.metadata["rerank_score"] = 1.0
         combined.append(document)
         if len(combined) >= top_n:
@@ -476,6 +532,58 @@ class RetrievalNodesMixin:
                 )
             else:
                 queries.pop(translation_slot)
+        canonical_route_tokens = _canonical_route_tokens(
+            resolved_question,
+            [document for group in results for document in group],
+        )
+        structure_loader = getattr(
+            self._retriever, "ainvoke_structure_identifiers", None
+        )
+        route_anchored = (
+            await structure_loader(canonical_route_tokens, source_types)
+            if structure_loader is not None and canonical_route_tokens
+            else await exact_loader(canonical_route_tokens, source_types)
+            if exact_loader is not None and canonical_route_tokens
+            else []
+        )
+        for document in route_anchored:
+            # Canonical routes reserve the target sections for semantic
+            # ranking; they do not assert that every linked section answers
+            # this particular wording. Otherwise the first two route IDs win
+            # the final anchor slots by list order and displace the relevant
+            # route before the cross-encoder can choose it.
+            document.metadata.pop("identifier_anchor", None)
+            document.metadata.pop("identifier_anchor_score", None)
+            document.metadata["canonical_route_candidate"] = True
+        route_query = (
+            retrieval_terminology_variant(resolved_question) or resolved_question
+        )
+        route_terms = set(
+            re.findall(r"[a-z0-9à-ÿ]{4,}", route_query.casefold())
+        ) - {
+            "como",
+            "cómo",
+            "what",
+            "where",
+            "which",
+            "with",
+            "from",
+            "para",
+        }
+        for document in route_anchored:
+            searchable = " ".join(
+                (
+                    document.page_content,
+                    " ".join(
+                        str(value)
+                        for value in document.metadata.get("structure_path") or ()
+                    ),
+                )
+            )
+            route_match_score = _exact_term_ratio(route_terms, searchable)
+            if route_match_score > 0:
+                document.metadata["canonical_route_match"] = True
+                document.metadata["canonical_route_match_score"] = route_match_score
         unique: dict[str, Document] = {}
         if state.get("preserve_candidates"):
             for document in state.get("candidates", []):
@@ -545,6 +653,7 @@ class RetrievalNodesMixin:
         anchored = _retain_explicit_identifier_anchors(
             anchored, _forced_anchor_tokens(resolved_question)
         )
+        anchored.extend(route_anchored)
         for document in anchored:
             identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
                 (document.page_content + str(document.metadata.get("reference"))).encode()
@@ -583,7 +692,7 @@ class RetrievalNodesMixin:
             ),
         )
         fused_candidates = deduplicate_candidate_bodies(
-            [*primary_authorized, *fused_candidates]
+            [*route_anchored, *primary_authorized, *fused_candidates]
         )[: max(self._settings.max_candidates, self._settings.retrieval_top_k)]
         registry = SourcePolicyRegistry.from_categories(
             _document_source_type(document) for document in fused_candidates
@@ -612,6 +721,11 @@ class RetrievalNodesMixin:
                     strength=self._settings.source_volume_discount_strength,
                 )
             )
+            if document.metadata.get("canonical_route_candidate"):
+                document.metadata["retrieval_fused_score"] = max(
+                    1.0,
+                    float(document.metadata["retrieval_fused_score"]),
+                )
         responsive, prefilter_reasons = _prefilter_candidates(
             fused_candidates,
             minimum_dense_score=self._settings.prefilter_min_dense_score,
@@ -685,6 +799,7 @@ class RetrievalNodesMixin:
                 "entity_capability": (
                     "enabled" if self._vocabulary.entities else "disabled"
                 ),
+                "canonical_route_count": len(canonical_route_tokens),
             },
         )
         return {

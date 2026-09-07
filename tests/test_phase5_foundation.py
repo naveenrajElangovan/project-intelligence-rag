@@ -65,6 +65,19 @@ def test_progressive_rerank_keeps_original_query_candidates() -> None:
     assert "primary" in {document.metadata["chunk_id"] for document in narrowed}
 
 
+def test_progressive_rerank_keeps_canonical_route_candidates() -> None:
+    documents = [_document(f"generic-{index}", 1.0 - index / 100) for index in range(20)]
+    route = _document("routed-section", 0.0, "PAGE")
+    route.metadata["canonical_route_candidate"] = True
+    documents.append(route)
+
+    narrowed = progressive_rerank_candidates(documents, 8)
+
+    assert "routed-section" in {
+        document.metadata["chunk_id"] for document in narrowed
+    }
+
+
 def test_source_volume_discount_is_neutral_for_one_and_never_excludes() -> None:
     score = 0.75
 

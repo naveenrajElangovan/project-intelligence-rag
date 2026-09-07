@@ -18,10 +18,14 @@ class CorpusVocabulary:
     source_types: tuple[str, ...] = ()
     code_extensions: tuple[str, ...] = ()
     languages: tuple[str, ...] = ()
+    intent_terms: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def entity_set(self) -> frozenset[str]:
         return frozenset(self.entities)
+
+    def terms_for(self, intent: str) -> tuple[str, ...]:
+        return next((terms for name, terms in self.intent_terms if name == intent), ())
 
     @classmethod
     def from_record(
@@ -45,6 +49,7 @@ class CorpusVocabulary:
             source_types=_normalized_values(values.get("source_types"), upper=True),
             code_extensions=_extensions(values.get("code_extensions")),
             languages=_normalized_values(values.get("languages"), casefold=True),
+            intent_terms=_intent_terms(values.get("intent_terms")),
         )
 
     @classmethod
@@ -52,8 +57,7 @@ class CorpusVocabulary:
         """Merge only vocabulary records already filtered to caller-visible policies."""
 
         vocabularies = tuple(values)
-        return cls(
-            **{
+        merged = {
                 field: tuple(
                     dict.fromkeys(
                         item
@@ -70,7 +74,40 @@ class CorpusVocabulary:
                     "languages",
                 )
             }
+        intent_names = tuple(
+            dict.fromkeys(name for vocabulary in vocabularies for name, _ in vocabulary.intent_terms)
         )
+        merged["intent_terms"] = tuple(
+            (
+                name,
+                tuple(
+                    dict.fromkeys(
+                        term
+                        for vocabulary in vocabularies
+                        for intent, terms in vocabulary.intent_terms
+                        if intent == name
+                        for term in terms
+                    )
+                ),
+            )
+            for name in intent_names
+        )
+        return cls(**merged)
+
+
+def _intent_terms(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return ()
+    if not isinstance(value, dict):
+        return ()
+    return tuple(
+        (str(intent).upper(), _normalized_values(terms, casefold=True))
+        for intent, terms in sorted(value.items())
+        if str(intent).strip() and _normalized_values(terms, casefold=True)
+    )
 
 def _raw_values(value: Any) -> Iterable[Any]:
     if isinstance(value, str):

@@ -6,8 +6,8 @@ from langchain_core.documents import Document
 from app.models import ArtifactReference, RagRequest, RagResponse
 
 
-def _complete_product_catalog_requested(project_id: str, question: str) -> bool:
-    if project_id != "T3B-COMPANY":
+def _complete_product_catalog_requested(enabled: bool, question: str) -> bool:
+    if not enabled:
         return False
     normalized = " ".join(question.casefold().split())
     return bool(
@@ -20,9 +20,13 @@ def _complete_product_catalog_requested(project_id: str, question: str) -> bool:
 
 
 def _catalog_artifact(
-    project_id: str, question: str, documents: list[Document]
+    project_id: str,
+    question: str,
+    documents: list[Document],
+    *,
+    enabled: bool = False,
 ) -> tuple[ArtifactReference, dict[str, int], str] | None:
-    if not _complete_product_catalog_requested(project_id, question):
+    if not _complete_product_catalog_requested(enabled, question):
         return None
     products = {
         str(document.metadata.get("product_sku") or ""): document
@@ -104,8 +108,11 @@ def catalog_response_fields(
     documents: list[Document],
     language: str,
     fallback_answer: str,
+    catalog_releases_enabled: bool = False,
 ) -> tuple[str, list[ArtifactReference]]:
-    catalog = _catalog_artifact(project_id, question, documents)
+    catalog = _catalog_artifact(
+        project_id, question, documents, enabled=catalog_releases_enabled
+    )
     if catalog is None:
         return fallback_answer, []
     artifact, totals, release_id = catalog
@@ -125,11 +132,18 @@ async def deterministic_catalog_response(
 ) -> RagResponse | None:
     """Bypass model generation for exhaustive product-catalog requests."""
 
-    if not _complete_product_catalog_requested(request.project_id, request.question):
+    if not _complete_product_catalog_requested(
+        request.catalog_releases_enabled, request.question
+    ):
         return None
     loader = getattr(retriever, "ainvoke_population", None)
     documents = await loader("product", (), ()) if loader is not None else []
-    catalog = _catalog_artifact(request.project_id, request.question, documents)
+    catalog = _catalog_artifact(
+        request.project_id,
+        request.question,
+        documents,
+        enabled=request.catalog_releases_enabled,
+    )
     language = "es" if re.search(r"\b(?:cu[aá]les|productos|cat[aá]logo)\b", request.question.casefold()) else "en"
     if catalog is None:
         answer = (

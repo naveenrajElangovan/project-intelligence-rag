@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     lexical_fallback_enabled: bool = True
     lexical_fallback_max_records: int = 5000
     lexical_fallback_cache_ttl_seconds: int = 300
+    lexical_fallback_cache_max_entries: int = 64
     warm_lexical_corpus_on_startup: bool = True
     # Bound each background attempt to warm the authorized lexical corpora and
     # retry after a downstream outage. Startup never awaits Chroma: /health is

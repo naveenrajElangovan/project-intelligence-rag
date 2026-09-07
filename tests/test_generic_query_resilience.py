@@ -64,6 +64,9 @@ def test_noisy_variant_is_additive_and_never_rewrites_known_entity() -> None:
     assert retrieval_terminology_variant("How do I review a value?") == (
         "How do I check a value?"
     )
+    priority_variant = retrieval_terminology_variant("How do I filter priority?")
+    assert "prioridad" in priority_variant
+    assert "prioritarios" in priority_variant
     assert uncertain_entity_token("HOW DOES NAVA WORK?", ("nova", "atlas")) == "NAVA"
     assert uncertain_entity_token("HOW DOES NOVA WORK?", ("nova", "atlas")) == ""
 

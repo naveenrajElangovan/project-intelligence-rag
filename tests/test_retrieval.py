@@ -6,6 +6,7 @@ from app.retrieval import (
     _FallbackCorpus,
     _lexical_index,
     _rank_cached_corpus,
+    document_visible_policies,
     warm_authorized_lexical_corpora,
 )
 from app.retrieval_errors import classify_retrieval_failure
@@ -108,6 +109,33 @@ class VocabularyIndex(FakeIndex):
         }
 
 
+class StructureRouteIndex(FakeIndex):
+    def get(self, **kwargs):
+        self.get_args = kwargs
+        return {
+            "ids": ["target", "unrelated"],
+            "documents": ["Use Solo prioritarios.", "Unrelated content."],
+            "metadatas": [
+                {
+                    "project_id": "DEMO",
+                    "access_policy_id": "project:DEMO",
+                    "schema_version": "3",
+                    "embedding_model": "multilingual-e5-large",
+                    "source_type": "PAGE",
+                    "structure_path": '["[ORDER-CATEGORIES] Categories and filters"]',
+                },
+                {
+                    "project_id": "DEMO",
+                    "access_policy_id": "project:DEMO",
+                    "schema_version": "3",
+                    "embedding_model": "multilingual-e5-large",
+                    "source_type": "PAGE",
+                    "structure_path": '["[PAY-CARD] Card payment"]',
+                },
+            ],
+        }
+
+
 class SourcePartitionedIndex(FakeIndex):
     def __init__(self) -> None:
         super().__init__()
@@ -183,6 +211,31 @@ def test_scoped_retrieval_adds_source_filter_without_weakening_authorization() -
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
             {"source_type": {"$eq": "CODE"}},
         ]
+    }
+
+
+def test_structure_route_lookup_keeps_project_and_source_boundaries() -> None:
+    index = StructureRouteIndex()
+    retriever = ChromaAccessRetriever(
+        index=index,
+        collection_name="project-intelligence",
+        embedder=FakeEmbedder(),
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
+        top_k=8,
+        score_threshold=0.25,
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+    )
+
+    documents = asyncio.run(
+        retriever.ainvoke_structure_identifiers(("ORDER-CATEGORIES",), ("PAGE",))
+    )
+
+    assert [document.metadata["chunk_id"] for document in documents] == ["target"]
+    assert documents[0].metadata["canonical_route_anchor"] is True
+    assert index.get_args["where"]["$and"][-1] == {
+        "source_type": {"$eq": "PAGE"}
     }
 
 
@@ -477,6 +530,23 @@ def test_cached_lexical_index_matches_reference_bm25_order() -> None:
             reverse=True,
         )
     ]
+
+
+def test_document_visible_cache_scope_ignores_user_and_role_but_keeps_departments() -> None:
+    first = document_visible_policies(
+        "DEMO",
+        ("project:DEMO", "user:first", "role:DEMO:USER", "department:DEMO:FINANCE"),
+    )
+    second = document_visible_policies(
+        "DEMO",
+        ("project:DEMO", "user:second", "role:DEMO:MANAGER", "department:DEMO:FINANCE"),
+    )
+    other = document_visible_policies(
+        "DEMO", ("project:DEMO", "user:third", "department:DEMO:LOGISTICS")
+    )
+
+    assert first == second == ("department:DEMO:FINANCE", "project:DEMO")
+    assert other != first
 
 
 def test_mixed_lexical_corpus_reserves_space_for_page_evidence() -> None:

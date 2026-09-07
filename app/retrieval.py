@@ -4,6 +4,7 @@ import math
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,7 +18,7 @@ from app.retrieval_errors import classify_retrieval_failure
 from app.lexical_tokens import tokens as lexical_tokens
 from app.retrieval_pipeline import BM25Retriever
 from app.table_evidence import normalize_table_dialect
-from app.telemetry import retrieval_discarded, retrieval_failure, retrieval_fallback
+from app.telemetry import lexical_cache_entries, retrieval_discarded, retrieval_failure, retrieval_fallback
 from app.vocabulary import CorpusVocabulary, VOCABULARY_RECORD_KIND
 
 
@@ -32,7 +33,7 @@ class _FallbackCorpus:
     average_document_length: float
 
 
-_FALLBACK_CORPUS_CACHE: dict[tuple[object, ...], _FallbackCorpus] = {}
+_FALLBACK_CORPUS_CACHE: OrderedDict[tuple[object, ...], _FallbackCorpus] = OrderedDict()
 _FALLBACK_CORPUS_LOCK = threading.Lock()
 _CHROMA_CLIENTS: dict[tuple[str, int], Any] = {}
 _CHROMA_COLLECTIONS: dict[tuple[str, int, str], Any] = {}
@@ -45,7 +46,7 @@ class _CachedVocabulary:
     value: CorpusVocabulary
 
 
-_VOCABULARY_CACHE: dict[tuple[object, ...], _CachedVocabulary] = {}
+_VOCABULARY_CACHE: OrderedDict[tuple[object, ...], _CachedVocabulary] = OrderedDict()
 _VOCABULARY_CACHE_LOCK = threading.Lock()
 
 
@@ -62,6 +63,32 @@ def _authorized_policy_filter(
             else {"$in": list(policies)}
         )
     }
+
+
+def document_visible_policies(
+    project_id: str, access_policy_ids: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return only scopes ingestion can stamp on documents.
+
+    User and role policies authorize application actions but never identify a
+    stored chunk. Excluding them makes lexical and vocabulary caches reusable
+    without weakening the Chroma filter used for retrieval.
+    """
+
+    project_policy = f"project:{project_id}"
+    policies = {
+        value
+        for value in access_policy_ids
+        if value == project_policy or value.startswith(f"department:{project_id}:")
+    }
+    if project_policy not in policies:
+        raise PermissionError("Authorized project policy is required.")
+    return tuple(sorted(policies))
+
+
+def lexical_cache_size() -> int:
+    with _FALLBACK_CORPUS_LOCK:
+        return len(_FALLBACK_CORPUS_CACHE)
 
 
 async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
@@ -95,6 +122,7 @@ async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
             lexical_fallback_enabled=settings.lexical_fallback_enabled,
             lexical_fallback_max_records=settings.lexical_fallback_max_records,
             lexical_fallback_cache_ttl_seconds=settings.lexical_fallback_cache_ttl_seconds,
+            lexical_fallback_cache_max_entries=settings.lexical_fallback_cache_max_entries,
             vocabulary_cache_ttl_seconds=settings.vocabulary_cache_ttl_seconds,
             embedder=embedder,
         )
@@ -130,6 +158,7 @@ class ChromaAccessRetriever(BaseRetriever):
     lexical_fallback_enabled: bool = True
     lexical_fallback_max_records: int = Field(default=5000, ge=100, le=20_000)
     lexical_fallback_cache_ttl_seconds: int = Field(default=300, ge=0, le=3600)
+    lexical_fallback_cache_max_entries: int = Field(default=64, ge=1, le=4096)
     vocabulary_cache_ttl_seconds: int = Field(default=300, ge=0, le=3600)
     _usage_events: list[dict[str, int]] = []
     _usage_lock: Any = None
@@ -154,6 +183,7 @@ class ChromaAccessRetriever(BaseRetriever):
         lexical_fallback_enabled: bool = True,
         lexical_fallback_max_records: int = 5000,
         lexical_fallback_cache_ttl_seconds: int = 300,
+        lexical_fallback_cache_max_entries: int = 64,
         vocabulary_cache_ttl_seconds: int = 300,
         embedder: Any = None,
     ) -> "ChromaAccessRetriever":
@@ -196,6 +226,7 @@ class ChromaAccessRetriever(BaseRetriever):
             lexical_fallback_enabled=lexical_fallback_enabled,
             lexical_fallback_max_records=lexical_fallback_max_records,
             lexical_fallback_cache_ttl_seconds=lexical_fallback_cache_ttl_seconds,
+            lexical_fallback_cache_max_entries=lexical_fallback_cache_max_entries,
             vocabulary_cache_ttl_seconds=vocabulary_cache_ttl_seconds,
         )
 
@@ -466,26 +497,28 @@ class ChromaAccessRetriever(BaseRetriever):
     def corpus_vocabulary(self) -> CorpusVocabulary:
         """Load the reserved project record without admitting it as evidence."""
 
+        visible_policies = document_visible_policies(self.project_id, self.access_policy_ids)
         key = (
             self.collection_name,
             self.project_id,
-            *sorted(self.access_policy_ids),
+            *visible_policies,
         )
         now = time.monotonic()
         with _VOCABULARY_CACHE_LOCK:
             cached = _VOCABULARY_CACHE.get(key)
             if cached is not None and cached.expires_at > now:
+                _VOCABULARY_CACHE.move_to_end(key)
                 return cached.value
         try:
             response = self.index.get(
                 where={
                     "$and": [
                         {"project_id": {"$eq": self.project_id}},
-                        _authorized_policy_filter(self.access_policy_ids),
+                        _authorized_policy_filter(visible_policies),
                         {"record_kind": {"$eq": VOCABULARY_RECORD_KIND}},
                     ]
                 },
-                limit=max(1, len(self.access_policy_ids)),
+                limit=max(1, len(visible_policies)),
                 include=["documents", "metadatas"],
             )
             documents = response.get("documents", [])
@@ -501,6 +534,9 @@ class ChromaAccessRetriever(BaseRetriever):
         expires_at = now + self.vocabulary_cache_ttl_seconds
         with _VOCABULARY_CACHE_LOCK:
             _VOCABULARY_CACHE[key] = _CachedVocabulary(expires_at, vocabulary)
+            _VOCABULARY_CACHE.move_to_end(key)
+            while len(_VOCABULARY_CACHE) > self.lexical_fallback_cache_max_entries:
+                _VOCABULARY_CACHE.popitem(last=False)
         return vocabulary
 
     async def _aget_relevant_documents(
@@ -564,6 +600,15 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         return await asyncio.to_thread(
             self._exact_identifier_documents, identifiers, source_types
+        )
+
+    async def ainvoke_structure_identifiers(
+        self, identifiers: tuple[str, ...], source_types: tuple[str, ...] = ()
+    ) -> list[Document]:
+        """Load authorized chunks whose section path contains an exact route ID."""
+
+        return await asyncio.to_thread(
+            self._structure_identifier_documents, identifiers, source_types
         )
 
     async def ainvoke_lexical(
@@ -729,6 +774,77 @@ class ChromaAccessRetriever(BaseRetriever):
             reverse=True,
         )[:12]
 
+    def _structure_identifier_documents(
+        self, identifiers: tuple[str, ...], source_types: tuple[str, ...]
+    ) -> list[Document]:
+        """Resolve canonical index routes stored in chunk structure metadata.
+
+        Chroma's document substring filter cannot inspect a serialized heading
+        path. This bounded metadata scan is intentionally a separate operation
+        and is only invoked after an authorized canonical-question index match.
+        """
+
+        if not identifiers:
+            return []
+        filters: list[dict[str, object]] = [
+            {"project_id": {"$eq": self.project_id}},
+            _authorized_policy_filter(self.access_policy_ids),
+            {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
+        ]
+        normalized_types = tuple(
+            dict.fromkeys(value.strip().upper() for value in source_types if value.strip())
+        )
+        if normalized_types:
+            filters.append(
+                {"source_type": {"$eq": normalized_types[0]}}
+                if len(normalized_types) == 1
+                else {"source_type": {"$in": list(normalized_types)}}
+            )
+        response = self.index.get(
+            where={"$and": filters},
+            limit=self.lexical_fallback_max_records,
+            include=["documents", "metadatas"],
+        )
+        expected = {identifier.upper() for identifier in identifiers}
+        found: list[Document] = []
+        drops: dict[str, int] = {}
+        for chunk_id, text, metadata in zip(
+            response.get("ids", []),
+            response.get("documents", []),
+            response.get("metadatas", []),
+            strict=True,
+        ):
+            fields = dict(metadata or {})
+            fields[self.text_field] = text or ""
+            document = self._document_from_fields(fields, str(chunk_id), 1.0, drops)
+            if document is None:
+                continue
+            structure_path = " ".join(
+                str(value) for value in document.metadata.get("structure_path") or ()
+            ).upper()
+            matched = [
+                identifier
+                for identifier in expected
+                if re.search(
+                    rf"(?<![A-Z0-9_-]){re.escape(identifier)}(?![A-Z0-9_-])",
+                    structure_path,
+                )
+            ]
+            if not matched:
+                continue
+            document.metadata["identifier_anchor"] = True
+            document.metadata["canonical_route_anchor"] = True
+            document.metadata["identifier_anchor_score"] = max(
+                _identifier_anchor_score(identifier, document)
+                for identifier in matched
+            )
+            found.append(document)
+        return sorted(
+            found,
+            key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),
+            reverse=True,
+        )[:12]
+
     def _lexical_fallback(
         self, query: str, source_types: tuple[str, ...], failure_code: str
     ) -> list[Document]:
@@ -836,11 +952,12 @@ class ChromaAccessRetriever(BaseRetriever):
     def _cached_authorized_corpus(
         self, source_types: tuple[str, ...]
     ) -> _FallbackCorpus:
+        visible_policies = document_visible_policies(self.project_id, self.access_policy_ids)
         key = (
             self.chroma_host,
             self.collection_name,
             self.project_id,
-            tuple(sorted(self.access_policy_ids)),
+            visible_policies,
             tuple(sorted(source_types)),
         )
         now = time.monotonic()
@@ -848,6 +965,8 @@ class ChromaAccessRetriever(BaseRetriever):
         if self.lexical_fallback_cache_ttl_seconds:
             with _FALLBACK_CORPUS_LOCK:
                 cached = _FALLBACK_CORPUS_CACHE.get(key)
+                if cached is not None:
+                    _FALLBACK_CORPUS_CACHE.move_to_end(key)
             if cached and cached.expires_at <= now:
                 cached = None
         if cached is None:
@@ -869,6 +988,10 @@ class ChromaAccessRetriever(BaseRetriever):
             if self.lexical_fallback_cache_ttl_seconds:
                 with _FALLBACK_CORPUS_LOCK:
                     _FALLBACK_CORPUS_CACHE[key] = cached
+                    _FALLBACK_CORPUS_CACHE.move_to_end(key)
+                    while len(_FALLBACK_CORPUS_CACHE) > self.lexical_fallback_cache_max_entries:
+                        _FALLBACK_CORPUS_CACHE.popitem(last=False)
+                    lexical_cache_entries(len(_FALLBACK_CORPUS_CACHE))
         return cached
 
     def _fetch_fallback_corpus(
@@ -1024,6 +1147,14 @@ def _identifier_anchor_score(identifier: str, document: Document) -> float:
     body = document.page_content
     title = str(document.metadata.get("title") or "")
     score = float(body.upper().count(identifier.upper()))
+    structure_path = " ".join(
+        str(value) for value in document.metadata.get("structure_path") or ()
+    )
+    if re.search(
+        rf"(?<![A-Z0-9_-]){re.escape(identifier.upper())}(?![A-Z0-9_-])",
+        structure_path.upper(),
+    ):
+        score += 120
     if re.search(rf"@SerialName\(['\"]{re.escape(identifier)}['\"]\)", body):
         score += 100
     if "data class " in body and identifier.upper() in body.upper():

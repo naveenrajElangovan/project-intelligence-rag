@@ -15,6 +15,53 @@ from app.workflow_support.query_analysis import (
     _normalized_words,
 )
 
+
+def _deterministic_canonical_route_answer(
+    question: str, documents: list[Document], language: str
+) -> GroundedAnswer | None:
+    """Quote the most topical instruction from an exact canonical route.
+
+    This is intentionally limited to documents independently marked as route
+    matches during authorized retrieval. It copies existing prose rather than
+    synthesizing a new procedure; normal citation and grounding checks still
+    run afterward.
+    """
+
+    words = {
+        word
+        for word in _normalized_words(question)
+        if len(word) >= 5
+        and word not in {"which", "where", "about", "cómo", "donde", "sobre"}
+    }
+    stems = {
+        word[:-4] if word.endswith("idad") else word[:-3] if word.endswith("ity") else word
+        for word in words
+    }
+    if not stems:
+        return None
+    matches: list[tuple[int, int, str]] = []
+    for source_number, document in enumerate(documents, start=1):
+        if not document.metadata.get("canonical_route_match"):
+            continue
+        for segment in re.split(r"(?<=[.!?])\s+|\n+", document.page_content):
+            cleaned = " ".join(segment.split()).strip(" -*")
+            if len(re.findall(r"\w+", cleaned)) < 4:
+                continue
+            folded = cleaned.casefold()
+            score = sum(stem in folded for stem in stems)
+            if score:
+                matches.append((score, -source_number, cleaned))
+    if not matches:
+        return None
+    _score, negative_source, text = max(matches)
+    source_number = -negative_source
+    heading = " ".join(question.split()).strip("# ")
+    return GroundedAnswer(
+        answer=f"### {heading}\n{text.rstrip('.')} [SOURCE {source_number}].",
+        citations=[source_number],
+        missing_information=[],
+    )
+
 def _deterministic_identifier_answer(
     question: str, documents: list[Document], language: str
 ) -> GroundedAnswer | None:
@@ -461,7 +508,11 @@ def _deterministic_code_location_answer(
         prefix = "El archivo coincidente es" if language == "es" else "The matching file is"
         answer = f"{prefix} `{selected[0][2]}` [SOURCE {selected[0][3]}]."
     else:
-        prefix = "Los archivos coincidentes son:" if language == "es" else "The matching files are:"
+        # A Markdown heading is structural rather than a factual claim. Keeping
+        # the introduction structural means every material line below carries
+        # its own citation and the deterministic answer never needs an LLM
+        # citation-repair pass that could alter exact paths or identifiers.
+        prefix = "### Archivos coincidentes" if language == "es" else "### Matching files"
         answer = prefix + "\n" + "\n".join(
             f"- `{label}` [SOURCE {source_number}]."
             for _score, _rank, label, source_number in selected

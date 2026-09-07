@@ -95,7 +95,10 @@ def progressive_rerank_candidates(
             default=0,
         )
         return (
-            1.0 if metadata.get("identifier_anchor") else 0.0,
+            1.0
+            if metadata.get("identifier_anchor")
+            or metadata.get("canonical_route_candidate")
+            else 0.0,
             1.0 if primary_rank or query_rank else 0.0,
             float(-(primary_rank or query_rank)) if primary_rank or query_rank else float("-inf"),
             float(metadata.get("retrieval_fused_score", 0.0) or 0.0),
@@ -126,6 +129,7 @@ def progressive_rerank_candidates(
     for document in ranked:
         if (
             document.metadata.get("identifier_anchor")
+            or document.metadata.get("canonical_route_candidate")
             or document.metadata.get("primary_query_rank")
             or document.metadata.get("query_candidate_ranks")
         ):

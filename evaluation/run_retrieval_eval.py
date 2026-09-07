@@ -47,6 +47,7 @@ from app.retrieval_pipeline import (
     deduplicate_candidate_bodies,
 )
 try:
+    from evaluation.build_gold_suites import build_registered_suites
     from evaluation.phoenix_client import publish_scores_to_phoenix
     from evaluation.score import (
         generation_dashboard_scores,
@@ -57,6 +58,7 @@ try:
         score_generation,
     )
 except ModuleNotFoundError:  # Direct `python evaluation/run_retrieval_eval.py` execution.
+    from build_gold_suites import build_registered_suites
     from phoenix_client import publish_scores_to_phoenix
     from score import (
         generation_dashboard_scores,
@@ -88,15 +90,16 @@ _MANIFEST_VERSION = 4
 _MINIMUM_GOLD_RESOLUTION_RATE = 0.95
 _PARAPHRASE_GROUPS_PATH = Path(__file__).with_name("paraphrase_groups.json")
 _DEFAULT_SUITES_PATH = Path(__file__).with_name("gold_suites.jsonl")
+_DEFAULT_REGISTRY_PATH = Path(__file__).with_name("suites.json")
 _BILINGUAL_SUITES_PATH = Path(__file__).with_name("bilingual_gold_suites.jsonl")
 _RERANK_SWEEP = (
-    ("baseline", 12, 16, 8, 0.10, 3),
-    ("regular_candidates_16", 16, 16, 8, 0.10, 3),
-    ("inventory_candidates_20", 12, 20, 8, 0.10, 3),
-    ("top_n_10", 12, 16, 10, 0.10, 3),
-    ("threshold_005", 12, 16, 8, 0.05, 3),
-    ("source_cap_4", 12, 16, 8, 0.10, 4),
-    ("combined", 16, 20, 10, 0.05, 3),
+    # Corpus-breadth sweep: truth thresholds remain fixed. The selected knee is
+    # recorded in project configuration only after section hit rate and refusal
+    # behavior have both been measured.
+    ("source_cap_3", 16, 16, 16, 0.10, 3),
+    ("source_cap_6", 16, 16, 16, 0.10, 6),
+    ("source_cap_12", 16, 16, 16, 0.10, 12),
+    ("source_cap_25", 16, 16, 16, 0.10, 25),
 )
 
 
@@ -296,40 +299,56 @@ def _namespace_manifest(
     return chunks
 
 
+def _predicate_matches(
+    predicate: dict[str, Any], metadata: dict[str, str]
+) -> bool:
+    if "all_of" in predicate:
+        return all(
+            _predicate_matches(item, metadata)
+            for item in predicate.get("all_of", [])
+        )
+    field = str(predicate.get("field") or "")
+    actual = str(metadata.get(field) or "").casefold()
+    if field not in _MANIFEST_FIELDS:
+        return False
+    if "equals" in predicate:
+        return actual == str(predicate.get("equals") or "").casefold()
+    expected = str(predicate.get("contains") or "").casefold()
+    if not expected:
+        return False
+    if expected in actual:
+        return True
+    # Ingestion formats section paths as JSON strings and some importers omit
+    # presentational brackets around stable section identifiers.
+    normalized_expected = re.sub(r"[^a-z0-9]+", "", expected)
+    normalized_actual = re.sub(r"[^a-z0-9]+", "", actual)
+    return bool(normalized_expected) and normalized_expected in normalized_actual
+
+
+def _gold_section_chunk_ids(
+    case: dict[str, Any], manifest: dict[str, dict[str, str]]
+) -> list[list[str]]:
+    """Resolve every declared section independently for section-level scoring."""
+
+    return [
+        [
+            chunk_id
+            for chunk_id, metadata in manifest.items()
+            if _predicate_matches(predicate, metadata)
+        ]
+        for predicate in case.get("gold_match", {}).get("any_of", [])
+    ]
+
+
 def _gold_ids(
     case: dict[str, Any], manifest: dict[str, dict[str, str]]
 ) -> list[str]:
     predicates = case.get("gold_match", {}).get("any_of", [])
 
-    def predicate_matches(
-        predicate: dict[str, Any], metadata: dict[str, str]
-    ) -> bool:
-        if "all_of" in predicate:
-            return all(
-                predicate_matches(item, metadata)
-                for item in predicate.get("all_of", [])
-            )
-        field = str(predicate.get("field") or "")
-        actual = str(metadata.get(field) or "").casefold()
-        if field not in _MANIFEST_FIELDS:
-            return False
-        if "equals" in predicate:
-            return actual == str(predicate.get("equals") or "").casefold()
-        expected = str(predicate.get("contains") or "").casefold()
-        if not expected:
-            return False
-        if expected in actual:
-            return True
-        # Ingestion formats section paths as JSON strings and some importers
-        # omit presentational brackets around stable section identifiers.
-        normalized_expected = re.sub(r"[^a-z0-9]+", "", expected)
-        normalized_actual = re.sub(r"[^a-z0-9]+", "", actual)
-        return bool(normalized_expected) and normalized_expected in normalized_actual
-
     matches: list[str] = []
     for chunk_id, metadata in manifest.items():
         for predicate in predicates:
-            if predicate_matches(predicate, metadata):
+            if _predicate_matches(predicate, metadata):
                 matches.append(chunk_id)
                 break
     return matches
@@ -560,6 +579,7 @@ def _result_row(
     lexical_enabled: bool,
 ) -> dict[str, Any]:
     gold = _gold_ids(case, manifest)
+    gold_sections = _gold_section_chunk_ids(case, manifest)
     retrieved_ids = _chunk_ids(fused)
     reranked_ids = _chunk_ids(reranked)
     role = str(case.get("role") or "answer_evidence")
@@ -572,6 +592,7 @@ def _result_row(
         "target_evidence_language": case.get("target_evidence_language") or "und",
         "role": role,
         "gold_chunk_ids": gold,
+        "gold_section_chunk_ids": gold_sections,
         "retrieved_chunk_ids": retrieved_ids,
         "reranked_chunk_ids": reranked_ids,
         "evidence_source_ids": [
@@ -580,6 +601,11 @@ def _result_row(
         "cited_source_ids": [],
         "exposed_project_ids": [
             str(document.metadata.get("project_id") or "")
+            for document in [*fused, *reranked]
+        ],
+        "department": case.get("department") or "",
+        "exposed_access_policy_ids": [
+            str(document.metadata.get("access_policy_id") or "")
             for document in [*fused, *reranked]
         ],
         "answerable": bool(case.get("answerable")),
@@ -844,13 +870,16 @@ async def _main(arguments: argparse.Namespace) -> None:
         logical_collection=arguments.collection,
         cache_path=_manifest_cache_path(arguments.out),
     )
+    access_policy_ids = [f"project:{arguments.project_id}"]
+    if arguments.department:
+        access_policy_ids.append(f"department:{arguments.project_id}:{arguments.department}")
     retriever = ChromaAccessRetriever.create(
         chroma_host=arguments.chroma_host,
         chroma_port=arguments.chroma_port,
         collection_name=arguments.collection,
         text_field="chunk_text",
         project_id=arguments.project_id,
-        access_policy_ids=(f"project:{arguments.project_id}",),
+        access_policy_ids=tuple(access_policy_ids),
         top_k=settings.retrieval_top_k,
         score_threshold=settings.retrieval_score_threshold,
         required_schema_version=settings.supported_schema_versions[0],
@@ -860,6 +889,7 @@ async def _main(arguments: argparse.Namespace) -> None:
         lexical_fallback_enabled=settings.lexical_fallback_enabled,
         lexical_fallback_max_records=settings.lexical_fallback_max_records,
         lexical_fallback_cache_ttl_seconds=settings.lexical_fallback_cache_ttl_seconds,
+        lexical_fallback_cache_max_entries=settings.lexical_fallback_cache_max_entries,
         vocabulary_cache_ttl_seconds=settings.vocabulary_cache_ttl_seconds,
         embedder=build_embedder(settings),
     )
@@ -870,7 +900,16 @@ async def _main(arguments: argparse.Namespace) -> None:
         dense_weight=settings.dense_fusion_weight,
     )
     reranker = build_reranker(settings)
-    all_cases = _load_evaluation_cases(arguments.suites)
+    suite_definitions: list[dict[str, Any]] = []
+    if arguments.suites:
+        all_cases = _load_evaluation_cases(arguments.suites)
+    else:
+        all_cases, suite_definitions = build_registered_suites(
+            project_id=arguments.project_id,
+            suite_ids=set(arguments.suite_ids or []),
+            department=arguments.department,
+            registry_path=arguments.registry,
+        )
     if arguments.ragas_references:
         all_cases = _apply_reviewed_references(
             all_cases,
@@ -913,7 +952,12 @@ async def _main(arguments: argparse.Namespace) -> None:
         )
         print(json.dumps(summaries, indent=2, sort_keys=True))
         return
-    rows = _load_jsonl(arguments.out) if arguments.out.exists() else []
+    selected_ids = {str(case.get("id")) for case in cases}
+    rows = [
+        row
+        for row in (_load_jsonl(arguments.out) if arguments.out.exists() else [])
+        if str(row.get("id")) in selected_ids
+    ]
     completed = {str(row.get("id")) for row in rows}
     for position, case in enumerate(cases, start=1):
         if str(case.get("id")) in completed:
@@ -939,6 +983,11 @@ async def _main(arguments: argparse.Namespace) -> None:
         encoding="utf-8",
     )
     summary = score(rows, settings=settings, project_id=arguments.project_id)
+    summary["suite_ids"] = [definition["id"] for definition in suite_definitions]
+    summary["declared_gates"] = {
+        definition["id"]: definition.get("gates") or {}
+        for definition in suite_definitions
+    }
     summary_path = arguments.out.with_suffix(".json")
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -950,7 +999,9 @@ async def _main(arguments: argparse.Namespace) -> None:
             f"{arguments.out.stem}.generation.jsonl"
         )
         generation_rows = await _run_generation_lane(
-            _generation_sample(all_cases, arguments.generate),
+            _generation_sample(
+                all_cases, arguments.generate, project_id=arguments.project_id
+            ),
             settings=settings,
             project_id=arguments.project_id,
             output=generation_out,
@@ -1147,16 +1198,46 @@ def _stratified_sample(cases: list[dict[str, Any]], size: int) -> list[dict[str,
 
 
 def _generation_sample(
-    cases: list[dict[str, Any]], size: int
+    cases: list[dict[str, Any]], size: int, *, project_id: str | None = None
 ) -> list[dict[str, Any]]:
     """Reserve nightly generation capacity for every paraphrase invariant."""
 
     paraphrases = json.loads(_PARAPHRASE_GROUPS_PATH.read_text(encoding="utf-8"))
+    if project_id is not None:
+        paraphrases = [
+            case for case in paraphrases if case.get("project_id") == project_id
+        ]
     paraphrases = [
         {**case, "suite": "paraphrase_invariance", "evaluation_lane": "generation"}
         for case in paraphrases
     ]
     remaining = max(0, size - len(paraphrases))
+    if size >= 100:
+        # Long documentation corpora are sampled by routed section, not merely
+        # by suite. This makes every section/language visible in the generation
+        # lane while retaining every must-refuse case.
+        negatives = [case for case in cases if case.get("answerable") is False]
+        selected: dict[str, dict[str, Any]] = {
+            str(case["id"]): case for case in negatives
+        }
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for case in cases:
+            if case.get("answerable") is not True:
+                continue
+            section_ids = case.get("gold_section_ids") or ["unsectioned"]
+            for section_id in section_ids:
+                groups[(str(case.get("query_language") or "und"), str(section_id))].append(case)
+        for group_cases in groups.values():
+            for case in group_cases[:4]:
+                selected[str(case["id"])] = case
+        section_sample = list(selected.values())
+        if len(section_sample) > remaining:
+            raise ValueError(
+                f"Generation size {size} cannot hold four cases per section/language; "
+                f"requires at least {len(section_sample) + len(paraphrases)}"
+            )
+        fillers = [case for case in cases if str(case.get("id")) not in selected]
+        return [*paraphrases, *section_sample, *_stratified_sample(fillers, remaining - len(section_sample))]
     return [*paraphrases, *_stratified_sample(cases, remaining)]
 
 
@@ -1197,6 +1278,7 @@ async def _run_generation_lane(
             "id": case.get("id"),
             "case_id": case.get("id"),
             "suite": case.get("suite"),
+            "department": case.get("department") or "",
             "query_language": case.get("query_language") or "und",
             "target_evidence_language": case.get("target_evidence_language") or "und",
             "paraphrase_group": case.get("paraphrase_group"),
@@ -1251,18 +1333,16 @@ def main() -> None:
         action="store_true",
         help="Run an ablation with the sparse channel removed.",
     )
-    parser.add_argument(
-        "--suites",
-        type=Path,
-        default=_DEFAULT_SUITES_PATH,
-    )
+    parser.add_argument("--suites", type=Path, help="Legacy explicit JSONL suite file.")
+    parser.add_argument("--registry", type=Path, default=_DEFAULT_REGISTRY_PATH)
+    parser.add_argument("--suite", action="append", dest="suite_ids")
+    parser.add_argument("--department")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--generate",
         type=int,
-        choices=range(30, 41),
         metavar="N",
-        help="Run full generation, citation validation, and grounding on 30-40 cases.",
+        help="Run full generation; documentation suites should budget four cases per section/language.",
     )
     parser.add_argument("--generation-out", type=Path)
     parser.add_argument(

@@ -184,6 +184,14 @@ def retrieval_terminology_variant(value: str) -> str:
         value,
         flags=re.IGNORECASE,
     )
+    if re.search(
+        r"\b(?:priority|priorities|prioritized?|prioridad|prioridades|prioritarios?)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        normalized += (
+            " priority priorities prioritized prioridad prioridades prioritario prioritarios"
+        )
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized if normalized.casefold() != value.strip().casefold() else ""
 
@@ -465,20 +473,41 @@ def _normalized_words(value: str) -> tuple[str, ...]:
 
 
 def _source_route_intent(
-    question: str, available_source_types: tuple[str, ...] = ()
+    question: str,
+    available_source_types: tuple[str, ...] = (),
+    intent_terms: dict[str, tuple[str, ...]] | None = None,
 ) -> str:
     """Classify only the source authority needed; never create answer content."""
 
+    source_types = {value.upper() for value in available_source_types}
+    # A project with no issue tracker cannot have a delivery question. The words
+    # that select DELIVERY are also ordinary store vocabulary, so routing a
+    # documentation-only corpus to ISSUE guarantees an empty result. An empty
+    # set means the vocabulary has not been observed and preserves prior routing.
+    issue_sources_available = not source_types or "ISSUE" in source_types
     normalized = " ".join(_normalized_words(question))
-    if re.search(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]+-\d+(?![A-Za-z0-9])", question):
+
+    def matches(intent: str, default_pattern: str) -> bool:
+        terms = (intent_terms or {}).get(intent)
+        if terms is None:
+            return bool(re.search(default_pattern, normalized))
+        padded = f" {normalized} "
+        return any(
+            f" {' '.join(_normalized_words(term))} " in padded
+            for term in terms
+            if _normalized_words(term)
+        )
+    if issue_sources_available and re.search(
+        r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]+-\d+(?![A-Za-z0-9])", question
+    ):
         return "DELIVERY"
     # An explicit work-item term selects Jira. A bare attribute such as "status"
     # does not: in a follow-up it commonly belongs to the carried code or document
     # entity (for example, an event payload field).
-    explicit_work_item = re.search(
+    explicit_work_item = matches(
+        "DELIVERY",
         r"\b(?:jira|issues?|bugs?|sprints?|delivery|releases?|priority|"
         r"priorities|assignees?|entrega|incidencias?|errores?|prioridad(?:es)?)\b",
-        normalized,
     )
     project_status = re.search(
         r"\b(?:statuses|status|estado)\b.{0,35}\b(?:project|release|delivery|sprint|"
@@ -498,33 +527,32 @@ def _source_route_intent(
         r"recibo|comprobante|papel)\b",
         normalized,
     )
-    if explicit_work_item or project_status:
+    if issue_sources_available and (explicit_work_item or project_status):
         return "DELIVERY"
     if ticket_document_context:
         return "CODE_ASSISTED"
-    if ticket_work_item_context:
+    if issue_sources_available and ticket_work_item_context:
         return "DELIVERY"
     if member_identifiers(question):
         return "CODE_ASSISTED"
-    cross_source_signal = re.search(
+    cross_source_signal = matches(
+        "CROSS_SOURCE",
         r"\b(?:compare|compares|comparison|versus|vs|match|matches|align|alignment|"
         r"differ|differs|difference|architecture|architectural|compara|comparar|"
         r"comparacion|contra|coincide|alineacion|diferencia|arquitectura)\b",
-        normalized,
     )
-    source_types = {value.upper() for value in available_source_types}
     if cross_source_signal and (
         not source_types or {"PAGE", "CODE"} <= source_types
     ):
         return "CROSS_SOURCE"
-    if re.search(
+    if matches(
+        "IMPLEMENTATION",
         r"\b(?:implement|implemented|implementation|code|source code|github|repository|"
         r"class|classes|function|functions|file|files|path|paths|package|"
         r"packages|module|modules|test|tests|configuration|config|dependency|implementa|"
         r"implementado|implementacion|codigo|repositorio|clase|clases|funcion|funciones|"
         r"archivo|archivos|ruta|rutas|paquete|paquetes|modulo|modulos|"
         r"prueba|pruebas|configuracion|dependencia)\b",
-        normalized,
     ):
         return "IMPLEMENTATION"
     # All other project questions inspect documentation and code independently.

@@ -40,7 +40,9 @@ class EvaluationWorkflowMixin:
                 deterministic, (), resolve_response_language(self._request.question)
             )
         clarification = clarification_response(
-            self._request, self._vocabulary.entities
+            self._request,
+            self._vocabulary.entities,
+            getattr(self._vocabulary, "source_types", ()),
         )
         if clarification is not None:
             return WorkflowEvaluationResult(

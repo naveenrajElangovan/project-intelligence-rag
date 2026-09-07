@@ -84,6 +84,22 @@ class ConversationContextUpdate(BaseModel):
     )
 
 
+class RetrievalProfile(BaseModel):
+    """Corpus-shaped breadth controls supplied by trusted project configuration."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    max_chunks_per_source: int = Field(alias="maxChunksPerSource", ge=1, le=50)
+    rerank_top_n: int = Field(alias="rerankTopN", ge=1, le=50)
+    mixed_source_top_n: int = Field(alias="mixedSourceTopN", ge=1, le=50)
+
+    def settings_overrides(self) -> dict[str, int]:
+        return {
+            "max_chunks_per_source": self.max_chunks_per_source,
+            "rerank_top_n": self.rerank_top_n,
+            "mixed_source_top_n": self.mixed_source_top_n,
+        }
+
+
 class RagRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -116,6 +132,10 @@ class RagRequest(BaseModel):
     model_profile: Literal["budget", "standard", "complex"] = Field(
         default="standard", alias="modelProfile"
     )
+    retrieval_profile: RetrievalProfile | None = Field(
+        default=None, alias="retrievalProfile"
+    )
+    catalog_releases_enabled: bool = Field(default=False, alias="catalogReleasesEnabled")
     conversation_history: list[ConversationMessage] = Field(
         default_factory=list, alias="conversationHistory", max_length=12
     )

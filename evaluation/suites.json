@@ -1,0 +1,37 @@
+{
+  "suites": [
+    {
+      "id": "developer_gold",
+      "project_id": "T2.0",
+      "departments": [],
+      "source": {
+        "kind": "qa_pairs",
+        "paths": [
+          "evaluation/gold_suites.jsonl",
+          "evaluation/bilingual_gold_suites.jsonl"
+        ],
+        "languages": ["en", "es"]
+      },
+      "gold": {"granularity": "chunk", "anchor_field": "structure_path"},
+      "gates": {"cross_project_leakage": 0, "cross_department_leakage": 0}
+    },
+    {
+      "id": "store_canonical_questions",
+      "project_id": "T2.0-STORE",
+      "departments": [],
+      "source": {
+        "kind": "canonical_question_index",
+        "paths": ["docs/store-assistant/{lang}/topics/10_*.md"],
+        "languages": ["en", "es"]
+      },
+      "gold": {"granularity": "section", "anchor_field": "structure_leaf"},
+      "gates": {
+        "section_hit_rate_at_16": 0.75,
+        "out_of_scope_answer_rate": 0.05,
+        "refusal_precision": 0.80,
+        "cross_project_leakage": 0,
+        "cross_department_leakage": 0
+      }
+    }
+  ]
+}
