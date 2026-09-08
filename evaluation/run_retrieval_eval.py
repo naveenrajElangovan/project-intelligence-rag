@@ -1301,6 +1301,8 @@ async def _run_generation_lane(
             "answer_style": evaluation_result.answer_style,
             "context_relevance": evaluation_result.context_relevance,
             "answer_relevance": evaluation_result.answer_relevance,
+            "canonical_fallback_used": evaluation_result.canonical_fallback_used,
+            "canonical_fallback_reason": evaluation_result.canonical_fallback_reason,
             "refusal_reason": response.refusal_reason,
             "expected_refusal_reason": case.get("expected_refusal_reason"),
         }

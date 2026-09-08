@@ -8,7 +8,7 @@ from langgraph.config import get_stream_writer
 
 from app.llm import BilingualQueryPlanner, GroundedAnswer, TokenUsage, answer_sentence_floor
 from app.grounding_contract import evidence_facts, render_structured_facts
-from app.telemetry import stage_complete, started
+from app.telemetry import canonical_quote_fallback, stage_complete, started
 from app.table_evidence import contains_table
 from app.workflow_nodes.state import RagState
 from app.workflow_support.citations import (
@@ -54,6 +54,7 @@ from app.workflow_support.deterministic_answers import (
 )
 from app.workflow_support.query_analysis import (
     _add_usage,
+    _normalized_words,
     _overview_repair_kwargs,
     _safe_query_variant,
     _source_authority_valid,
@@ -74,6 +75,46 @@ _ENTITY_STOP_WORDS = {
     "system",
     "the",
 }
+
+
+def _answer_has_minimum_substance(
+    question: str, generated: GroundedAnswer, answer_style: str
+) -> bool:
+    """Reject a quote-only fallback or an answer that merely repeats the question.
+
+    Citation markers and a Markdown heading do not add substance. Canonical quote
+    fallback output is intentionally one quoted evidence line, so it must never be
+    treated as a complete answer. Other answer styles fail only when their remaining
+    body is the normalized question itself.
+    """
+
+    if answer_style == "canonical_quote":
+        return False
+    body_lines = [
+        line.strip()
+        for line in generated.answer.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    body = re.sub(r"\[SOURCE \d+\]", "", " ".join(body_lines)).strip(" .?!¿¡\"'")
+    normalized_body = " ".join(_normalized_words(body))
+    normalized_question = " ".join(_normalized_words(question))
+    return bool(normalized_body) and normalized_body != normalized_question
+
+
+def _model_fallback_reason(generated: GroundedAnswer | None) -> str:
+    """Classify a model result that cannot be used as a substantive answer.
+
+    A missing object and a blank body are empty responses. A body with no
+    citations and explicit missing-information entries is the structured form
+    of a model refusal. A normal grounded answer does not need a fallback.
+    Stream timeouts are classified by the exception handler at the call site.
+    """
+
+    if generated is None or not generated.answer.strip():
+        return "EMPTY_MODEL_RESPONSE"
+    if generated.missing_information and not generated.citations:
+        return "MODEL_REFUSAL"
+    return ""
 
 
 def _normalized_entity(value: object) -> str:
@@ -1584,12 +1625,6 @@ class AnswerNodesMixin:
                 documents,
                 state.get("language", "mixed"),
             )
-        if generated is None:
-            generated = _deterministic_canonical_route_answer(
-                answer_question,
-                documents,
-                state.get("language", "mixed"),
-            )
         if generated is None and coverage_expected_keys:
             generated = _deterministic_population_inventory_answer(
                 coverage_expected_keys, documents
@@ -1601,6 +1636,8 @@ class AnswerNodesMixin:
         ):
             generated = render_structured_facts(evidence_facts(documents))
         deterministic = generated is not None
+        canonical_fallback_used = False
+        canonical_fallback_reason = ""
         generation_temperature = 0.0
         answer_style = "concise"
 
@@ -1712,77 +1749,105 @@ class AnswerNodesMixin:
                 )
                 raise
 
+        model_generation_attempted = generated is None
         if generated is None:
-            if state.get("query_intent") in {
-                "ENTITY_OVERVIEW",
-                "PROJECT_OVERVIEW",
-                "FEATURE_INVENTORY",
-                "IMPLEMENTATION",
-                "DELIVERY",
-                "CODE_ASSISTED",
-                "CROSS_SOURCE",
-                "IMPLEMENTATION_FLOW",
-                "STRUCTURED_INVENTORY",
-            }:
-                intent = state.get("query_intent")
-                answer_style = (
-                    "project_overview"
-                    if intent == "PROJECT_OVERVIEW"
-                    else "feature_inventory"
-                    if intent == "FEATURE_INVENTORY"
-                    else "implementation"
-                    if intent == "IMPLEMENTATION"
-                    else "delivery"
-                    if intent == "DELIVERY"
-                    else "code_assisted"
-                    if intent == "CODE_ASSISTED"
-                    else "code_assisted"
-                    if intent == "IMPLEMENTATION_FLOW"
-                    else "cross_source"
-                    if intent == "CROSS_SOURCE"
-                    else "structured_inventory"
-                    if intent == "STRUCTURED_INVENTORY"
-                    else "entity_overview"
-                )
-                if list_response_requested and intent not in {
+            generation_failure: Exception | None = None
+            try:
+                if state.get("query_intent") in {
                     "ENTITY_OVERVIEW",
                     "PROJECT_OVERVIEW",
+                    "FEATURE_INVENTORY",
+                    "IMPLEMENTATION",
+                    "DELIVERY",
+                    "CODE_ASSISTED",
+                    "CROSS_SOURCE",
+                    "IMPLEMENTATION_FLOW",
+                    "STRUCTURED_INVENTORY",
                 }:
-                    answer_style = "requested_list"
-                if answer_shape_selected in {
-                    "structured_tabular",
-                    "comparison_table",
-                }:
-                    answer_style = answer_shape_selected
-                try:
-                    generated = await generate_model_answer(answer_style)
-                except TypeError as error:
-                    if (
-                        "answer_style" not in str(error)
-                        and "sentence_callback" not in str(error)
-                        and "delta_callback" not in str(error)
-                    ):
-                        raise
-                    generated = await self._generator.answer(
-                        answer_question,
-                        documents,
-                        state.get("language", "mixed"),
+                    intent = state.get("query_intent")
+                    answer_style = (
+                        "project_overview"
+                        if intent == "PROJECT_OVERVIEW"
+                        else "feature_inventory"
+                        if intent == "FEATURE_INVENTORY"
+                        else "implementation"
+                        if intent == "IMPLEMENTATION"
+                        else "delivery"
+                        if intent == "DELIVERY"
+                        else "code_assisted"
+                        if intent == "CODE_ASSISTED"
+                        else "code_assisted"
+                        if intent == "IMPLEMENTATION_FLOW"
+                        else "cross_source"
+                        if intent == "CROSS_SOURCE"
+                        else "structured_inventory"
+                        if intent == "STRUCTURED_INVENTORY"
+                        else "entity_overview"
                     )
-            else:
-                generated = await generate_model_answer(
-                    answer_shape_selected
+                    if list_response_requested and intent not in {
+                        "ENTITY_OVERVIEW",
+                        "PROJECT_OVERVIEW",
+                    }:
+                        answer_style = "requested_list"
                     if answer_shape_selected in {
                         "structured_tabular",
                         "comparison_table",
-                    }
-                    else "requested_list"
-                    if list_response_requested
-                    else "concise"
-                )
+                    }:
+                        answer_style = answer_shape_selected
+                    try:
+                        generated = await generate_model_answer(answer_style)
+                    except TypeError as error:
+                        if (
+                            "answer_style" not in str(error)
+                            and "sentence_callback" not in str(error)
+                            and "delta_callback" not in str(error)
+                        ):
+                            raise
+                        generated = await self._generator.answer(
+                            answer_question,
+                            documents,
+                            state.get("language", "mixed"),
+                        )
+                else:
+                    generated = await generate_model_answer(
+                        answer_shape_selected
+                        if answer_shape_selected in {
+                            "structured_tabular",
+                            "comparison_table",
+                        }
+                        else "requested_list"
+                        if list_response_requested
+                        else "concise"
+                    )
+            except TimeoutError as failure:
+                generation_failure = failure
+                canonical_fallback_reason = "STREAM_TIMEOUT"
             generation_temperature = float(
                 getattr(self._generator, "last_temperature", 0.0)
             )
-        generation_usage = TokenUsage() if deterministic else self._generator.last_usage
+            if not canonical_fallback_reason:
+                canonical_fallback_reason = _model_fallback_reason(generated)
+            if canonical_fallback_reason:
+                canonical = _deterministic_canonical_route_answer(
+                    answer_question,
+                    documents,
+                    state.get("language", "mixed"),
+                )
+                if canonical is not None:
+                    generated = canonical
+                    canonical_fallback_used = True
+                    answer_style = "canonical_quote"
+                    canonical_quote_fallback(canonical_fallback_reason)
+                elif generation_failure is not None:
+                    raise generation_failure
+                elif generated is None:
+                    generated = GroundedAnswer(answer="", citations=[])
+        generation_usage = (
+            TokenUsage()
+            if not model_generation_attempted
+            else getattr(self._generator, "last_usage", TokenUsage())
+        )
+        deterministic = deterministic or canonical_fallback_used
         user_transformation_repaired = False
         # Every repair below is a second full evidence prefill on the one model
         # slot, and each is retried. They can chain, so the budget is shared:
@@ -1903,6 +1968,8 @@ class AnswerNodesMixin:
             reason_code=(
                 f"{getattr(self._generator, 'last_stream_timeout_kind', '').upper()}_PARTIAL"
                 if getattr(self._generator, "last_stream_truncated", False)
+                else f"CANONICAL_QUOTE_FALLBACK_{canonical_fallback_reason}"
+                if canonical_fallback_used
                 else "FEATURE_INVENTORY_EXTRACTION"
                 if state.get("query_intent") == "FEATURE_INVENTORY"
                 else "CODE_INVENTORY_EXTRACTION"
@@ -1927,7 +1994,9 @@ class AnswerNodesMixin:
             ),
             model_provider="deterministic" if deterministic else self._settings.llm_provider,
             model_name=(
-                "jira-metadata-extractor"
+                "canonical-quote-extractor"
+                if canonical_fallback_used
+                else "jira-metadata-extractor"
                 if state.get("query_intent") == "DELIVERY" and deterministic
                 else "code-location-extractor"
                 if state.get("query_intent") == "IMPLEMENTATION" and deterministic
@@ -1986,6 +2055,8 @@ class AnswerNodesMixin:
                 "stream_truncated": int(
                     getattr(self._generator, "last_stream_truncated", False)
                 ),
+                "canonical_fallback_used": int(canonical_fallback_used),
+                "canonical_fallback_reason": canonical_fallback_reason,
                 **answer_shape_metrics(generated.answer),
             },
             **generation_usage.model_dump(),
@@ -1994,6 +2065,8 @@ class AnswerNodesMixin:
             "generated": generated,
             "documents": documents,
             "answer_style": answer_style,
+            "canonical_fallback_used": canonical_fallback_used,
+            "canonical_fallback_reason": canonical_fallback_reason,
             "coverage_expected": len(coverage_expected_keys),
             "coverage_expected_identifiers": coverage_expected_keys,
             "coverage_covered": len(coverage_expected_keys) - len(coverage_missing),
@@ -2194,6 +2267,36 @@ class AnswerNodesMixin:
     async def _verify_grounding(self, state: RagState) -> RagState:
         began = started()
         answer_question = state.get("resolved_question") or self._request.question
+        if not _answer_has_minimum_substance(
+            answer_question,
+            state["generated"],
+            state.get("answer_style", "concise"),
+        ):
+            stage_complete(
+                "verify_grounding",
+                self._request.project_id,
+                began,
+                input_count=len(state["generated"].citations),
+                output_count=0,
+                reason_code="INSUFFICIENT_ANSWER_SUBSTANCE",
+                model_provider="deterministic",
+                model_name="minimum-substance-gate",
+                model_profile="grounding",
+                language=state.get("language", "und"),
+                extra={
+                    "canonical_fallback_used": int(
+                        state.get("canonical_fallback_used", False)
+                    ),
+                    "canonical_fallback_reason": str(
+                        state.get("canonical_fallback_reason") or ""
+                    ),
+                },
+            )
+            return {
+                "grounded": False,
+                "grounding_reason": "INSUFFICIENT_ANSWER_SUBSTANCE",
+                "answer_relevance": 0.0,
+            }
         if state.get("query_intent") == "IMPLEMENTATION":
             expected = _deterministic_code_location_answer(
                 answer_question,

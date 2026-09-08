@@ -16,6 +16,8 @@ class RagState(TypedDict, total=False):
     documents: list[Document]
     generated: GroundedAnswer
     answer_style: str
+    canonical_fallback_used: bool
+    canonical_fallback_reason: str
     retrieval_attempt: int
     repaired: bool
     grounded: bool

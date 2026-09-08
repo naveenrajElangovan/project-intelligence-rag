@@ -1544,6 +1544,65 @@ def test_canonical_route_answer_copies_the_topical_instruction() -> None:
     assert workflow_module._citations_valid(answer, 1)
 
 
+def test_canonical_quote_is_not_a_substantive_answer() -> None:
+    from app.workflow_nodes.answering import _answer_has_minimum_substance
+
+    quoted = GroundedAnswer(
+        answer="### How do I reprint a ticket?\nSelect Reprint [SOURCE 1].",
+        citations=[1],
+    )
+
+    assert not _answer_has_minimum_substance(
+        "How do I reprint a ticket?", quoted, "canonical_quote"
+    )
+
+
+def test_question_echo_is_not_a_substantive_answer() -> None:
+    from app.workflow_nodes.answering import _answer_has_minimum_substance
+
+    echoed = GroundedAnswer(
+        answer="The table is empty. [SOURCE 1]",
+        citations=[1],
+    )
+    substantive = GroundedAnswer(
+        answer="The table is empty because no matching records are available [SOURCE 1].",
+        citations=[1],
+    )
+
+    assert not _answer_has_minimum_substance(
+        "The table is empty.", echoed, "concise"
+    )
+    assert _answer_has_minimum_substance(
+        "Why is the table empty?", substantive, "concise"
+    )
+
+
+def test_model_fallback_reason_distinguishes_empty_and_refusal() -> None:
+    from app.workflow_nodes.answering import _model_fallback_reason
+
+    assert _model_fallback_reason(None) == "EMPTY_MODEL_RESPONSE"
+    assert (
+        _model_fallback_reason(GroundedAnswer(answer="  ", citations=[]))
+        == "EMPTY_MODEL_RESPONSE"
+    )
+    assert (
+        _model_fallback_reason(
+            GroundedAnswer(
+                answer="I cannot answer from this evidence.",
+                citations=[],
+                missing_information=["A matching procedure is required."],
+            )
+        )
+        == "MODEL_REFUSAL"
+    )
+    assert (
+        _model_fallback_reason(
+            GroundedAnswer(answer="Use Reprint [SOURCE 1].", citations=[1])
+        )
+        == ""
+    )
+
+
 def test_general_code_question_keeps_relevant_source_file_ahead_of_readme(
     monkeypatch,
 ) -> None:

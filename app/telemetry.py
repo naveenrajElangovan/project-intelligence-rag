@@ -90,6 +90,11 @@ _CODE_REQUIRED_ZERO = Counter(
     "Code-required requests that retrieved no CODE candidates.",
     ("query_intent",),
 )
+_CANONICAL_QUOTE_FALLBACKS = Counter(
+    "pi_rag_canonical_quote_fallback_total",
+    "Canonical quote fallbacks used after answer generation did not produce an answer.",
+    ("reason",),
+)
 _REQUEST_ADMISSIONS = Counter(
     "pi_rag_request_admissions_total",
     "RAG requests accepted or shed at the capacity boundary.",
@@ -163,6 +168,17 @@ def admission_capacity(capacity: int) -> None:
 
 def lexical_cache_entries(size: int) -> None:
     _LEXICAL_CACHE_ENTRIES.set(max(0, size))
+
+
+def canonical_quote_fallback(reason: str) -> None:
+    """Count why the canonical quote fallback was selected.
+
+    The reason is deliberately a small machine code rather than answer content,
+    so operators can distinguish timeouts, empty responses, refusals, and the
+    legacy pre-generation path without placing user text in telemetry.
+    """
+
+    _CANONICAL_QUOTE_FALLBACKS.labels(reason).inc()
 
 
 def request_admitted(began: float) -> None:

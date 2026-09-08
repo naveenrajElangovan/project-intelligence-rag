@@ -280,7 +280,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
                     "FRESHNESS_NOT_VERIFIABLE",
                     "REQUESTED_COVERAGE_INCOMPLETE",
                     "UNSUPPORTED_CLAIM",
-                    "INVALID_DERIVATION",
+                    "INVALID_DERIVATION", "INSUFFICIENT_ANSWER_SUBSTANCE",
                 }
                 else "POPULATION_RETRIEVAL_MISS"
                 if population_miss

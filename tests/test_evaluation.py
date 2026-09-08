@@ -720,6 +720,33 @@ def test_refusal_quality_metrics_are_reported_per_language() -> None:
     assert dashboard["out_of_scope_answer_rate.es"] == 1
 
 
+def test_generation_score_reports_canonical_fallback_impact() -> None:
+    rows = [
+        {
+            "query_language": "en",
+            "answerable": False,
+            "answered": True,
+            "cited_source_ids": ["page-1"],
+            "canonical_fallback_used": True,
+            "canonical_fallback_reason": "EMPTY_MODEL_RESPONSE",
+        },
+        {
+            "query_language": "en",
+            "answerable": False,
+            "answered": False,
+            "cited_source_ids": [],
+            "canonical_fallback_used": False,
+        },
+    ]
+
+    summary = score_generation(rows)
+
+    assert summary["canonical_fallback_cases"] == 1
+    assert summary["canonical_fallback_reasons"] == {"EMPTY_MODEL_RESPONSE": 1}
+    assert summary["out_of_scope_answer_rate"] == 0.5
+    assert summary["out_of_scope_answer_rate_excluding_canonical_fallback"] == 0
+
+
 def test_default_suite_has_bilingual_fast_lane_and_negative_reasons() -> None:
     cases = _load_evaluation_cases(EVALUATION / "gold_suites.jsonl")
     fast_lane = [case for case in cases if case.get("evaluation_lane") != "generation"]

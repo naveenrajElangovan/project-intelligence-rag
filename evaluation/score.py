@@ -1,6 +1,7 @@
 """Score captured evaluation results without sending content to another service."""
 
 import argparse
+from collections import Counter
 import json
 import math
 from pathlib import Path
@@ -282,6 +283,23 @@ def score_generation(
     citations_valid = sum(int(row.get("valid_citation_count") or 0) for row in rows)
     citations_total = sum(len(row.get("cited_source_ids", [])) for row in rows)
     false_positives = sum(bool(row.get("answered")) for row in no_answer)
+    no_answer_without_fallback = [
+        row for row in no_answer if not row.get("canonical_fallback_used")
+    ]
+    false_positives_without_fallback = sum(
+        bool(row.get("answered")) for row in no_answer_without_fallback
+    )
+    canonical_fallback_rows = [
+        row for row in rows if row.get("canonical_fallback_used")
+    ]
+    canonical_fallback_reasons = dict(
+        sorted(
+            Counter(
+                str(row.get("canonical_fallback_reason") or "UNCLASSIFIED")
+                for row in canonical_fallback_rows
+            ).items()
+        )
+    )
     true_refusals = sum(not bool(row.get("answered")) for row in no_answer)
     refusals = sum(not bool(row.get("answered")) for row in rows)
     reason_cases = [row for row in no_answer if row.get("expected_refusal_reason")]
@@ -318,6 +336,13 @@ def score_generation(
         "citation_precision": citations_valid / citations_total if citations_total else 0,
         "refusal_precision": true_refusals / refusals if refusals else 0,
         "out_of_scope_answer_rate": false_positives / len(no_answer) if no_answer else 0,
+        "out_of_scope_answer_rate_excluding_canonical_fallback": (
+            false_positives_without_fallback / len(no_answer_without_fallback)
+            if no_answer_without_fallback
+            else 0
+        ),
+        "canonical_fallback_cases": len(canonical_fallback_rows),
+        "canonical_fallback_reasons": canonical_fallback_reasons,
         "refusal_reason_accuracy": correct_reasons / len(reason_cases) if reason_cases else 0,
         "paraphrase_groups": len(paraphrase_groups),
         "paraphrase_divergent_groups": divergent_groups,

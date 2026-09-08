@@ -22,6 +22,8 @@ class WorkflowEvaluationResult:
     answer_style: str = ""
     context_relevance: float = -1.0
     answer_relevance: float = -1.0
+    canonical_fallback_used: bool = False
+    canonical_fallback_reason: str = ""
 
 
 class EvaluationWorkflowMixin:
@@ -69,4 +71,8 @@ class EvaluationWorkflowMixin:
             answer_style=str(state.get("answer_style") or ""),
             context_relevance=float(state.get("context_relevance", -1.0)),
             answer_relevance=float(state.get("answer_relevance", -1.0)),
+            canonical_fallback_used=bool(state.get("canonical_fallback_used", False)),
+            canonical_fallback_reason=str(
+                state.get("canonical_fallback_reason") or ""
+            ),
         )
