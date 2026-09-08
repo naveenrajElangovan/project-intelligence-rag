@@ -110,6 +110,20 @@ Earned the hard way; they are not negotiable.
 6. Verify with a live count, never with a tool's own success flag.
 7. One project, one provider, per pass. `T2.0-STORE` before `T2.0`.
 8. On any gate failure: stop and report. Never work around, never retry blindly.
+9. **Order of enablement for any access-scoping change — learned from the 2026-09-08 incident.**
+   A label that no caller's token can match does not protect a document, it **hides** it.
+   The only safe order is: **(a)** the backend mints the scope, **(b)** the directory assigns
+   the attribute to a real user, **(c)** verify a live user receives the scope, **(d)** only
+   then stamp documents with it. Never stamp first. The proof that (a)–(c) hold is a live
+   question from the real account, not a unit test.
+10. **Chroma is busy, not dead, after a large delete.** Deleting hundreds of vectors blocks
+   the heartbeat while the index rebuilds — measured at roughly 90 seconds, recovering on the
+   sixth 30-second attempt, with `RestartCount 0` and no OOM or panic in the logs. Diagnose
+   with `docker ps -a`, `docker logs`, `docker stats` and a bounded retry **before**
+   concluding anything is broken. Restoring a backup over a merely busy database is how a
+   recoverable pause becomes a real outage.
+11. **A verification script that prints nothing has failed, not passed.** Every gate script
+   emits an explicit result and exits non-zero when its dependency is unreachable.
 
 ## 5. State of play
 
@@ -124,6 +138,9 @@ Earned the hard way; they are not negotiable.
 | Purge → re-ingest → restore loop for `T2.0-STORE / CONFLUENCE` | proven end to end, 619 chunks / 24 sources restored |
 | Backups | 139 MB copy + 57 MB archive, SHA-256 recorded, held outside git |
 | `T2.0` | untouched, 5,132 chunks / 1,042 sources |
+| **Dark-corpus incident, 2026-09-08 — closed** | Department rules were seeded and the corpus re-stamped before the backend could mint a `department:` scope. 424 of 619 chunks became invisible to `store_user`, proven live: *"sobre el cierre de caja"* returned confidence `NONE`. The rules themselves were correct — a page-by-page prediction matched Chroma exactly, 195 shared + 424 department = 619. **The sequence was wrong, not the rules.** Recovered by removing the rules from the control plane, purging and re-ingesting; `T2.0` never touched. The same question now answers at confidence `MEDIUM` from a fresh chat. Rule 9 in section 4 exists because of this |
+| Store corpus, current | 619 chunks / 24 sources / schema 3, **100% `project:T2.0-STORE`**, live-verified through the real store account |
+| Control plane, current | both projects hold `source_access_rules=[]` — verified directly in `.local-sql/control-plane.db` |
 
 **Reported by the implementing agent, not yet independently verified:** evaluation registry,
 section-level metrics, 220-case stratified sampling, department/language metric splits,
@@ -148,6 +165,8 @@ department onboarding runbook, and the test counts (RAG 840, backend 124).
 | Spanish ranking gap on `T2.0` (`ndcg@16` 0.175 es vs 0.407 en on equal recall) | open |
 | Backend `/v1/me` orders assignments by `display_name` | open, now cosmetic — the client no longer auto-selects |
 | Release compose Chroma mount | fixed in the file; **must be rolled out to production with a data migration first**, or recreating that container destroys its index |
+| **`config/local-project.T2.0-STORE.json` still holds the 8 department rules** | **open — a loaded gun.** The control plane is clean, but `scripts/seed_project_record.py` and `repair_local_project.sh` push that file into it. The next repair silently re-arms the dark-corpus regression. Move the rules to a clearly-named pending file the seeder does not read, until rule 9's preconditions (a)–(c) hold |
+| Backend does not mint `department:` scopes for a real user | **open, and it is the precondition for everything department-related.** `store_user` receives `project:T2.0-STORE`, `user:<oid>`, `role:T2.0-STORE:STORE_USER` — no department. Entra must carry the attribute and `chat_policy.retrieval_policies` must mint it, both verified live, before any document is stamped again |
 | Code structure standard (`38_…`) and documentation standard (`01_…`) | written, not started |
 
 ## 7. The document set
