@@ -260,18 +260,17 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
             usage = TokenUsage()
             model_provider = "none"
             model_name = "none"
-            # "Nothing was retrieved" and "material was retrieved but the claims
-            # written from it could not be verified" are different failures with
-            # different fixes -- indexing versus phrasing -- and used to produce
-            # the same message, which made the second look like the first.
             unverified = bool(documents) and state.get("grounded") is False and state.get("grounding_reason") != "INCOMPLETE_EVIDENCE"
             population_miss = bool(state.get("coverage_expected")) and bool(
                 state.get("population_retrieval_miss")
             )
             gate_reason = str(state.get("grounding_reason") or "") if state.get("output_gate_applied") else ""
+            generated_refusal_reason = generated.refusal_reason if generated is not None and generated.outcome == "REFUSAL" else None
             refusal_reason = (
                 "ENTITY_MISMATCH"
                 if state.get("entity_mismatch_requested")
+                else generated_refusal_reason
+                if generated_refusal_reason
                 else gate_reason
                 if gate_reason in {
                     "UNRESOLVED_SOURCE_CONFLICT",

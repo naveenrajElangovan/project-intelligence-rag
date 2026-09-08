@@ -15,7 +15,7 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.config import Settings, get_settings
 from app.workflow_support.language import DEFAULT_RESPONSE_LANGUAGE, language_name
@@ -233,6 +233,24 @@ class ConversationResolution(BaseModel):
 
 
 class GroundedAnswer(BaseModel):
+    outcome: Literal["ANSWER", "REFUSAL"] = Field(
+        default="ANSWER",
+        description=(
+            "ANSWER when the response provides requested information. REFUSAL when the "
+            "response declines the request, even if it also redirects the user."
+        ),
+    )
+    refusal_reason: Literal[
+        "SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"
+    ] | None = Field(
+        default=None,
+        description=(
+            "Required for REFUSAL: SOURCE_SCOPE_VIOLATION for requests outside the "
+            "authorized project-assistance boundary, UNVERIFIED_EVIDENCE for an in-project "
+            "request whose requested detail is not established by the supplied evidence, "
+            "otherwise INSUFFICIENT_EVIDENCE."
+        ),
+    )
     answer: str = Field(
         description=(
             "A concise grounded answer where every material sentence ends with one or more "
@@ -247,6 +265,16 @@ class GroundedAnswer(BaseModel):
         ),
     )
     missing_information: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_typed_outcome(self) -> "GroundedAnswer":
+        """Keep answer/refusal state explicit and internally consistent."""
+
+        if self.outcome == "REFUSAL" and self.refusal_reason is None:
+            raise ValueError("A REFUSAL outcome requires refusal_reason")
+        if self.outcome == "ANSWER" and self.refusal_reason is not None:
+            raise ValueError("An ANSWER outcome cannot carry refusal_reason")
+        return self
 
 
 class ClaimRejection(BaseModel):
@@ -790,8 +818,17 @@ class LangChainGroundedAnswerGenerator:
                     "Every material sentence "
                     "MUST end with one or more exact citations such as [SOURCE 1]. The citations array "
                     "MUST contain each one-based SOURCE number used in the answer. Never return a "
-                    "factual answer with an empty citations array. Do not infer a conclusion unless it is "
-                    "reproducible from cited facts and begins `Inference (<derivation rule>):`. If evidence is insufficient, say so "
+                    "factual answer with an empty citations array. "
+                    "Classify the result explicitly. If you decline the request in prose, set outcome to "
+                    "REFUSAL and set refusal_reason to SOURCE_SCOPE_VIOLATION for a request outside the "
+                    "authorized project-assistance boundary, UNVERIFIED_EVIDENCE for an in-project request "
+                    "whose requested detail is not established by the supplied evidence, or "
+                    "INSUFFICIENT_EVIDENCE when no sufficient answer can be produced. A refusal remains "
+                    "REFUSAL even when it redirects the user "
+                    "to supported topics. For a substantive answer, set outcome to ANSWER and refusal_reason "
+                    "to null. "
+                    "Do not infer a conclusion unless it is reproducible from cited facts and begins "
+                    "`Inference (<derivation rule>):`. If evidence is insufficient, say so "
                     "without factual claims and list what is missing. Return only the schema.",
                 ),
                 (

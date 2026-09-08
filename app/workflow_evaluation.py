@@ -24,6 +24,8 @@ class WorkflowEvaluationResult:
     answer_relevance: float = -1.0
     canonical_fallback_used: bool = False
     canonical_fallback_reason: str = ""
+    generated_outcome: str = ""
+    generated_refusal_reason: str = ""
 
 
 class EvaluationWorkflowMixin:
@@ -74,5 +76,9 @@ class EvaluationWorkflowMixin:
             canonical_fallback_used=bool(state.get("canonical_fallback_used", False)),
             canonical_fallback_reason=str(
                 state.get("canonical_fallback_reason") or ""
+            ),
+            generated_outcome=str(state.get("generated_outcome") or ""),
+            generated_refusal_reason=str(
+                state.get("generated_refusal_reason") or ""
             ),
         )

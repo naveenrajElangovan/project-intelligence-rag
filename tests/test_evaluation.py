@@ -701,6 +701,7 @@ def test_refusal_quality_metrics_are_reported_per_language() -> None:
             "query_language": "en",
             "answerable": False,
             "answered": False,
+            "refusal_reason": "SOURCE_SCOPE_VIOLATION",
             "cited_source_ids": [],
         },
         {
@@ -734,6 +735,7 @@ def test_generation_score_reports_canonical_fallback_impact() -> None:
             "query_language": "en",
             "answerable": False,
             "answered": False,
+            "refusal_reason": "INSUFFICIENT_EVIDENCE",
             "cited_source_ids": [],
             "canonical_fallback_used": False,
         },
@@ -744,7 +746,61 @@ def test_generation_score_reports_canonical_fallback_impact() -> None:
     assert summary["canonical_fallback_cases"] == 1
     assert summary["canonical_fallback_reasons"] == {"EMPTY_MODEL_RESPONSE": 1}
     assert summary["out_of_scope_answer_rate"] == 0.5
+    assert summary["legacy_out_of_scope_answer_rate"] == 0.5
     assert summary["out_of_scope_answer_rate_excluding_canonical_fallback"] == 0
+
+
+def test_real_prose_refusals_are_scored_from_typed_outcomes() -> None:
+    rows = [
+        {
+            "id": "store-en-184",
+            "query_language": "en",
+            "answerable": False,
+            "answered": True,
+            "refusal_reason": "SOURCE_SCOPE_VIOLATION",
+            "answer": (
+                "I cannot help with Windows, Android, or macOS because this assistant "
+                "covers only visible POS and BOT operation and troubleshooting for Linux "
+                "stores. I can instead help with access, sales, payments, printing, "
+                "merchandise, inventory, orders, cash, and closure."
+            ),
+        },
+        {
+            "id": "store-es-182",
+            "query_language": "es",
+            "answerable": False,
+            "answered": True,
+            "refusal_reason": "UNVERIFIED_EVIDENCE",
+            "answer": (
+                "No puedo proporcionarte instrucciones para instalar o desplegar Tiendas "
+                "2.0 Linux, ya que el asistente est\u00e1 dise\u00f1ado exclusivamente para ayudar "
+                "con la operaci\u00f3n visible de puntos de venta (POS) y botellas (BOT), as\u00ed "
+                "como para solucionar problemas en tiendas Linux."
+            ),
+        },
+        {
+            "id": "store-es-184",
+            "query_language": "es",
+            "answerable": False,
+            "answered": True,
+            "refusal_reason": "SOURCE_SCOPE_VIOLATION",
+            "answer": (
+                "No puedo ayudarte con Windows, Android o macOS porque este asistente solo "
+                "cubre la operaci\u00f3n y soluci\u00f3n de problemas visibles de POS y BOT en "
+                "tiendas Linux. Si necesitas asistencia, por favor consulta temas "
+                "relacionados con acceso, ventas, pagos, impresi\u00f3n, mercanc\u00eda, inventario, "
+                "pedidos, efectivo o cierres de Tiendas 2.0 Linux."
+            ),
+        },
+    ]
+
+    summary = score_generation(rows)
+
+    assert summary["legacy_out_of_scope_answer_rate"] == 1
+    assert summary["out_of_scope_answer_rate"] == 0
+    assert summary["refusal_precision"] == 1
+    assert summary["by_query_language"]["en"]["out_of_scope_answer_rate"] == 0
+    assert summary["by_query_language"]["es"]["out_of_scope_answer_rate"] == 0
 
 
 def test_default_suite_has_bilingual_fast_lane_and_negative_reasons() -> None:

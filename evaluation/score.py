@@ -282,12 +282,15 @@ def score_generation(
     accepted = sum(bool(row.get("grounding_accepted")) for row in answerable)
     citations_valid = sum(int(row.get("valid_citation_count") or 0) for row in rows)
     citations_total = sum(len(row.get("cited_source_ids", [])) for row in rows)
-    false_positives = sum(bool(row.get("answered")) for row in no_answer)
+    def typed_refusal(row: dict[str, object]) -> bool:
+        return bool(str(row.get("refusal_reason") or "").strip())
+    legacy_false_positives = sum(bool(row.get("answered")) for row in no_answer)
+    false_positives = sum(not typed_refusal(row) for row in no_answer)
     no_answer_without_fallback = [
         row for row in no_answer if not row.get("canonical_fallback_used")
     ]
     false_positives_without_fallback = sum(
-        bool(row.get("answered")) for row in no_answer_without_fallback
+        not typed_refusal(row) for row in no_answer_without_fallback
     )
     canonical_fallback_rows = [
         row for row in rows if row.get("canonical_fallback_used")
@@ -300,8 +303,10 @@ def score_generation(
             ).items()
         )
     )
-    true_refusals = sum(not bool(row.get("answered")) for row in no_answer)
-    refusals = sum(not bool(row.get("answered")) for row in rows)
+    true_refusals = sum(typed_refusal(row) for row in no_answer)
+    refusals = sum(typed_refusal(row) for row in rows)
+    legacy_true_refusals = sum(not bool(row.get("answered")) for row in no_answer)
+    legacy_refusals = sum(not bool(row.get("answered")) for row in rows)
     reason_cases = [row for row in no_answer if row.get("expected_refusal_reason")]
     correct_reasons = sum(
         row.get("refusal_reason") == row.get("expected_refusal_reason")
@@ -335,7 +340,13 @@ def score_generation(
         "grounding_acceptance_rate": accepted / len(answerable) if answerable else 0,
         "citation_precision": citations_valid / citations_total if citations_total else 0,
         "refusal_precision": true_refusals / refusals if refusals else 0,
+        "legacy_refusal_precision": (
+            legacy_true_refusals / legacy_refusals if legacy_refusals else 0
+        ),
         "out_of_scope_answer_rate": false_positives / len(no_answer) if no_answer else 0,
+        "legacy_out_of_scope_answer_rate": (
+            legacy_false_positives / len(no_answer) if no_answer else 0
+        ),
         "out_of_scope_answer_rate_excluding_canonical_fallback": (
             false_positives_without_fallback / len(no_answer_without_fallback)
             if no_answer_without_fallback

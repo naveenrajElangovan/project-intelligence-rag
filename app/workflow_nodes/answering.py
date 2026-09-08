@@ -112,6 +112,8 @@ def _model_fallback_reason(generated: GroundedAnswer | None) -> str:
 
     if generated is None or not generated.answer.strip():
         return "EMPTY_MODEL_RESPONSE"
+    if generated.outcome == "REFUSAL":
+        return ""
     if generated.missing_information and not generated.citations:
         return "MODEL_REFUSAL"
     return ""
@@ -2067,6 +2069,8 @@ class AnswerNodesMixin:
             "answer_style": answer_style,
             "canonical_fallback_used": canonical_fallback_used,
             "canonical_fallback_reason": canonical_fallback_reason,
+            "generated_outcome": generated.outcome,
+            "generated_refusal_reason": generated.refusal_reason or "",
             "coverage_expected": len(coverage_expected_keys),
             "coverage_expected_identifiers": coverage_expected_keys,
             "coverage_covered": len(coverage_expected_keys) - len(coverage_missing),
@@ -2164,6 +2168,23 @@ class AnswerNodesMixin:
     async def _validate_citations(self, state: RagState) -> RagState:
         began = started()
         generated = state["generated"]
+        if generated.outcome == "REFUSAL":
+            reason = generated.refusal_reason or "INSUFFICIENT_EVIDENCE"
+            stage_complete(
+                "validate_citations",
+                self._request.project_id,
+                began,
+                input_count=len(generated.citations),
+                output_count=0,
+                reason_code=f"TYPED_REFUSAL_{reason}",
+                language=state.get("language", "und"),
+            )
+            return {
+                "repaired": False,
+                "grounded": False,
+                "grounding_reason": reason,
+                "generated_refusal_reason": reason,
+            }
         if _citations_valid(generated, len(state["documents"])):
             stage_complete(
                 "validate_citations",
@@ -2267,6 +2288,30 @@ class AnswerNodesMixin:
     async def _verify_grounding(self, state: RagState) -> RagState:
         began = started()
         answer_question = state.get("resolved_question") or self._request.question
+        if state["generated"].outcome == "REFUSAL":
+            reason = (
+                state["generated"].refusal_reason
+                or state.get("generated_refusal_reason")
+                or "INSUFFICIENT_EVIDENCE"
+            )
+            stage_complete(
+                "verify_grounding",
+                self._request.project_id,
+                began,
+                input_count=len(state["generated"].citations),
+                output_count=0,
+                reason_code=f"TYPED_REFUSAL_{reason}",
+                model_provider="deterministic",
+                model_name="typed-outcome-gate",
+                model_profile="grounding",
+                language=state.get("language", "und"),
+            )
+            return {
+                "grounded": False,
+                "grounding_reason": reason,
+                "answer_relevance": 0.0,
+                "generated_refusal_reason": reason,
+            }
         if not _answer_has_minimum_substance(
             answer_question,
             state["generated"],

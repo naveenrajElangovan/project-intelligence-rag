@@ -18,6 +18,8 @@ class RagState(TypedDict, total=False):
     answer_style: str
     canonical_fallback_used: bool
     canonical_fallback_reason: str
+    generated_outcome: str
+    generated_refusal_reason: str
     retrieval_attempt: int
     repaired: bool
     grounded: bool
