@@ -757,3 +757,31 @@ def test_store_generation_sample_never_injects_developer_paraphrases() -> None:
     assert not any(case.get("paraphrase_group") for case in sample)
     assert {case.get("query_language") for case in sample} == {"en", "es"}
     assert {case.get("answerable") for case in sample} == {True, False}
+
+
+def test_store_generation_sample_covers_every_routed_section_in_both_languages() -> None:
+    cases, _ = build_registered_suites(
+        project_id="T2.0-STORE",
+        department="STORE_OPERATIONS",
+    )
+    sample = _generation_sample(cases, 220, project_id="T2.0-STORE")
+
+    expected_pairs = {
+        (case["query_language"], section_id)
+        for case in cases
+        if case.get("answerable") is True
+        for section_id in case.get("gold_section_ids", [])
+    }
+    sampled_pairs = {
+        (case["query_language"], section_id)
+        for case in sample
+        if case.get("answerable") is True
+        for section_id in case.get("gold_section_ids", [])
+    }
+
+    assert len(sample) == 220
+    assert sum(case.get("query_language") == "en" for case in sample) == 110
+    assert sum(case.get("query_language") == "es" for case in sample) == 110
+    assert sampled_pairs == expected_pairs
+    assert len(sampled_pairs) == 260
+    assert sum(case.get("answerable") is False for case in sample) == 12
