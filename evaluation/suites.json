@@ -18,7 +18,7 @@
     {
       "id": "store_canonical_questions",
       "project_id": "T2.0-STORE",
-      "departments": [],
+      "departments": ["STORE_OPERATIONS"],
       "source": {
         "kind": "canonical_question_index",
         "paths": ["docs/store-assistant/{lang}/topics/10_*.md"],

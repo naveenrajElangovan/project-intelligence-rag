@@ -143,6 +143,18 @@ def test_ninth_department_suite_is_registry_only_configuration(tmp_path) -> None
     assert {case["department"] for case in cases} == {"NINTH_DEPARTMENT"}
     assert suites[0]["gates"]["cross_department_leakage"] == 0
 
+
+def test_store_registry_supports_store_operations_visibility() -> None:
+    cases, suites = build_registered_suites(
+        project_id="T2.0-STORE",
+        department="STORE_OPERATIONS",
+    )
+
+    assert len(cases) == 368
+    assert {case["department"] for case in cases} == {"STORE_OPERATIONS"}
+    assert [suite["id"] for suite in suites] == ["store_canonical_questions"]
+
+
 def test_store_out_of_scope_cases_feed_bilingual_refusal_metrics() -> None:
     cases = build_store_canonical_suite(
         STORE_DOCS / "en/topics/10_CANONICAL_QUESTION_INDEX.md",
