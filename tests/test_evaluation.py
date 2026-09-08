@@ -601,9 +601,11 @@ def test_generation_lane_always_captures_local_pairwise_content(
         evidenceStatus="SUFFICIENT",
     )
 
+    captured_requests = []
+
     class FakeWorkflow:
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, _settings, request):
+            captured_requests.append(request)
 
         async def run_for_evaluation(self):
             return WorkflowEvaluationResult(
@@ -631,6 +633,7 @@ def test_generation_lane_always_captures_local_pairwise_content(
                     "question": "Local question",
                     "answerable": True,
                     "query_language": "en",
+                    "department": "STORE_OPERATIONS",
                 }
             ],
             settings=settings,
@@ -645,6 +648,10 @@ def test_generation_lane_always_captures_local_pairwise_content(
     assert rows[0]["answer_style"] == "direct"
     assert rows[0]["context_relevance"] == 0.42
     assert rows[0]["answer_relevance"] == 0.73
+    assert captured_requests[0].access_policy_ids == [
+        "project:T2.0",
+        "department:T2.0:STORE_OPERATIONS",
+    ]
 
 
 def test_generation_metrics_report_paraphrase_divergence() -> None:

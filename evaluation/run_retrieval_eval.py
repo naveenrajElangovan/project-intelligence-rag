@@ -1258,6 +1258,10 @@ async def _run_generation_lane(
     for position, case in enumerate(cases, start=1):
         if str(case.get("id")) in completed:
             continue
+        access_policy_ids = [f"project:{project_id}"]
+        department = str(case.get("department") or "").strip()
+        if department:
+            access_policy_ids.append(f"department:{project_id}:{department}")
         request = RagRequest(
             projectId=project_id,
             collectionName=settings.chroma_collection,
@@ -1266,7 +1270,7 @@ async def _run_generation_lane(
             embeddingModel=settings.supported_embedding_models[0],
             schemaVersion=settings.supported_schema_versions[0],
             question=str(case["question"]),
-            accessPolicyIds=[f"project:{project_id}"],
+            accessPolicyIds=access_policy_ids,
             modelProfile="budget",
         )
         evaluation_result = await AuthorizedRagWorkflow(
