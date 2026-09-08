@@ -232,6 +232,23 @@ class ConversationResolution(BaseModel):
     standalone_question: str = Field(min_length=2, max_length=4000)
 
 
+class AnswerOutcome(BaseModel):
+    """Typed disposition for a streamed prose answer."""
+
+    outcome: Literal["ANSWER", "REFUSAL"]
+    refusal_reason: Literal[
+        "SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_typed_outcome(self) -> "AnswerOutcome":
+        if self.outcome == "REFUSAL" and self.refusal_reason is None:
+            raise ValueError("A REFUSAL outcome requires refusal_reason")
+        if self.outcome == "ANSWER" and self.refusal_reason is not None:
+            raise ValueError("An ANSWER outcome cannot carry refusal_reason")
+        return self
+
+
 class GroundedAnswer(BaseModel):
     outcome: Literal["ANSWER", "REFUSAL"] = Field(
         default="ANSWER",
@@ -910,8 +927,30 @@ class LangChainGroundedAnswerGenerator:
                     self.last_time_to_first_chunk_seconds = (
                         stream_timing.time_to_first_chunk_seconds
                     )
-                self.last_answer_metadata_seconds = 0.0
+                metadata_began = time.perf_counter()
+                outcome_prompt = ChatPromptTemplate.from_messages(
+                    [
+                        (
+                            "system",
+                            "Classify the response disposition only; do not add or verify facts. "
+                            "Use REFUSAL whenever the response declines the request, including when "
+                            "it redirects to supported topics. Use SOURCE_SCOPE_VIOLATION when the "
+                            "request is outside the authorized assistance boundary, "
+                            "UNVERIFIED_EVIDENCE for an in-project detail not established by evidence, "
+                            "and INSUFFICIENT_EVIDENCE for any other inability to answer.",
+                        ),
+                        ("human", "QUESTION:\n{question}\n\nRESPONSE:\n{response}"),
+                    ]
+                )
+                outcome, outcome_usage = await _invoke_with_usage(
+                    outcome_prompt | model.with_structured_output(AnswerOutcome),
+                    {"question": question, "response": prose},
+                    self._settings,
+                )
+                self.last_answer_metadata_seconds = time.perf_counter() - metadata_began
                 value = GroundedAnswer(
+                    outcome=outcome.outcome,
+                    refusal_reason=outcome.refusal_reason,
                     answer=prose,
                     citations=_citations_from_answer(prose),
                     # Deliberately empty on this path. The buffered path lets the
@@ -925,7 +964,7 @@ class LangChainGroundedAnswerGenerator:
                     # free-text commentary, which no client renders.
                     missing_information=[],
                 )
-                usage = prose_usage
+                usage = _combine_usage(prose_usage, outcome_usage)
         self.last_usage = usage
         return value
 
