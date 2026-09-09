@@ -71,6 +71,7 @@ def test_citation_markers_are_not_scored_as_content() -> None:
     scored_question, scored_answer = verifier.scored_pairs[0]
     assert scored_question == QUESTION
     assert "[SOURCE" not in scored_answer
+    assert verifier.last_answer_relevance_pair == (scored_question, scored_answer)
 
 
 def test_an_empty_answer_defers_rather_than_inventing_a_refusal() -> None:

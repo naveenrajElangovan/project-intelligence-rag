@@ -6,6 +6,7 @@ import re
 
 from langgraph.config import get_stream_writer
 
+from app.grounding import LocalCitationGroundingVerifier
 from app.llm import (
     BilingualQueryPlanner,
     GroundedAnswer,
@@ -1371,6 +1372,8 @@ def _expand_standalone_identifier_question(
 class AnswerNodesMixin:
     """AnswerNodes responsibilities."""
 
+    _grounding_verifier: LocalCitationGroundingVerifier
+
     async def _generate(self, state: RagState) -> RagState:
         began = started()
         overview_style_repaired = False
@@ -2708,6 +2711,7 @@ class AnswerNodesMixin:
                 threshold=self._settings.answer_relevance_threshold,
             )
         )
+        scorer_pair = self._grounding_verifier.last_answer_relevance_pair or ("", "")
         if grounded and not addresses:
             grounded = False
             reason_code = "ANSWER_NOT_RELEVANT"
@@ -2759,6 +2763,9 @@ class AnswerNodesMixin:
             "grounded": grounded,
             "grounding_reason": reason_code,
             "answer_relevance": answer_relevance,
+            "pre_gate_draft_answer": generated.answer,
+            "answer_relevance_scorer_question": scorer_pair[0],
+            "answer_relevance_scorer_answer": scorer_pair[1],
             "coverage_expected": len(population_expected),
             "coverage_covered": len(population_expected) - len(population_missing),
             "coverage_missing": population_missing,

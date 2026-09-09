@@ -47,6 +47,10 @@ class LocalCitationGroundingVerifier:
         self._accelerator_max_concurrency = settings.accelerator_max_concurrency
         self.last_usage = TokenUsage()
         self._pair_score_cache: dict[tuple[str, str], float] = {}
+        # Evaluation reads this immediately after the topicality check. Keeping
+        # the exact normalized pair makes a low score auditable without
+        # confusing the public refusal text with the draft that was scored.
+        self.last_answer_relevance_pair: tuple[str, str] | None = None
 
     def _predict_scores(
         self, pairs: list[tuple[str, str]], batch_size: int
@@ -440,11 +444,13 @@ class LocalCitationGroundingVerifier:
             re.sub(r"\s*\[SOURCE \d+\]", "", answer)
         ).strip()
         prompt = " ".join(str(question or "").split())
+        self.last_answer_relevance_pair = None
         if not text or not prompt:
             # Nothing to judge. Inventing a refusal here would be worse than
             # deferring to the gates that already passed.
             return True, 1.0
         pair = (prompt, self._scored(text))
+        self.last_answer_relevance_pair = pair
         await self._ensure_scores([pair])
         score = self._pair_score_cache[pair]
         self._pair_score_cache.clear()

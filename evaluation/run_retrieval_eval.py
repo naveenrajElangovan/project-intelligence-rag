@@ -1555,6 +1555,12 @@ async def _run_generation_lane(
             "answer_style": evaluation_result.answer_style,
             "context_relevance": evaluation_result.context_relevance,
             "answer_relevance": evaluation_result.answer_relevance,
+            "pre_gate_draft_answer": evaluation_result.pre_gate_draft_answer,
+            "pre_gate_answer_relevance": evaluation_result.answer_relevance,
+            "answer_relevance_pair": {
+                "question": evaluation_result.answer_relevance_scorer_question,
+                "answer": evaluation_result.answer_relevance_scorer_answer,
+            },
             "canonical_fallback_used": evaluation_result.canonical_fallback_used,
             "canonical_fallback_reason": evaluation_result.canonical_fallback_reason,
             "generated_outcome": generated_outcome,

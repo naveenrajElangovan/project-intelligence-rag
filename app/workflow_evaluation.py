@@ -22,6 +22,9 @@ class WorkflowEvaluationResult:
     answer_style: str = ""
     context_relevance: float = -1.0
     answer_relevance: float = -1.0
+    pre_gate_draft_answer: str = ""
+    answer_relevance_scorer_question: str = ""
+    answer_relevance_scorer_answer: str = ""
     canonical_fallback_used: bool = False
     canonical_fallback_reason: str = ""
     generated_outcome: str = ""
@@ -73,6 +76,13 @@ class EvaluationWorkflowMixin:
             answer_style=str(state.get("answer_style") or ""),
             context_relevance=float(state.get("context_relevance", -1.0)),
             answer_relevance=float(state.get("answer_relevance", -1.0)),
+            pre_gate_draft_answer=str(state.get("pre_gate_draft_answer") or ""),
+            answer_relevance_scorer_question=str(
+                state.get("answer_relevance_scorer_question") or ""
+            ),
+            answer_relevance_scorer_answer=str(
+                state.get("answer_relevance_scorer_answer") or ""
+            ),
             canonical_fallback_used=bool(state.get("canonical_fallback_used", False)),
             canonical_fallback_reason=str(
                 state.get("canonical_fallback_reason") or ""

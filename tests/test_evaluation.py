@@ -73,6 +73,9 @@ def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None
         "answer_style": "direct",
         "context_relevance": 0.42,
         "answer_relevance": 0.73,
+        "pre_gate_draft_answer": "Draft answer [SOURCE 1]",
+        "answer_relevance_scorer_question": "resolved question",
+        "answer_relevance_scorer_answer": "Draft answer",
     }
     workflow = object.__new__(AuthorizedRagWorkflow)
     workflow._request = SimpleNamespace(question="pregunta", project_id="T2.0")
@@ -98,6 +101,9 @@ def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None
     assert evaluated.answer_style == "direct"
     assert evaluated.context_relevance == 0.42
     assert evaluated.answer_relevance == 0.73
+    assert evaluated.pre_gate_draft_answer == "Draft answer [SOURCE 1]"
+    assert evaluated.answer_relevance_scorer_question == "resolved question"
+    assert evaluated.answer_relevance_scorer_answer == "Draft answer"
 
 
 def test_quality_monitoring_does_not_change_runtime_gates() -> None:
@@ -637,6 +643,9 @@ def test_generation_lane_always_captures_local_pairwise_content(
                 answer_style="direct",
                 context_relevance=0.42,
                 answer_relevance=0.73,
+                pre_gate_draft_answer="Draft answer [SOURCE 1]",
+                answer_relevance_scorer_question="resolved question",
+                answer_relevance_scorer_answer="Draft answer",
             )
 
     monkeypatch.setattr(
@@ -678,6 +687,12 @@ def test_generation_lane_always_captures_local_pairwise_content(
     assert rows[0]["answer_style"] == "direct"
     assert rows[0]["context_relevance"] == 0.42
     assert rows[0]["answer_relevance"] == 0.73
+    assert rows[0]["pre_gate_draft_answer"] == "Draft answer [SOURCE 1]"
+    assert rows[0]["pre_gate_answer_relevance"] == 0.73
+    assert rows[0]["answer_relevance_pair"] == {
+        "question": "resolved question",
+        "answer": "Draft answer",
+    }
     assert captured_requests[0].access_policy_ids == [
         "project:T2.0",
         "department:T2.0:STORE_OPERATIONS",

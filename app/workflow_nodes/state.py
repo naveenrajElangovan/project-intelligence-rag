@@ -54,6 +54,9 @@ class RagState(TypedDict, total=False):
     context_completeness: float
     context_failure_reason: str
     answer_relevance: float
+    pre_gate_draft_answer: str
+    answer_relevance_scorer_question: str
+    answer_relevance_scorer_answer: str
     coverage_expected: int
     coverage_expected_identifiers: tuple[str, ...]
     coverage_expected_fields: tuple[str, ...]
