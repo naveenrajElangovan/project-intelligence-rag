@@ -1260,11 +1260,11 @@ def _generation_sample(
             )
         fillers = [case for case in cases if str(case.get("id")) not in selected]
         return [*paraphrases, *section_sample, *_stratified_sample(fillers, remaining - len(section_sample))]
-    # Small developer lanes still need a usable bilingual negative gate. Keep
-    # one case for every (language, typed refusal reason) pair before filling
-    # the remaining capacity. The full suite is balanced separately; this
-    # reservation prevents a 30-case run from accidentally judging Spanish on
-    # one negative row.
+    # Small developer lanes need both a usable bilingual negative gate and at
+    # least one answerable example in every language represented by the suite.
+    # The mandatory developer paraphrases are currently English, so ordinary
+    # round-robin filling can consume the remaining capacity without selecting
+    # a Spanish answerable case. Reserve the language boundary explicitly.
     negative_groups: dict[tuple[str, str], dict[str, Any]] = {}
     for case in cases:
         if case.get("answerable") is not False:
@@ -1274,18 +1274,42 @@ def _generation_sample(
             str(case.get("expected_refusal_reason") or "unspecified"),
         )
         negative_groups.setdefault(key, case)
-    reserved = list(negative_groups.values())
+    answerable_languages: dict[str, dict[str, Any]] = {}
+    for case in cases:
+        if case.get("answerable") is not True:
+            continue
+        language = str(case.get("query_language") or "und")
+        answerable_languages.setdefault(language, case)
+    reserved = [*negative_groups.values(), *answerable_languages.values()]
     reserved_ids = {str(case.get("id")) for case in reserved}
     if len(reserved) > remaining:
         raise ValueError(
-            f"Generation size {size} cannot hold one negative per language/reason; "
+            f"Generation size {size} cannot hold one negative per language/reason "
+            "and one answerable case per language; "
             f"requires at least {len(paraphrases) + len(reserved)}"
         )
-    fillers = [case for case in cases if str(case.get("id")) not in reserved_ids]
+    answerable_fillers = [
+        case
+        for case in cases
+        if case.get("answerable") is True
+        and str(case.get("id")) not in reserved_ids
+    ]
+    negative_fillers = [
+        case
+        for case in cases
+        if case.get("answerable") is False
+        and str(case.get("id")) not in reserved_ids
+    ]
+    filler_size = remaining - len(reserved)
+    fillers = _stratified_sample(answerable_fillers, filler_size)
+    if len(fillers) < filler_size:
+        fillers.extend(
+            _stratified_sample(negative_fillers, filler_size - len(fillers))
+        )
     return [
         *paraphrases,
         *reserved,
-        *_stratified_sample(fillers, remaining - len(reserved)),
+        *fillers,
     ]
 
 
