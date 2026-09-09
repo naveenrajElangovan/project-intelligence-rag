@@ -14,11 +14,14 @@ from app.workflow import AuthorizedRagWorkflow
 from langchain_core.documents import Document
 from evaluation.run_retrieval_eval import (
     _MINIMUM_GOLD_RESOLUTION_RATE,
+    _RecordedCandidateWorkflow,
     _apply_reviewed_references,
+    _generation_candidate_rows,
     _reviewed_bilingual_ragas_cases,
     _generation_sample,
     _gold_ids,
     _load_evaluation_cases,
+    _rehydrate_recorded_candidates,
     _run_generation_lane,
     _stratified_sample,
     _validate_gold_resolution,
@@ -732,6 +735,106 @@ def test_generation_lane_types_a_silent_no_answer(tmp_path, monkeypatch) -> None
     assert rows[0]["refusal_reason"] == "INSUFFICIENT_EVIDENCE"
     assert rows[0]["generated_outcome"] == "REFUSAL"
     assert rows[0]["generated_refusal_reason"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_recorded_candidate_workflow_reuses_only_authorized_documents() -> None:
+    workflow = object.__new__(_RecordedCandidateWorkflow)
+    workflow._request = SimpleNamespace(
+        project_id="T2.0-STORE",
+        access_policy_ids=["project:T2.0-STORE"],
+        question="How do I close the register?",
+    )
+    workflow._recorded_candidates = (
+        Document(
+            page_content="Closing guidance",
+            metadata={
+                "chunk_id": "close-1",
+                "project_id": "T2.0-STORE",
+                "access_policy_id": "project:T2.0-STORE",
+            },
+        ),
+    )
+
+    result = asyncio.run(
+        workflow._retrieve(
+            {
+                "queries": ("How do I close the register?",),
+                "resolved_question": "How do I close the register?",
+            }
+        )
+    )
+
+    assert [item.metadata["chunk_id"] for item in result["candidates"]] == [
+        "close-1"
+    ]
+    assert result["fused_candidate_count"] == 1
+
+
+def test_recorded_candidate_workflow_fails_closed_on_foreign_policy() -> None:
+    workflow = object.__new__(_RecordedCandidateWorkflow)
+    workflow._request = SimpleNamespace(
+        project_id="T2.0-STORE",
+        access_policy_ids=["project:T2.0-STORE"],
+        question="Question",
+    )
+    workflow._recorded_candidates = (
+        Document(
+            page_content="Foreign evidence",
+            metadata={
+                "project_id": "T2.0",
+                "access_policy_id": "project:T2.0",
+            },
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="outside the generation request"):
+        asyncio.run(workflow._retrieve({"queries": ("Question",)}))
+
+
+def test_recorded_candidate_ids_are_rehydrated_in_recorded_order() -> None:
+    class Collection:
+        def get(self, **_kwargs):
+            return {
+                "ids": ["physical-2", "physical-1"],
+                "documents": ["second", "first"],
+                "metadatas": [
+                    {"canonical_chunk_id": "chunk-2"},
+                    {"canonical_chunk_id": "chunk-1"},
+                ],
+            }
+
+    candidates = _rehydrate_recorded_candidates(
+        [{"id": "case-1", "retrieved_chunk_ids": ["chunk-1", "chunk-2"]}],
+        Collection(),
+    )
+
+    assert [item.page_content for item in candidates["case-1"]] == [
+        "first",
+        "second",
+    ]
+    assert candidates["case-1"][0].metadata["retrieval_fused_score"] == 1
+
+
+def test_generation_candidate_rows_reuse_existing_retrieval_row(tmp_path) -> None:
+    retrieval_row = {"id": "case-1", "retrieved_chunk_ids": ["chunk-1"]}
+
+    rows = asyncio.run(
+        _generation_candidate_rows(
+            [{"id": "case-1"}],
+            retrieval_rows=[retrieval_row],
+            manifest={},
+            retriever=None,
+            sparse=None,
+            fusion=None,
+            reranker=None,
+            settings=None,
+            output=tmp_path / "candidates.jsonl",
+            lexical_enabled=True,
+        )
+    )
+
+    assert rows == [retrieval_row]
+    assert not (tmp_path / "candidates.jsonl").exists()
 
 
 def test_generation_metrics_report_paraphrase_divergence() -> None:
