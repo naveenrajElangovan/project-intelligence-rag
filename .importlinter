@@ -1,0 +1,22 @@
+[importlinter]
+root_package = app
+
+[importlinter:contract:workflow-core-does-not-import-delivery]
+name = Workflow core does not depend on HTTP delivery modules
+type = forbidden
+source_modules =
+    app.workflow_nodes
+    app.workflow_support
+forbidden_modules =
+    app.main
+    app.inference_api
+
+[importlinter:contract:models-stay-independent]
+name = API models do not depend on orchestration or storage
+type = forbidden
+source_modules =
+    app.models
+forbidden_modules =
+    app.workflow
+    app.workflow_nodes
+    app.retrieval
