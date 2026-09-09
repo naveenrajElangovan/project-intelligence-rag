@@ -1032,6 +1032,11 @@ def test_generation_sample_always_includes_every_paraphrase_case() -> None:
     assert negative_counts["en"] == negative_counts["es"]
     assert negative_counts["es"] >= 3
     assert {case.get("query_language") for case in sample} >= {"en", "es"}
+    assert {
+        case.get("query_language")
+        for case in sample
+        if case.get("answerable") is True
+    } >= {"en", "es"}
 
 
 def test_store_generation_sample_never_injects_developer_paraphrases() -> None:
