@@ -598,6 +598,7 @@ def test_generation_lane_rejects_duplicate_stale_rows(tmp_path) -> None:
                 settings=SimpleNamespace(),
                 project_id="T2.0",
                 output=output,
+                recorded_candidates={},
             )
         )
 
@@ -618,10 +619,12 @@ def test_generation_lane_always_captures_local_pairwise_content(
     )
 
     captured_requests = []
+    captured_candidates = []
 
     class FakeWorkflow:
-        def __init__(self, _settings, request):
+        def __init__(self, _settings, request, candidates):
             captured_requests.append(request)
+            captured_candidates.append(candidates)
 
         async def run_for_evaluation(self):
             return WorkflowEvaluationResult(
@@ -634,7 +637,7 @@ def test_generation_lane_always_captures_local_pairwise_content(
             )
 
     monkeypatch.setattr(
-        "evaluation.run_retrieval_eval.AuthorizedRagWorkflow", FakeWorkflow
+        "evaluation.run_retrieval_eval._RecordedCandidateWorkflow", FakeWorkflow
     )
     settings = SimpleNamespace(
         chroma_collection="collection",
@@ -655,6 +658,14 @@ def test_generation_lane_always_captures_local_pairwise_content(
             settings=settings,
             project_id="T2.0",
             output=tmp_path / "generation.jsonl",
+            recorded_candidates={
+                "case-1": [
+                    Document(
+                        page_content="recorded retrieval evidence",
+                        metadata={"chunk_id": "chunk-1"},
+                    )
+                ]
+            },
         )
     )
 
@@ -668,6 +679,59 @@ def test_generation_lane_always_captures_local_pairwise_content(
         "project:T2.0",
         "department:T2.0:STORE_OPERATIONS",
     ]
+    assert captured_candidates[0][0].metadata["chunk_id"] == "chunk-1"
+
+
+def test_generation_lane_types_a_silent_no_answer(tmp_path, monkeypatch) -> None:
+    from app.workflow_evaluation import WorkflowEvaluationResult
+
+    response = RagResponse(
+        answer="Verified guidance was not found.",
+        status="INSUFFICIENT_EVIDENCE",
+        confidence="NONE",
+        projectId="T2.0-STORE",
+        sources=[],
+        missingInformation=[],
+        evidenceStatus="INSUFFICIENT",
+    )
+
+    class FakeWorkflow:
+        def __init__(self, _settings, _request, _candidates):
+            pass
+
+        async def run_for_evaluation(self):
+            return WorkflowEvaluationResult(
+                response=response,
+                retrieved_contexts=(),
+                query_language="en",
+            )
+
+    monkeypatch.setattr(
+        "evaluation.run_retrieval_eval._RecordedCandidateWorkflow", FakeWorkflow
+    )
+    settings = SimpleNamespace(
+        chroma_collection="collection",
+        supported_embedding_models=("model",),
+        supported_schema_versions=("3",),
+    )
+    rows = asyncio.run(
+        _run_generation_lane(
+            [{
+                "id": "silent-no-answer",
+                "question": "Question without a verified answer",
+                "answerable": True,
+                "query_language": "en",
+            }],
+            settings=settings,
+            project_id="T2.0-STORE",
+            output=tmp_path / "generation.jsonl",
+            recorded_candidates={"silent-no-answer": []},
+        )
+    )
+
+    assert rows[0]["refusal_reason"] == "INSUFFICIENT_EVIDENCE"
+    assert rows[0]["generated_outcome"] == "REFUSAL"
+    assert rows[0]["generated_refusal_reason"] == "INSUFFICIENT_EVIDENCE"
 
 
 def test_generation_metrics_report_paraphrase_divergence() -> None:

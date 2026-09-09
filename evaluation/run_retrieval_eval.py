@@ -29,7 +29,9 @@ from app.reranking import (
 )
 from app.retrieval import ChromaAccessRetriever
 from app.workflow import AuthorizedRagWorkflow
+from app.workflow_nodes.state import RagState
 from app.workflow_nodes.retrieval import (
+    _canonical_route_directive,
     _exact_identifier_tokens,
     _forced_anchor_tokens,
     _prefilter_candidates,
@@ -45,6 +47,7 @@ from app.retrieval_pipeline import (
     BM25Retriever,
     ReciprocalRankFusion,
     deduplicate_candidate_bodies,
+    validate_authorized_candidates,
 )
 try:
     from evaluation.build_gold_suites import build_registered_suites
@@ -473,6 +476,64 @@ def _chunk_ids(documents: list[Any]) -> list[str]:
     return [str(document.metadata.get("chunk_id") or "") for document in documents]
 
 
+class _RecordedCandidateWorkflow(AuthorizedRagWorkflow):
+    """Run generation against the retrieval lane's immutable candidate pool.
+
+    Generation previously invoked the complete workflow a second time. A case
+    could therefore be a retrieval success in one execution and an evidence
+    miss in another. This evaluation-only workflow keeps planning, reranking,
+    generation, and truth gates unchanged, replacing only live retrieval with
+    the candidates already recorded by the retrieval lane.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        request: RagRequest,
+        candidates: list[Document],
+    ) -> None:
+        super().__init__(settings, request)
+        self._recorded_candidates = tuple(
+            Document(page_content=item.page_content, metadata=dict(item.metadata))
+            for item in candidates
+        )
+
+    async def _retrieve(self, state: RagState) -> RagState:
+        candidates = [
+            Document(page_content=item.page_content, metadata=dict(item.metadata))
+            for item in self._recorded_candidates
+        ]
+        authorized = validate_authorized_candidates(
+            candidates,
+            project_id=self._request.project_id,
+            access_policy_ids=self._request.access_policy_ids,
+        )
+        if len(authorized) != len(candidates):
+            raise RuntimeError(
+                "Recorded evaluation candidates include documents outside the "
+                "generation request's access policies"
+            )
+        _tokens, route_refusal_reason = _canonical_route_directive(
+            state.get("resolved_question", self._request.question), authorized
+        )
+        queries = tuple(state.get("queries", ()))
+        return {
+            "queries": queries,
+            "rerank_queries": tuple(
+                dict.fromkeys((*state.get("rerank_queries", ()), *queries))
+            ),
+            "translation_slot": None,
+            "candidates": authorized,
+            "preserve_candidates": False,
+            "lexical_candidate_count": 0,
+            "dense_candidate_count": len(authorized),
+            "fallback_candidate_count": 0,
+            "fused_candidate_count": len(authorized),
+            "prefiltered_count": 0,
+            "canonical_route_refusal_reason": route_refusal_reason,
+        }
+
+
 async def _run_case(
     case: dict[str, Any],
     *,
@@ -805,10 +866,11 @@ async def _run_reranker_sweep(
     return summaries
 
 
-def _load_recorded_candidates(path: Path, collection: Any) -> dict[str, list[Any]]:
-    """Rehydrate one accepted fused pool so a sweep changes ranking only."""
+def _rehydrate_recorded_candidates(
+    rows: list[dict[str, Any]], collection: Any
+) -> dict[str, list[Document]]:
+    """Load recorded candidate IDs without performing another semantic search."""
 
-    rows = _load_jsonl(path)
     wanted = {
         str(chunk_id)
         for row in rows
@@ -847,7 +909,7 @@ def _load_recorded_candidates(path: Path, collection: Any) -> dict[str, list[Any
     missing = wanted - by_id.keys()
     if missing:
         raise RuntimeError(f"Recorded sweep candidates missing from Chroma: {sorted(missing)[:5]}")
-    result: dict[str, list[Any]] = {}
+    result: dict[str, list[Document]] = {}
     for row in rows:
         ordered = [
             Document(
@@ -862,6 +924,68 @@ def _load_recorded_candidates(path: Path, collection: Any) -> dict[str, list[Any
             document.metadata["retrieval_fused_score"] = (total - index) / total
         result[str(row.get("id"))] = ordered
     return result
+
+
+def _load_recorded_candidates(path: Path, collection: Any) -> dict[str, list[Document]]:
+    """Rehydrate one accepted fused pool so a sweep changes ranking only."""
+
+    return _rehydrate_recorded_candidates(_load_jsonl(path), collection)
+
+
+async def _generation_candidate_rows(
+    cases: list[dict[str, Any]],
+    *,
+    retrieval_rows: list[dict[str, Any]],
+    manifest: dict[str, dict[str, str]],
+    retriever: ChromaAccessRetriever,
+    sparse: BM25Retriever,
+    fusion: ReciprocalRankFusion,
+    reranker: Any,
+    settings: Settings,
+    output: Path,
+    lexical_enabled: bool,
+) -> list[dict[str, Any]]:
+    """Record exactly one retrieval pool for every selected generation case."""
+
+    selected_ids = {str(case.get("id")) for case in cases}
+    by_id = {
+        str(row.get("id")): row
+        for row in [
+            *retrieval_rows,
+            *(_load_jsonl(output) if output.exists() else []),
+        ]
+        if str(row.get("id")) in selected_ids
+    }
+    for position, case in enumerate(cases, start=1):
+        case_id = str(case.get("id"))
+        if case_id in by_id:
+            continue
+        by_id[case_id] = await _run_case(
+            case,
+            manifest=manifest,
+            retriever=retriever,
+            sparse=sparse,
+            fusion=fusion,
+            reranker=reranker,
+            settings=settings,
+            lexical_enabled=lexical_enabled,
+        )
+        output.write_text(
+            "".join(
+                json.dumps(by_id[identifier], sort_keys=True) + "\n"
+                for identifier in sorted(by_id)
+            ),
+            encoding="utf-8",
+        )
+        print(
+            f"generation_retrieval={position}/{len(cases)} id={case_id}", flush=True
+        )
+    missing = selected_ids - by_id.keys()
+    if missing:
+        raise RuntimeError(
+            f"Generation retrieval pools are incomplete: {sorted(missing)[:5]}"
+        )
+    return [by_id[str(case.get("id"))] for case in cases]
 
 
 async def _main(arguments: argparse.Namespace) -> None:
@@ -1020,13 +1144,29 @@ async def _main(arguments: argparse.Namespace) -> None:
         generation_out = arguments.generation_out or arguments.out.with_name(
             f"{arguments.out.stem}.generation.jsonl"
         )
+        generation_cases = _generation_sample(
+            all_cases, arguments.generate, project_id=arguments.project_id
+        )
+        candidate_rows = await _generation_candidate_rows(
+            generation_cases,
+            retrieval_rows=rows,
+            manifest=manifest,
+            retriever=retriever,
+            sparse=sparse,
+            fusion=fusion,
+            reranker=reranker,
+            settings=settings,
+            output=generation_out.with_name(f"{generation_out.stem}.candidates.jsonl"),
+            lexical_enabled=not arguments.disable_lexical,
+        )
         generation_rows = await _run_generation_lane(
-            _generation_sample(
-                all_cases, arguments.generate, project_id=arguments.project_id
-            ),
+            generation_cases,
             settings=settings,
             project_id=arguments.project_id,
             output=generation_out,
+            recorded_candidates=_rehydrate_recorded_candidates(
+                candidate_rows, collection
+            ),
         )
         generation_summary = score_generation(generation_rows)
         generation_out.with_suffix(".json").write_text(
@@ -1049,11 +1189,28 @@ async def _main(arguments: argparse.Namespace) -> None:
         generation_output = arguments.ragas_out.with_name(
             f"{arguments.ragas_out.stem}.generation.jsonl"
         )
+        candidate_rows = await _generation_candidate_rows(
+            bilingual_generation_cases,
+            retrieval_rows=rows,
+            manifest=manifest,
+            retriever=retriever,
+            sparse=sparse,
+            fusion=fusion,
+            reranker=reranker,
+            settings=settings,
+            output=generation_output.with_name(
+                f"{generation_output.stem}.candidates.jsonl"
+            ),
+            lexical_enabled=not arguments.disable_lexical,
+        )
         generation_rows = await _run_generation_lane(
             bilingual_generation_cases,
             settings=settings,
             project_id=arguments.project_id,
             output=generation_output,
+            recorded_candidates=_rehydrate_recorded_candidates(
+                candidate_rows, collection
+            ),
         )
         generation_summary = score_generation(generation_rows)
         generation_summary_path = generation_output.with_suffix(".json")
@@ -1295,6 +1452,7 @@ async def _run_generation_lane(
     settings: Settings,
     project_id: str,
     output: Path,
+    recorded_candidates: dict[str, list[Document]],
 ) -> list[dict[str, Any]]:
     selected_ids = {str(case.get("id")) for case in cases}
     rows = [
@@ -1306,6 +1464,11 @@ async def _run_generation_lane(
     for position, case in enumerate(cases, start=1):
         if str(case.get("id")) in completed:
             continue
+        case_id = str(case.get("id"))
+        if case_id not in recorded_candidates:
+            raise RuntimeError(
+                f"Generation case {case_id} has no retrieval-lane candidate pool"
+            )
         access_policy_ids = [f"project:{project_id}"]
         department = str(case.get("department") or "").strip()
         if department:
@@ -1321,10 +1484,23 @@ async def _run_generation_lane(
             accessPolicyIds=access_policy_ids,
             modelProfile="budget",
         )
-        evaluation_result = await AuthorizedRagWorkflow(
-            settings, request
+        evaluation_result = await _RecordedCandidateWorkflow(
+            settings, request, recorded_candidates[case_id]
         ).run_for_evaluation()
         response = evaluation_result.response
+        no_answer = response.confidence == "NONE"
+        refusal_reason = str(
+            response.refusal_reason
+            or response.failure_reason
+            or evaluation_result.generated_refusal_reason
+            or ("INSUFFICIENT_EVIDENCE" if no_answer else "")
+        )
+        generated_outcome = evaluation_result.generated_outcome or (
+            "REFUSAL" if no_answer else "ANSWER"
+        )
+        generated_refusal_reason = evaluation_result.generated_refusal_reason or (
+            refusal_reason if no_answer else ""
+        )
         cited = [source.reference for source in response.sources if source.reference]
         row = {
             "id": case.get("id"),
@@ -1351,9 +1527,9 @@ async def _run_generation_lane(
             "answer_relevance": evaluation_result.answer_relevance,
             "canonical_fallback_used": evaluation_result.canonical_fallback_used,
             "canonical_fallback_reason": evaluation_result.canonical_fallback_reason,
-            "generated_outcome": evaluation_result.generated_outcome,
-            "generated_refusal_reason": evaluation_result.generated_refusal_reason,
-            "refusal_reason": response.refusal_reason,
+            "generated_outcome": generated_outcome,
+            "generated_refusal_reason": generated_refusal_reason,
+            "refusal_reason": refusal_reason,
             "expected_refusal_reason": case.get("expected_refusal_reason"),
         }
         if case.get("reference") and case.get("reference_status") == "reviewed":
