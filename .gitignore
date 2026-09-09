@@ -12,6 +12,7 @@ __pycache__/
 .pytest_cache/
 .evaluation-cache/
 .quality-runs/
+.agent-docs/
 evaluation/ragas-generated*.jsonl
 evaluation/ragas-results.json
 *.py[cod]

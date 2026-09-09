@@ -92,14 +92,17 @@ _PARAPHRASE_GROUPS_PATH = Path(__file__).with_name("paraphrase_groups.json")
 _DEFAULT_SUITES_PATH = Path(__file__).with_name("gold_suites.jsonl")
 _DEFAULT_REGISTRY_PATH = Path(__file__).with_name("suites.json")
 _BILINGUAL_SUITES_PATH = Path(__file__).with_name("bilingual_gold_suites.jsonl")
-_RERANK_SWEEP = (
-    # Corpus-breadth sweep: truth thresholds remain fixed. The selected knee is
-    # recorded in project configuration only after section hit rate and refusal
-    # behavior have both been measured.
-    ("source_cap_3", 16, 16, 16, 0.10, 3),
-    ("source_cap_6", 16, 16, 16, 0.10, 6),
-    ("source_cap_12", 16, 16, 16, 0.10, 12),
-    ("source_cap_25", 16, 16, 16, 0.10, 25),
+_RERANK_SWEEP = tuple(
+    (
+        f"threshold_{threshold:.2f}_top_{top_n}",
+        25,
+        25,
+        top_n,
+        threshold,
+        6,
+    )
+    for threshold in (0.00, 0.02, 0.05, 0.10)
+    for top_n in (8, 16, 25)
 )
 
 
@@ -778,7 +781,26 @@ async def _run_reranker_sweep(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
             encoding="utf-8",
         )
-        summaries[name] = score(rows, settings=settings, project_id=str(cases[0]["project_id"]))
+        # The requested headline stays fixed at section hit @16 even when the
+        # serving width under test is 8 or 25. A width of 8 naturally exposes
+        # only eight rows to that fixed evaluation window.
+        cell_settings = settings.model_copy(update={"rerank_top_n": 16})
+        summary = score(
+            rows,
+            settings=cell_settings,
+            project_id=str(cases[0]["project_id"]),
+        )
+        _, _, serving_top_n, threshold, source_limit = next(
+            config[1:] for config in _RERANK_SWEEP if config[0] == name
+        )
+        summary.update(
+            {
+                "sweep_rerank_top_n": serving_top_n,
+                "sweep_rerank_score_threshold": threshold,
+                "sweep_max_chunks_per_source": source_limit,
+            }
+        )
+        summaries[name] = summary
     output.write_text(json.dumps(summaries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return summaries
 
@@ -1238,7 +1260,33 @@ def _generation_sample(
             )
         fillers = [case for case in cases if str(case.get("id")) not in selected]
         return [*paraphrases, *section_sample, *_stratified_sample(fillers, remaining - len(section_sample))]
-    return [*paraphrases, *_stratified_sample(cases, remaining)]
+    # Small developer lanes still need a usable bilingual negative gate. Keep
+    # one case for every (language, typed refusal reason) pair before filling
+    # the remaining capacity. The full suite is balanced separately; this
+    # reservation prevents a 30-case run from accidentally judging Spanish on
+    # one negative row.
+    negative_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for case in cases:
+        if case.get("answerable") is not False:
+            continue
+        key = (
+            str(case.get("query_language") or "und"),
+            str(case.get("expected_refusal_reason") or "unspecified"),
+        )
+        negative_groups.setdefault(key, case)
+    reserved = list(negative_groups.values())
+    reserved_ids = {str(case.get("id")) for case in reserved}
+    if len(reserved) > remaining:
+        raise ValueError(
+            f"Generation size {size} cannot hold one negative per language/reason; "
+            f"requires at least {len(paraphrases) + len(reserved)}"
+        )
+    fillers = [case for case in cases if str(case.get("id")) not in reserved_ids]
+    return [
+        *paraphrases,
+        *reserved,
+        *_stratified_sample(fillers, remaining - len(reserved)),
+    ]
 
 
 async def _run_generation_lane(

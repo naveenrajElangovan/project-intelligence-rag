@@ -6,7 +6,13 @@ import re
 
 from langgraph.config import get_stream_writer
 
-from app.llm import BilingualQueryPlanner, GroundedAnswer, TokenUsage, answer_sentence_floor
+from app.llm import (
+    BilingualQueryPlanner,
+    GroundedAnswer,
+    TokenUsage,
+    answer_sentence_floor,
+    refusal_answer,
+)
 from app.grounding_contract import evidence_facts, render_structured_facts
 from app.telemetry import canonical_quote_fallback, stage_complete, started
 from app.table_evidence import contains_table
@@ -1369,6 +1375,37 @@ class AnswerNodesMixin:
         began = started()
         overview_style_repaired = False
         answer_question = state.get("resolved_question") or self._request.question
+        route_refusal_reason = state.get("canonical_route_refusal_reason", "")
+        if route_refusal_reason:
+            generated = GroundedAnswer(
+                answer=refusal_answer(
+                    route_refusal_reason, state.get("language", "mixed")
+                ),
+                citations=[],
+                outcome="REFUSAL",
+                refusal_reason=route_refusal_reason,
+            )
+            stage_complete(
+                "generate",
+                self._request.project_id,
+                began,
+                input_count=len(state.get("documents", [])),
+                output_count=0,
+                reason_code="CORPUS_DECLARED_OUT_OF_SCOPE",
+                model_provider="deterministic",
+                model_name="canonical-index-router",
+                model_profile="routing",
+                language=state.get("language", "und"),
+            )
+            return {
+                "generated": generated,
+                "documents": list(state.get("documents", [])),
+                "answer_style": "corpus_declared_refusal",
+                "generated_outcome": "REFUSAL",
+                "generated_refusal_reason": route_refusal_reason,
+                "canonical_fallback_used": False,
+                "canonical_fallback_reason": "",
+            }
         list_response_requested = _list_response_requested(answer_question)
         retrieved_documents = list(state.get("documents", []))
         sibling_expanded_count = 0

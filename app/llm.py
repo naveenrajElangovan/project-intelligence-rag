@@ -249,6 +249,52 @@ class AnswerOutcome(BaseModel):
         return self
 
 
+def normalize_streamed_answer_outcome(
+    prose: str, outcome: AnswerOutcome
+) -> AnswerOutcome:
+    """Correct an explicit prose refusal misclassified as an answer.
+
+    The second model call remains the primary classifier. This deterministic
+    guard handles only first-person or assistant-subject declarations of
+    inability at the start of the response. It intentionally ignores later
+    operational cautions such as "do not repeat the payment", which are valid
+    store instructions rather than refusals.
+    """
+
+    if outcome.outcome == "REFUSAL":
+        return outcome
+    opening = re.sub(r"^[\s#>*\-]+", "", prose).strip().casefold()[:320]
+    explicit_refusal = any(
+        re.match(pattern, opening)
+        for pattern in (
+            r"(?:i|we)\s+(?:cannot|can't|am unable|are unable|must decline)\b",
+            r"(?:the|this)\s+assistant\s+(?:must decline|cannot|can't|is unable)\b",
+            r"no\s+(?:puedo|podemos)\b",
+            r"(?:el|este)\s+asistente\s+(?:debe rechazar|no puede)\b",
+        )
+    )
+    if not explicit_refusal:
+        return outcome
+    scope_boundary = any(
+        phrase in opening
+        for phrase in (
+            "outside the authorized",
+            "only covers",
+            "restricted from",
+            "restricted to",
+            "fuera del alcance",
+            "solo cubre",
+            "exclusivamente para",
+        )
+    )
+    return AnswerOutcome(
+        outcome="REFUSAL",
+        refusal_reason=(
+            "SOURCE_SCOPE_VIOLATION" if scope_boundary else "INSUFFICIENT_EVIDENCE"
+        ),
+    )
+
+
 class GroundedAnswer(BaseModel):
     outcome: Literal["ANSWER", "REFUSAL"] = Field(
         default="ANSWER",
@@ -947,6 +993,7 @@ class LangChainGroundedAnswerGenerator:
                     {"question": question, "response": prose},
                     self._settings,
                 )
+                outcome = normalize_streamed_answer_outcome(prose, outcome)
                 self.last_answer_metadata_seconds = time.perf_counter() - metadata_began
                 value = GroundedAnswer(
                     outcome=outcome.outcome,

@@ -611,6 +611,15 @@ class ChromaAccessRetriever(BaseRetriever):
             self._structure_identifier_documents, identifiers, source_types
         )
 
+    async def ainvoke_canonical_questions(
+        self, question: str, source_types: tuple[str, ...] = ()
+    ) -> list[Document]:
+        """Load authorized canonical-index chunks containing an exact question."""
+
+        return await asyncio.to_thread(
+            self._canonical_question_documents, question, source_types
+        )
+
     async def ainvoke_lexical(
         self, query: str, source_types: tuple[str, ...] = ()
     ) -> list[Document]:
@@ -844,6 +853,48 @@ class ChromaAccessRetriever(BaseRetriever):
             key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),
             reverse=True,
         )[:12]
+
+    def _canonical_question_documents(
+        self, question: str, source_types: tuple[str, ...]
+    ) -> list[Document]:
+        """Resolve canonical questions from the authorization-keyed local cache.
+
+        The lexical corpus cache has already been loaded through project,
+        access-policy, schema, model, and source-type filters. Reusing it avoids
+        an expensive Chroma document scan for every question. The workflow still
+        performs normalized exact-question matching before following a route.
+        """
+
+        value = question.strip()
+        if not value:
+            return []
+        normalized_question = " ".join(
+            re.findall(r"[a-z0-9à-ÿ]+", value.casefold())
+        )
+        found: list[Document] = []
+        for cached in self._cached_authorized_corpus(source_types).documents:
+            document = _clone_document(cached)
+            structure_value = document.metadata.get("structure_path") or ""
+            structure = (
+                " ".join(str(item) for item in structure_value)
+                if isinstance(structure_value, (list, tuple))
+                else str(structure_value)
+            )
+            if "QUESTION-" not in structure.upper():
+                continue
+            quoted_questions = {
+                " ".join(re.findall(r"[a-z0-9à-ÿ]+", match.casefold()))
+                for match in re.findall(
+                    r'["“]([^"”]{3,200})["”]', document.page_content
+                )
+            }
+            if normalized_question not in quoted_questions:
+                continue
+            document.metadata["canonical_question_index"] = True
+            found.append(document)
+            if len(found) >= 24:
+                break
+        return found
 
     def _lexical_fallback(
         self, query: str, source_types: tuple[str, ...], failure_code: str

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import Settings
-from app.models import RagResponse
+from app.models import RagResponse, RetrievalProfile
 from app.workflow import AuthorizedRagWorkflow
 from langchain_core.documents import Document
 from evaluation.run_retrieval_eval import (
@@ -37,6 +37,22 @@ from evaluation.build_gold_suites import build_registered_suites, build_store_ca
 
 EVALUATION = Path(__file__).parents[1] / "evaluation"
 STORE_DOCS = Path(__file__).parents[1] / "docs" / "store-assistant"
+
+
+def test_project_retrieval_profile_can_lower_only_the_rerank_filter() -> None:
+    profile = RetrievalProfile(
+        maxChunksPerSource=6,
+        rerankTopN=16,
+        mixedSourceTopN=12,
+        rerankScoreThreshold=0.0,
+    )
+
+    assert profile.settings_overrides() == {
+        "max_chunks_per_source": 6,
+        "rerank_top_n": 16,
+        "mixed_source_top_n": 12,
+        "rerank_score_threshold": 0.0,
+    }
 
 
 def test_evaluation_interface_captures_exact_final_evidence(monkeypatch) -> None:
@@ -810,7 +826,13 @@ def test_default_suite_has_bilingual_fast_lane_and_negative_reasons() -> None:
     sample = _stratified_sample(cases, 30)
 
     assert len(fast_lane) == 378
-    assert len(negatives) == 40
+    assert len(negatives) == 60
+    assert {
+        language: sum(
+            case.get("query_language") == language for case in negatives
+        )
+        for language in ("en", "es")
+    } == {"en": 30, "es": 30}
     assert {
         case.get("expected_refusal_reason")
         for case in sample
@@ -835,6 +857,13 @@ def test_generation_sample_always_includes_every_paraphrase_case() -> None:
         "entity_behavior",
         "cross_source",
     }
+    negatives = [case for case in sample if case.get("answerable") is False]
+    negative_counts = {
+        language: sum(case.get("query_language") == language for case in negatives)
+        for language in ("en", "es")
+    }
+    assert negative_counts["en"] == negative_counts["es"]
+    assert negative_counts["es"] >= 3
     assert {case.get("query_language") for case in sample} >= {"en", "es"}
 
 
