@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev,eval]'
       - run: make lint format-check PYTHON=python
 
   mypy:
@@ -30,7 +30,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev,eval]'
       - run: make type-check PYTHON=python
 
   import-linter:
@@ -42,7 +42,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev,eval]'
       - run: make imports PYTHON=python LINT_IMPORTS=lint-imports
 
   tests-and-coverage:
@@ -54,7 +54,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e '.[dev]'
+      - run: python -m pip install -e '.[dev,eval]'
       - run: make test PYTHON=python COVERAGE=coverage
       - uses: actions/upload-artifact@v4
         with:
