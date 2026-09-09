@@ -91,12 +91,16 @@ class RetrievalProfile(BaseModel):
     max_chunks_per_source: int = Field(alias="maxChunksPerSource", ge=1, le=50)
     rerank_top_n: int = Field(alias="rerankTopN", ge=1, le=50)
     mixed_source_top_n: int = Field(alias="mixedSourceTopN", ge=1, le=50)
+    rerank_score_threshold: float = Field(
+        default=0.10, alias="rerankScoreThreshold", ge=0.0, le=1.0
+    )
 
-    def settings_overrides(self) -> dict[str, int]:
+    def settings_overrides(self) -> dict[str, int | float]:
         return {
             "max_chunks_per_source": self.max_chunks_per_source,
             "rerank_top_n": self.rerank_top_n,
             "mixed_source_top_n": self.mixed_source_top_n,
+            "rerank_score_threshold": self.rerank_score_threshold,
         }
 
 

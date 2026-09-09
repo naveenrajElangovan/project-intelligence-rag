@@ -232,6 +232,69 @@ class ConversationResolution(BaseModel):
     standalone_question: str = Field(min_length=2, max_length=4000)
 
 
+class AnswerOutcome(BaseModel):
+    """Typed disposition for a streamed prose answer."""
+
+    outcome: Literal["ANSWER", "REFUSAL"]
+    refusal_reason: Literal[
+        "SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_typed_outcome(self) -> "AnswerOutcome":
+        if self.outcome == "REFUSAL" and self.refusal_reason is None:
+            raise ValueError("A REFUSAL outcome requires refusal_reason")
+        if self.outcome == "ANSWER" and self.refusal_reason is not None:
+            raise ValueError("An ANSWER outcome cannot carry refusal_reason")
+        return self
+
+
+def normalize_streamed_answer_outcome(
+    prose: str, outcome: AnswerOutcome
+) -> AnswerOutcome:
+    """Correct an explicit prose refusal misclassified as an answer.
+
+    The second model call remains the primary classifier. This deterministic
+    guard handles only first-person or assistant-subject declarations of
+    inability at the start of the response. It intentionally ignores later
+    operational cautions such as "do not repeat the payment", which are valid
+    store instructions rather than refusals.
+    """
+
+    if outcome.outcome == "REFUSAL":
+        return outcome
+    opening = re.sub(r"^[\s#>*\-]+", "", prose).strip().casefold()[:320]
+    explicit_refusal = any(
+        re.match(pattern, opening)
+        for pattern in (
+            r"(?:i|we)\s+(?:cannot|can't|am unable|are unable|must decline)\b",
+            r"(?:the|this)\s+assistant\s+(?:must decline|cannot|can't|is unable)\b",
+            r"no\s+(?:puedo|podemos)\b",
+            r"(?:el|este)\s+asistente\s+(?:debe rechazar|no puede)\b",
+        )
+    )
+    if not explicit_refusal:
+        return outcome
+    scope_boundary = any(
+        phrase in opening
+        for phrase in (
+            "outside the authorized",
+            "only covers",
+            "restricted from",
+            "restricted to",
+            "fuera del alcance",
+            "solo cubre",
+            "exclusivamente para",
+        )
+    )
+    return AnswerOutcome(
+        outcome="REFUSAL",
+        refusal_reason=(
+            "SOURCE_SCOPE_VIOLATION" if scope_boundary else "INSUFFICIENT_EVIDENCE"
+        ),
+    )
+
+
 class GroundedAnswer(BaseModel):
     outcome: Literal["ANSWER", "REFUSAL"] = Field(
         default="ANSWER",
@@ -910,8 +973,31 @@ class LangChainGroundedAnswerGenerator:
                     self.last_time_to_first_chunk_seconds = (
                         stream_timing.time_to_first_chunk_seconds
                     )
-                self.last_answer_metadata_seconds = 0.0
+                metadata_began = time.perf_counter()
+                outcome_prompt = ChatPromptTemplate.from_messages(
+                    [
+                        (
+                            "system",
+                            "Classify the response disposition only; do not add or verify facts. "
+                            "Use REFUSAL whenever the response declines the request, including when "
+                            "it redirects to supported topics. Use SOURCE_SCOPE_VIOLATION when the "
+                            "request is outside the authorized assistance boundary, "
+                            "UNVERIFIED_EVIDENCE for an in-project detail not established by evidence, "
+                            "and INSUFFICIENT_EVIDENCE for any other inability to answer.",
+                        ),
+                        ("human", "QUESTION:\n{question}\n\nRESPONSE:\n{response}"),
+                    ]
+                )
+                outcome, outcome_usage = await _invoke_with_usage(
+                    outcome_prompt | model.with_structured_output(AnswerOutcome),
+                    {"question": question, "response": prose},
+                    self._settings,
+                )
+                outcome = normalize_streamed_answer_outcome(prose, outcome)
+                self.last_answer_metadata_seconds = time.perf_counter() - metadata_began
                 value = GroundedAnswer(
+                    outcome=outcome.outcome,
+                    refusal_reason=outcome.refusal_reason,
                     answer=prose,
                     citations=_citations_from_answer(prose),
                     # Deliberately empty on this path. The buffered path lets the
@@ -925,7 +1011,7 @@ class LangChainGroundedAnswerGenerator:
                     # free-text commentary, which no client renders.
                     missing_information=[],
                 )
-                usage = prose_usage
+                usage = _combine_usage(prose_usage, outcome_usage)
         self.last_usage = usage
         return value
 

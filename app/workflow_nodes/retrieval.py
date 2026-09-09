@@ -105,15 +105,36 @@ def _canonical_route_tokens(
     access-policy, and source-type filters as every other exact lookup.
     """
 
+    tokens, _refusal_reason = _canonical_route_directive(
+        question, documents, limit=limit
+    )
+    return tokens
+
+
+def _canonical_route_directive(
+    question: str, documents: list[Document], *, limit: int = 12
+) -> tuple[tuple[str, ...], str]:
+    """Read exact question routes and their corpus-declared disposition.
+
+    ``QUESTION-OUT-OF-SCOPE`` is a documentation convention, not a project or
+    department rule. Any authorized corpus can use it to declare exact
+    questions that must produce an evidence refusal. Nearby wording continues
+    through normal retrieval; no business keyword is inferred here.
+    """
+
     normalized_question = " ".join(
         re.findall(r"[a-z0-9à-ÿ]+", question.casefold())
     )
     if len(normalized_question.split()) < 3:
-        return ()
+        return (), ""
     tokens: list[str] = []
+    refusal_reason = ""
     for document in documents:
-        structure = " ".join(
-            str(value) for value in document.metadata.get("structure_path") or ()
+        structure_value = document.metadata.get("structure_path") or ""
+        structure = (
+            " ".join(str(value) for value in structure_value)
+            if isinstance(structure_value, (list, tuple))
+            else str(structure_value)
         )
         if "QUESTION-" not in structure.upper():
             continue
@@ -131,13 +152,34 @@ def _canonical_route_tokens(
             and normalized_body != normalized_question
         ):
             continue
+        if "QUESTION-OUT-OF-SCOPE" in structure.upper():
+            refusal_reason = "INSUFFICIENT_EVIDENCE"
         for token in re.findall(r"\[([A-Z][A-Z0-9_-]{2,})\]", document.page_content):
             if token.startswith("QUESTION-") or token in tokens:
                 continue
             tokens.append(token)
             if len(tokens) >= limit:
-                return tuple(tokens)
-    return tuple(tokens)
+                return tuple(tokens), refusal_reason
+    return tuple(tokens), refusal_reason
+
+
+async def _load_canonical_route_directive(
+    retriever: object,
+    question: str,
+    semantic_documents: list[Document],
+    source_types: tuple[str, ...],
+) -> tuple[tuple[str, ...], str]:
+    """Resolve a corpus route without depending on a semantic candidate hit."""
+
+    canonical_loader = getattr(retriever, "ainvoke_canonical_questions", None)
+    canonical_documents = (
+        await canonical_loader(question, source_types)
+        if canonical_loader is not None
+        else []
+    )
+    return _canonical_route_directive(
+        question, [*canonical_documents, *semantic_documents]
+    )
 
 
 def _retain_explicit_identifier_anchors(
@@ -532,9 +574,13 @@ class RetrievalNodesMixin:
                 )
             else:
                 queries.pop(translation_slot)
-        canonical_route_tokens = _canonical_route_tokens(
-            resolved_question,
-            [document for group in results for document in group],
+        canonical_route_tokens, canonical_route_refusal_reason = (
+            await _load_canonical_route_directive(
+                self._retriever,
+                resolved_question,
+                [document for group in results for document in group],
+                source_types,
+            )
         )
         structure_loader = getattr(
             self._retriever, "ainvoke_structure_identifiers", None
@@ -815,6 +861,7 @@ class RetrievalNodesMixin:
             "fallback_candidate_count": fallback_candidates,
             "fused_candidate_count": len(fused_candidates),
             "prefiltered_count": len(fused_candidates) - len(responsive),
+            "canonical_route_refusal_reason": canonical_route_refusal_reason,
         }
 
     async def _retrieve_scope(
