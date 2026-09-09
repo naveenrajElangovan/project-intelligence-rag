@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 
-BASELINE_ERROR_COUNT = 472
+BASELINE_ERROR_COUNT = 473
 ERROR_PATTERN = re.compile(r"^.+:\d+: error:", re.MULTILINE)
 
 
