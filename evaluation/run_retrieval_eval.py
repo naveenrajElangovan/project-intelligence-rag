@@ -18,7 +18,7 @@ from langchain_core.documents import Document
 from app.chroma_collections import project_collection_name, verify_project_collection
 from app.config import Settings
 from app.embedding import build_embedder
-from app.models import RagRequest
+from app.models import RagRequest, RetrievalProfile
 from app.reranking import (
     _exact_code_anchor_match,
     build_reranker,
@@ -989,22 +989,52 @@ async def _generation_candidate_rows(
 
 
 async def _main(arguments: argparse.Namespace) -> None:
-    overrides: dict[str, Any] = {
+    connection_overrides: dict[str, Any] = {
         "chroma_host": arguments.chroma_host,
         "chroma_port": arguments.chroma_port,
         "chroma_collection": arguments.collection,
     }
+    settings = Settings(**connection_overrides)
+    if arguments.schema_version is not None:
+        if arguments.schema_version not in settings.supported_schema_versions:
+            raise ValueError(
+                f"Unsupported evaluation schema version: {arguments.schema_version}"
+            )
+        settings = settings.model_copy(
+            update={"supported_schema_versions": (arguments.schema_version,)}
+        )
+    if arguments.embedding_model is not None:
+        if arguments.embedding_model not in settings.supported_embedding_models:
+            raise ValueError(
+                f"Unsupported evaluation embedding model: {arguments.embedding_model}"
+            )
+        settings = settings.model_copy(
+            update={"supported_embedding_models": (arguments.embedding_model,)}
+        )
+    profile_values: dict[str, int | float] = {
+        "maxChunksPerSource": settings.max_chunks_per_source,
+        "rerankTopN": settings.rerank_top_n,
+        "mixedSourceTopN": settings.mixed_source_top_n,
+        "rerankScoreThreshold": settings.rerank_score_threshold,
+    }
     for name in (
         "cross_encoder_candidate_limit",
         "inventory_cross_encoder_candidate_limit",
-        "rerank_top_n",
-        "rerank_score_threshold",
-        "max_chunks_per_source",
     ):
         value = getattr(arguments, name, None)
         if value is not None:
-            overrides[name] = value
-    settings = Settings(**overrides)
+            settings = settings.model_copy(update={name: value})
+    for argument_name, profile_name in (
+        ("max_chunks_per_source", "maxChunksPerSource"),
+        ("rerank_top_n", "rerankTopN"),
+        ("mixed_source_top_n", "mixedSourceTopN"),
+        ("rerank_score_threshold", "rerankScoreThreshold"),
+    ):
+        value = getattr(arguments, argument_name, None)
+        if value is not None:
+            profile_values[profile_name] = value
+    profile = RetrievalProfile.model_validate(profile_values)
+    settings = settings.model_copy(update=profile.settings_overrides())
     physical_name = project_collection_name(arguments.collection, arguments.project_id)
     collection = HttpClient(
         host=arguments.chroma_host, port=arguments.chroma_port
@@ -1561,6 +1591,14 @@ def main() -> None:
     parser.add_argument("--chroma-port", type=int, default=8000)
     parser.add_argument("--collection", default="project-intelligence")
     parser.add_argument(
+        "--schema-version",
+        help="Use the schema version configured on the evaluated project's vector route.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        help="Use the embedding model configured on the evaluated project's vector route.",
+    )
+    parser.add_argument(
         "--disable-lexical",
         action="store_true",
         help="Run an ablation with the sparse channel removed.",
@@ -1597,6 +1635,7 @@ def main() -> None:
     parser.add_argument("--cross-encoder-candidate-limit", type=int)
     parser.add_argument("--inventory-cross-encoder-candidate-limit", type=int)
     parser.add_argument("--rerank-top-n", type=int)
+    parser.add_argument("--mixed-source-top-n", type=int)
     parser.add_argument("--rerank-score-threshold", type=float)
     parser.add_argument("--max-chunks-per-source", type=int)
     parser.add_argument(
