@@ -49,6 +49,12 @@ if [[ -z "${api_key}" ]]; then
   api_key="$(<"${KEY_FILE}")"
 fi
 export PI_RAG_INTERNAL_API_KEY="${api_key}"
+# launchd does not inherit this short-lived shell environment. Persist only the
+# already-resolved service credential in the private runtime directory so the
+# worker and Docker RAG continue to authenticate with the same value.
+umask 077
+printf '%s' "${api_key}" >"${KEY_FILE}"
+chmod 0600 "${KEY_FILE}"
 
 healthy() {
   curl --fail --silent --max-time 5 \
@@ -78,23 +84,26 @@ if healthy; then
   exit 1
 fi
 
-nohup /bin/bash "${SCRIPT_DIRECTORY}/run_accelerator_macos.sh" \
-  >>"${LOG_FILE}" 2>&1 &
-accelerator_pid="$!"
-printf '%s\n' "${accelerator_pid}" >"${PID_FILE}"
+# A shell background child can be reaped when the terminal or automation
+# session ends even under nohup. A LaunchAgent cannot read a repository under
+# macOS's privacy-protected Desktop folder. Ask Terminal to own the worker;
+# `-g -j` keeps it in the background while retaining the user's Desktop access.
+open -g -j -a Terminal "${SCRIPT_DIRECTORY}/run_accelerator_macos.sh"
 
 for _ in {1..120}; do
   if healthy; then
+    accelerator_pid="$(lsof -ti tcp:8004 -sTCP:LISTEN 2>/dev/null | head -1)"
+    if [[ -z "${accelerator_pid}" ]]; then
+      echo "MPS accelerator is healthy but its listener PID was not found." >&2
+      exit 1
+    fi
+    printf '%s\n' "${accelerator_pid}" >"${PID_FILE}"
     echo "MPS accelerator started on http://127.0.0.1:8004 (PID ${accelerator_pid})."
     exit 0
-  fi
-  if ! kill -0 "${accelerator_pid}" 2>/dev/null; then
-    break
   fi
   sleep 1
 done
 
 echo "MPS accelerator failed. Review ${LOG_FILE}." >&2
-kill "${accelerator_pid}" 2>/dev/null || true
 rm -f "${PID_FILE}"
 exit 1

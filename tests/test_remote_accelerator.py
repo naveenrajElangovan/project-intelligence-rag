@@ -3,8 +3,13 @@ import asyncio
 from langchain_core.documents import Document
 
 from app.config import Settings
-from app.embedding import RemoteMultilingualEmbedder, build_embedder
+from app.embedding import (
+    LocalMultilingualEmbedder,
+    RemoteMultilingualEmbedder,
+    build_embedder,
+)
 from app.grounding import LocalCitationGroundingVerifier
+from app.inference_api import RerankPair
 from app.llm import GroundedAnswer
 from app.reranking import RemoteMultilingualReranker, build_reranker
 
@@ -33,6 +38,21 @@ def test_remote_embedder_preserves_cache_and_dimensions(monkeypatch) -> None:
     assert isinstance(embedder, RemoteMultilingualEmbedder)
     assert embedder.embed_query("same query") == embedder.embed_query("same query")
     assert len(calls) == 1
+
+
+def test_accelerator_can_leave_query_embedding_on_cpu() -> None:
+    settings = _settings().model_copy(update={"local_accelerator_embedding_enabled": False})
+
+    embedder = build_embedder(settings)
+
+    assert isinstance(embedder, LocalMultilingualEmbedder)
+
+
+def test_accelerator_accepts_empty_pairs_supported_by_local_cross_encoder() -> None:
+    assert RerankPair(query="", evidence="").model_dump() == {
+        "query": "",
+        "evidence": "",
+    }
 
 
 def test_remote_reranker_preserves_local_selection_logic(monkeypatch) -> None:

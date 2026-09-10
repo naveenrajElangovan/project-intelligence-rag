@@ -74,9 +74,7 @@ class LocalMultilingualEmbedder:
             return []
         normalized = [value.strip() for value in texts]
         with self._cache_lock:
-            missing = [
-                value for value in dict.fromkeys(normalized) if value not in self._cache
-            ]
+            missing = [value for value in dict.fromkeys(normalized) if value not in self._cache]
         if missing:
             self._encode(missing)
         with self._cache_lock:
@@ -165,7 +163,7 @@ class RemoteMultilingualEmbedder(LocalMultilingualEmbedder):
 
 def build_embedder(settings: Settings) -> LocalMultilingualEmbedder:
     """Build the mandatory local query embedder."""
-    if settings.local_accelerator_url:
+    if settings.local_accelerator_url and settings.local_accelerator_embedding_enabled:
         return RemoteMultilingualEmbedder(
             settings.local_embedding_model,
             base_url=settings.local_accelerator_url,

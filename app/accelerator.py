@@ -47,6 +47,27 @@ def _is_replayable(error: Exception) -> bool:
     )
 
 
+def _http_validation_summary(error: HTTPError) -> str:
+    """Return validation locations without echoing request content or secrets."""
+
+    try:
+        payload = json.loads(error.read())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    details = payload.get("detail") if isinstance(payload, dict) else None
+    if not isinstance(details, list):
+        return ""
+    failures: list[str] = []
+    for detail in details[:4]:
+        if not isinstance(detail, dict):
+            continue
+        location = detail.get("loc")
+        kind = detail.get("type")
+        if isinstance(location, list) and isinstance(kind, str):
+            failures.append(f"{'.'.join(str(part) for part in location)}:{kind}")
+    return ",".join(failures)
+
+
 def accelerator_request(
     base_url: str,
     path: str,
@@ -79,8 +100,16 @@ def accelerator_request(
             except (HTTPError, URLError, TimeoutError) as error:
                 last_error = error
                 if attempt + 1 >= max(1, attempts) or not _is_replayable(error):
+                    validation = (
+                        _http_validation_summary(error) if isinstance(error, HTTPError) else ""
+                    )
+                    suffix = (
+                        f" ({error.code}{': ' + validation if validation else ''})"
+                        if isinstance(error, HTTPError)
+                        else ""
+                    )
                     raise RuntimeError(
-                        f"Local accelerator request failed: {type(error).__name__}"
+                        f"Local accelerator request failed: {type(error).__name__}{suffix}"
                     ) from error
                 time.sleep(0.2 * (2**attempt))
                 continue
@@ -121,9 +150,7 @@ def accelerator_embed(
             raise RuntimeError("Local accelerator returned invalid embedding vectors.")
         for vector in returned:
             if not isinstance(vector, list) or len(vector) != dimensions:
-                raise RuntimeError(
-                    "Local accelerator returned the wrong embedding dimensions."
-                )
+                raise RuntimeError("Local accelerator returned the wrong embedding dimensions.")
             vectors.append([float(value) for value in vector])
     return vectors
 
@@ -157,9 +184,7 @@ def accelerator_scores(
             base_url,
             "/rerank",
             {
-                "pairs": [
-                    {"query": query, "evidence": evidence} for query, evidence in batch
-                ],
+                "pairs": [{"query": query, "evidence": evidence} for query, evidence in batch],
                 "max_length": max_length,
             },
             api_key=api_key,

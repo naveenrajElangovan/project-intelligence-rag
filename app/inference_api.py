@@ -20,8 +20,11 @@ class EmbedRequest(BaseModel):
 
 
 class RerankPair(BaseModel):
-    query: str = Field(min_length=1, max_length=4_000)
-    evidence: str = Field(min_length=1, max_length=16_000)
+    # Match the in-process cross-encoder contract exactly. Some fail-closed
+    # routing paths intentionally score an empty resolved query; the model can
+    # score that pair, and the remote transport must not turn it into a 422.
+    query: str = Field(max_length=4_000)
+    evidence: str = Field(max_length=16_000)
 
 
 class RerankRequest(BaseModel):

@@ -48,9 +48,13 @@ class Settings(BaseSettings):
     ollama_reasoning_enabled: bool = False
     local_inference_enabled: bool = True
     # Docker Desktop cannot expose Apple's Metal backend to Linux containers.
-    # When set, embedding and cross-encoder scoring are delegated to the
-    # authenticated macOS worker while orchestration remains containerized.
+    # When set, cross-encoder scoring is delegated to the authenticated macOS
+    # worker while orchestration remains containerized. Query embedding can be
+    # kept on CPU to preserve the exact candidate pool produced by the indexed
+    # CPU embeddings; MPS and CPU differ enough numerically to move a boundary
+    # candidate in the bilingual store quality lane.
     local_accelerator_url: str = ""
+    local_accelerator_embedding_enabled: bool = True
     local_accelerator_timeout_seconds: float = 120.0
     # Connection-level retries only. A refused or dropped connection means the
     # worker never started, so replaying it is free. A timeout means it is
@@ -258,8 +262,8 @@ class Settings(BaseSettings):
                 and self.openai_standard_model
                 and self.openai_complex_model
             )
-        credential_configured = (
-            self.azure_openai_use_managed_identity or bool(self.azure_openai_api_key)
+        credential_configured = self.azure_openai_use_managed_identity or bool(
+            self.azure_openai_api_key
         )
         return all(
             (self.azure_openai_endpoint, self.azure_openai_deployment, credential_configured)
@@ -289,48 +293,34 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_SUPPORTED_SCHEMA_VERSIONS must not be empty")
         if self.ollama_context_tokens < 4_096 or self.ollama_context_tokens > 262_144:
             raise ValueError(
-                "PI_RAG_OLLAMA_CONTEXT_TOKENS must be between 4096 and the model's "
-                "native 262144"
+                "PI_RAG_OLLAMA_CONTEXT_TOKENS must be between 4096 and the model's native 262144"
             )
         if self.ollama_max_output_tokens < 256 or self.ollama_max_output_tokens > 8_192:
             raise ValueError("PI_RAG_OLLAMA_MAX_OUTPUT_TOKENS must be between 256 and 8192")
         if self.llm_timeout_seconds <= 0:
             raise ValueError("PI_RAG_LLM_TIMEOUT_SECONDS must be greater than zero")
         if self.llm_stream_idle_timeout_seconds <= 0:
-            raise ValueError(
-                "PI_RAG_LLM_STREAM_IDLE_TIMEOUT_SECONDS must be greater than zero"
-            )
-        if (
-            self.llm_stream_total_timeout_seconds
-            <= self.llm_stream_idle_timeout_seconds
-        ):
+            raise ValueError("PI_RAG_LLM_STREAM_IDLE_TIMEOUT_SECONDS must be greater than zero")
+        if self.llm_stream_total_timeout_seconds <= self.llm_stream_idle_timeout_seconds:
             raise ValueError(
                 "PI_RAG_LLM_STREAM_TOTAL_TIMEOUT_SECONDS must exceed "
                 "PI_RAG_LLM_STREAM_IDLE_TIMEOUT_SECONDS"
             )
         if self.llm_stream_first_chunk_timeout_seconds <= 0:
             raise ValueError(
-                "PI_RAG_LLM_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS must be greater "
-                "than zero"
+                "PI_RAG_LLM_STREAM_FIRST_CHUNK_TIMEOUT_SECONDS must be greater than zero"
             )
         if self.query_embedding_timeout_seconds <= 0:
-            raise ValueError(
-                "PI_RAG_QUERY_EMBEDDING_TIMEOUT_SECONDS must be greater than zero"
-            )
+            raise ValueError("PI_RAG_QUERY_EMBEDDING_TIMEOUT_SECONDS must be greater than zero")
         if not 1 <= self.local_accelerator_retry_attempts <= 3:
-            raise ValueError(
-                "PI_RAG_LOCAL_ACCELERATOR_RETRY_ATTEMPTS must be between 1 and 3"
-            )
+            raise ValueError("PI_RAG_LOCAL_ACCELERATOR_RETRY_ATTEMPTS must be between 1 and 3")
         if not 1 <= self.accelerator_max_concurrency <= 8:
-            raise ValueError(
-                "PI_RAG_ACCELERATOR_MAX_CONCURRENCY must be between 1 and 8"
-            )
+            raise ValueError("PI_RAG_ACCELERATOR_MAX_CONCURRENCY must be between 1 and 8")
         if not 0 <= self.max_answer_repairs <= 3:
             raise ValueError("PI_RAG_MAX_ANSWER_REPAIRS must be between 0 and 3")
         if self.request_timeout_seconds <= self.llm_stream_total_timeout_seconds:
             raise ValueError(
-                "PI_RAG_REQUEST_TIMEOUT_SECONDS must exceed "
-                "PI_RAG_LLM_STREAM_TOTAL_TIMEOUT_SECONDS"
+                "PI_RAG_REQUEST_TIMEOUT_SECONDS must exceed PI_RAG_LLM_STREAM_TOTAL_TIMEOUT_SECONDS"
             )
         # One generation call plus every repair it may chain, each retried. The
         # previous check counted a single call and could not see the repairs.
@@ -345,21 +335,15 @@ class Settings(BaseSettings):
                 "repairs"
             )
         if self.answer_detail not in {"brief", "standard", "detailed"}:
-            raise ValueError(
-                "PI_RAG_ANSWER_DETAIL must be brief, standard, or detailed"
-            )
+            raise ValueError("PI_RAG_ANSWER_DETAIL must be brief, standard, or detailed")
         if not 0 <= self.ollama_presence_penalty <= 2:
             raise ValueError("PI_RAG_OLLAMA_PRESENCE_PENALTY must be between 0 and 2")
         if not 0.5 <= self.ollama_repeat_penalty <= 2:
             raise ValueError("PI_RAG_OLLAMA_REPEAT_PENALTY must be between 0.5 and 2")
         if not 1 <= self.lexical_corpus_warm_timeout_seconds <= 300:
-            raise ValueError(
-                "PI_RAG_LEXICAL_CORPUS_WARM_TIMEOUT_SECONDS must be between 1 and 300"
-            )
+            raise ValueError("PI_RAG_LEXICAL_CORPUS_WARM_TIMEOUT_SECONDS must be between 1 and 300")
         if not 1 <= self.lexical_corpus_warm_retry_seconds <= 300:
-            raise ValueError(
-                "PI_RAG_LEXICAL_CORPUS_WARM_RETRY_SECONDS must be between 1 and 300"
-            )
+            raise ValueError("PI_RAG_LEXICAL_CORPUS_WARM_RETRY_SECONDS must be between 1 and 300")
         if self.prompt_overhead_reserve_tokens < 512:
             raise ValueError("PI_RAG_PROMPT_OVERHEAD_RESERVE_TOKENS must be at least 512")
         fixed_prompt_cost = (
@@ -382,13 +366,10 @@ class Settings(BaseSettings):
         if not 0 <= self.prefilter_min_dense_score <= 1:
             raise ValueError("PI_RAG_PREFILTER_MIN_DENSE_SCORE must be between 0 and 1")
         if not 0 <= self.context_relevance_floor <= 1:
-            raise ValueError(
-                "PI_RAG_CONTEXT_RELEVANCE_FLOOR must be between 0 and 1"
-            )
+            raise ValueError("PI_RAG_CONTEXT_RELEVANCE_FLOOR must be between 0 and 1")
         if self.context_relevance_floor >= self.context_relevance_threshold:
             raise ValueError(
-                "PI_RAG_CONTEXT_RELEVANCE_FLOOR must be below "
-                "PI_RAG_CONTEXT_RELEVANCE_THRESHOLD"
+                "PI_RAG_CONTEXT_RELEVANCE_FLOOR must be below PI_RAG_CONTEXT_RELEVANCE_THRESHOLD"
             )
         if not 0 <= self.prefilter_max_removed_fraction <= 0.5:
             raise ValueError(
@@ -399,9 +380,7 @@ class Settings(BaseSettings):
         if self.local_max_concurrency < 1 or self.local_max_concurrency > 4:
             raise ValueError("PI_RAG_LOCAL_MAX_CONCURRENCY must be between 1 and 4")
         if self.local_accelerator_timeout_seconds <= 0:
-            raise ValueError(
-                "PI_RAG_LOCAL_ACCELERATOR_TIMEOUT_SECONDS must be greater than zero"
-            )
+            raise ValueError("PI_RAG_LOCAL_ACCELERATOR_TIMEOUT_SECONDS must be greater than zero")
         if self.max_inflight_requests < 1 or self.max_inflight_requests > 32:
             raise ValueError("PI_RAG_MAX_INFLIGHT_REQUESTS must be between 1 and 32")
         if self.admission_capacity_override is not None and not (
@@ -412,9 +391,7 @@ class Settings(BaseSettings):
                 "PI_RAG_MAX_INFLIGHT_REQUESTS"
             )
         if self.load_shed_wait_seconds <= 0 or self.load_shed_wait_seconds > 5:
-            raise ValueError(
-                "PI_RAG_LOAD_SHED_WAIT_SECONDS must be greater than 0 and at most 5"
-            )
+            raise ValueError("PI_RAG_LOAD_SHED_WAIT_SECONDS must be greater than 0 and at most 5")
         if self.max_query_variants < 1 or self.max_query_variants > 5:
             raise ValueError("PI_RAG_MAX_QUERY_VARIANTS must be between 1 and 5")
         if self.max_entity_expansions < 0 or self.max_entity_expansions > 20:
@@ -426,15 +403,11 @@ class Settings(BaseSettings):
         if self.lexical_fusion_weight <= 0 or self.dense_fusion_weight <= 0:
             raise ValueError("Hybrid fusion weights must be greater than zero")
         if not 0 <= self.source_volume_discount_strength <= 1:
-            raise ValueError(
-                "PI_RAG_SOURCE_VOLUME_DISCOUNT_STRENGTH must be between 0 and 1"
-            )
+            raise ValueError("PI_RAG_SOURCE_VOLUME_DISCOUNT_STRENGTH must be between 0 and 1")
         if self.feature_inventory_top_n < 2 or self.feature_inventory_top_n > 25:
             raise ValueError("PI_RAG_FEATURE_INVENTORY_TOP_N must be between 2 and 25")
         if not 1 <= self.population_contract_max_members <= 500:
-            raise ValueError(
-                "PI_RAG_POPULATION_CONTRACT_MAX_MEMBERS must be between 1 and 500"
-            )
+            raise ValueError("PI_RAG_POPULATION_CONTRACT_MAX_MEMBERS must be between 1 and 500")
         if (
             self.inventory_cross_encoder_candidate_limit < 4
             or self.inventory_cross_encoder_candidate_limit > 25
@@ -446,7 +419,10 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_DEPENDENCY_RETRY_ATTEMPTS must be between 1 and 5")
         if self.lexical_fallback_max_records < 100 or self.lexical_fallback_max_records > 20_000:
             raise ValueError("PI_RAG_LEXICAL_FALLBACK_MAX_RECORDS must be between 100 and 20000")
-        if self.lexical_fallback_cache_ttl_seconds < 0 or self.lexical_fallback_cache_ttl_seconds > 3600:
+        if (
+            self.lexical_fallback_cache_ttl_seconds < 0
+            or self.lexical_fallback_cache_ttl_seconds > 3600
+        ):
             raise ValueError("PI_RAG_LEXICAL_FALLBACK_CACHE_TTL_SECONDS must be between 0 and 3600")
         if self.embedding_dimensions not in {384, 768, 1024}:
             raise ValueError("PI_RAG_EMBEDDING_DIMENSIONS must be 384, 768, or 1024")
@@ -455,9 +431,7 @@ class Settings(BaseSettings):
         if self.local_rerank_batch_size < 1 or self.local_rerank_batch_size > 128:
             raise ValueError("PI_RAG_LOCAL_RERANK_BATCH_SIZE must be between 1 and 128")
         if self.local_rerank_max_length < 256 or self.local_rerank_max_length > 8192:
-            raise ValueError(
-                "PI_RAG_LOCAL_RERANK_MAX_LENGTH must be between 256 and 8192"
-            )
+            raise ValueError("PI_RAG_LOCAL_RERANK_MAX_LENGTH must be between 256 and 8192")
         if not self.local_embedding_model:
             raise ValueError("PI_RAG_LOCAL_EMBEDDING_MODEL is required for local embedding")
         if not 0 <= self.grounding_score_threshold <= 1:
@@ -473,9 +447,7 @@ class Settings(BaseSettings):
                 "PI_RAG_GROUNDING_TABLE_EVIDENCE_SCORE_THRESHOLD must be between 0 and the normal grounding threshold"
             )
         if not 0 <= self.exact_code_rerank_score_threshold <= 1:
-            raise ValueError(
-                "PI_RAG_EXACT_CODE_RERANK_SCORE_THRESHOLD must be between 0 and 1"
-            )
+            raise ValueError("PI_RAG_EXACT_CODE_RERANK_SCORE_THRESHOLD must be between 0 and 1")
         if not 0 <= self.rerank_cross_language_score_threshold <= self.rerank_score_threshold:
             raise ValueError(
                 "PI_RAG_RERANK_CROSS_LANGUAGE_SCORE_THRESHOLD must be between 0 "
@@ -496,15 +468,16 @@ class Settings(BaseSettings):
         environment = self.environment.strip().lower()
         if environment != "development" and len(self.internal_api_key) < 32:
             raise ValueError(
-                "PI_RAG_INTERNAL_API_KEY must contain at least 32 characters "
-                "outside development"
+                "PI_RAG_INTERNAL_API_KEY must contain at least 32 characters outside development"
             )
         if environment == "production":
             missing = []
             if len(self.internal_api_key) < 32:
                 missing.append("PI_RAG_INTERNAL_API_KEY")
             if not self.chroma_host or self.chroma_port < 1 or not self.chroma_collection:
-                missing.append("PI_RAG_CHROMA_HOST, PI_RAG_CHROMA_PORT, and PI_RAG_CHROMA_COLLECTION")
+                missing.append(
+                    "PI_RAG_CHROMA_HOST, PI_RAG_CHROMA_PORT, and PI_RAG_CHROMA_COLLECTION"
+                )
             if self.llm_provider not in {"ollama", "openai", "azure-openai"}:
                 missing.append("PI_RAG_LLM_PROVIDER must be ollama, openai, or azure-openai")
             if not self.llm_configured:
