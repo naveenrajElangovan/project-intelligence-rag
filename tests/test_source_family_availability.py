@@ -78,3 +78,23 @@ def test_documentation_only_project_refuses_developer_sources_before_retrieval(
     assert response.confidence == "NONE"
     assert response.sources == []
     assert response.failure_reason == "SOURCE_SCOPE_VIOLATION"
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "The payment terminal is rejecting every transaction. What should I do?",
+        "La terminal de pago rechaza todas las transacciones. ¿Qué debo hacer?",
+    ),
+)
+def test_payment_terminal_is_not_mistaken_for_a_command_line_terminal(
+    question: str,
+) -> None:
+    request = RagRequest(
+        projectId="T2.0-STORE",
+        collectionName="project-intelligence",
+        question=question,
+        accessPolicyIds=["project:T2.0-STORE"],
+    )
+
+    assert clarification_response(request, ("pos", "bot"), ("PAGE",)) is None
