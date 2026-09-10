@@ -10,13 +10,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from opentelemetry.sdk.trace import SpanProcessor
+
 from app.config import Settings
 
 
 LOGGER = logging.getLogger("project_intelligence.rag.openinference")
 
 
-class _BoundarySpanProcessor:
+class _BoundarySpanProcessor(SpanProcessor):
     """Copy request baggage onto every auto-instrumented child span."""
 
     def on_start(self, span: Any, parent_context: Any = None) -> None:

@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import re
 
 import pytest
+from opentelemetry.sdk.trace import SpanProcessor
 
 from app.config import Settings
 from app.openinference_tracing import _BoundarySpanProcessor
@@ -25,6 +26,7 @@ def test_trace_content_policy_defaults_to_metadata_only() -> None:
 
 def test_boundary_processor_supports_pre_end_sdk_hook() -> None:
     processor = _BoundarySpanProcessor()
+    assert isinstance(processor, SpanProcessor)
     processor._on_ending(object())
 
 
