@@ -46,8 +46,13 @@ def clarification_response(
     )
     explicit_developer_system = bool(
         re.search(
-            r"\b(?:github|source code|database|sql|terminal|secrets?|tokens?|logs?|"
+            r"\b(?:github|source code|database|sql|secrets?|tokens?|logs?|"
             r"código fuente|base de datos|secretos?)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:(?:linux|shell|command|cli)\s+terminal|"
+            r"terminal\s+(?:command|commands|shell|comando|comandos))\b",
             normalized,
         )
     )
