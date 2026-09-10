@@ -282,6 +282,24 @@ def stage_complete(
         _TOKENS.labels(stage, "output", model_provider, model_name, model_profile).inc(output_tokens)
     if retry_count:
         _RETRIES.labels(stage).inc(retry_count)
+    # Mirror safe stage telemetry into the active OpenTelemetry span. Importing
+    # lazily keeps Prometheus/logging usable when tracing dependencies are absent.
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        span.add_event(
+            f"rag.stage.{stage}",
+            attributes={
+                key: value
+                for key, value in payload.items()
+                if isinstance(value, (bool, int, float, str))
+            },
+        )
+        if reason_code != "OK":
+            span.set_attribute("rag.reason_code", reason_code)
+    except Exception:
+        pass
     LOGGER.info(
         json.dumps(payload, separators=(",", ":"), sort_keys=True)
     )
@@ -299,6 +317,16 @@ def request_complete(
     duration_seconds = time.perf_counter() - began
     _REQUESTS.labels(outcome, confidence, model_profile, language).inc()
     _REQUEST_DURATION.labels(outcome).observe(duration_seconds)
+    try:
+        from opentelemetry import trace
+
+        span = trace.get_current_span()
+        span.set_attribute("rag.outcome", outcome)
+        span.set_attribute("rag.confidence", confidence)
+        span.set_attribute("rag.reason_code", reason_code)
+        span.set_attribute("rag.duration_ms", round(duration_seconds * 1000, 2))
+    except Exception:
+        pass
     LOGGER.info(
         json.dumps(
             {

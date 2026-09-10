@@ -4,10 +4,10 @@ import math
 import hashlib
 import re
 
+from langchain_core.documents import Document
 from langgraph.config import get_stream_writer
 
 from app.llm import (
-    BilingualQueryPlanner,
     GroundedAnswer,
     TokenUsage,
     answer_sentence_floor,
@@ -41,7 +41,6 @@ from app.workflow_support.conversation import (
 from app.workflow_support.completeness import (
     _answer_requirements,
     _completeness_repair_query,
-    _include_repair_evidence,
     _merge_ranked_documents,
     _missing_answer_requirements,
 )
@@ -62,7 +61,6 @@ from app.workflow_support.query_analysis import (
     _add_usage,
     _normalized_words,
     _overview_repair_kwargs,
-    _safe_query_variant,
     _source_authority_valid,
 )
 
@@ -176,8 +174,10 @@ def _referential_transformation_requested(
 ) -> bool:
     """Detect a request that transforms the prior answer rather than changing subject."""
 
-    if question == resolved_question or not vocabulary or not any(
-        getattr(message, "role", "") == "assistant" for message in history
+    if (
+        question == resolved_question
+        or not vocabulary
+        or not any(getattr(message, "role", "") == "assistant" for message in history)
     ):
         return False
     candidate_subject = _conversation_subject(question)
@@ -210,9 +210,7 @@ def _attribute_table_requested(question: str) -> bool:
     )
 
 
-def _comparison_subjects(
-    question: str, entities: tuple[str, ...]
-) -> tuple[str, ...]:
+def _comparison_subjects(question: str, entities: tuple[str, ...]) -> tuple[str, ...]:
     """Resolve explicit comparison subjects without inventing project concepts."""
 
     identifiers = member_identifiers(question)
@@ -251,7 +249,11 @@ def _enforce_table_claim_shape(
 ) -> tuple[GroundedAnswer, int]:
     """Remove format-invalid claims without changing grounding policy."""
 
-    if answer_style not in {"structured_tabular", "comparison_table"}:
+    if answer_style not in {
+        "structured_tabular",
+        "comparison_table",
+        "single_record_details",
+    }:
         return generated, 0
     invalid = [
         claim.text
@@ -264,25 +266,211 @@ def _enforce_table_claim_shape(
     return _remove_unsupported_claims(generated, invalid)
 
 
+def _single_record_details_table(generated: GroundedAnswer, language: str) -> GroundedAnswer:
+    """Preserve cited model prose in a deterministic record-details table."""
+
+    if answer_shape_metrics(generated.answer)["answer_table_count"] > 0:
+        return generated
+    rows: list[str] = []
+    for index, claim in enumerate(material_claims(generated.answer), start=1):
+        citations = re.findall(r"\[SOURCE (\d+)\]", claim.text)
+        if not citations:
+            continue
+        value = re.sub(r"\s*\[SOURCE \d+\]", "", claim.text).strip()
+        value = re.sub(
+            r"(?i)\s*(?:as shown|shown|listed|provided) in the (?:table|list) below\.?$",
+            "",
+            value,
+        ).strip()
+        value = value.replace("|", "\\|")
+        if value:
+            label = ("Detalle" if language == "es" else "Detail") + f" {index}"
+            source = " ".join(f"[SOURCE {citation}]" for citation in citations)
+            rows.append(f"| {label} | {value} | {source} |")
+    if not rows:
+        return generated
+    headers = (
+        "| Atributo | Valor | Fuente |\n|---|---|---|"
+        if language == "es"
+        else "| Attribute | Value | Source |\n|---|---|---|"
+    )
+    return generated.model_copy(update={"answer": "\n".join((headers, *rows))})
+
+
+def _deterministic_single_record_table(
+    documents: list[Document], language: str
+) -> GroundedAnswer | None:
+    """Render one locator-bounded evidence record without model synthesis."""
+
+    for source_index, document in enumerate(documents, start=1):
+        locator = str(document.metadata.get("locator") or "").strip()
+        if not locator or locator.casefold().startswith("page:"):
+            continue
+        for line in classify_answer_lines(document.page_content):
+            if line.kind is not AnswerLineKind.TABLE_ROW:
+                continue
+            if locator.casefold() not in line.text.casefold():
+                continue
+            headers = [cell.strip() for cell in line.table_header.strip().strip("|").split("|")]
+            values = [cell.strip() for cell in line.text.strip().strip("|").split("|")]
+            if len(headers) != len(values) or len(values) < 2:
+                continue
+            rows: list[str] = []
+            for header, value in zip(headers, values):
+                if not header or not value:
+                    continue
+                safe_header = header.replace("|", "\\|")
+                safe_value = value.replace("|", "\\|")
+                rows.append(f"| {safe_header} | {safe_value} | [SOURCE {source_index}] |")
+            if not rows:
+                continue
+            table_header = (
+                "| Atributo | Valor | Fuente |\n|---|---|---|"
+                if language == "es"
+                else "| Attribute | Value | Source |\n|---|---|---|"
+            )
+            return GroundedAnswer(
+                answer="\n".join((table_header, *rows)),
+                citations=[source_index],
+            )
+
+        lines = classify_answer_lines(document.page_content)
+        headings = [line.text for line in lines if line.kind is AnswerLineKind.HEADING]
+        if len(headings) != 1 or locator.casefold() not in headings[0].casefold():
+            continue
+        if any(line.kind is AnswerLineKind.TABLE_HEADER for line in lines):
+            continue
+        body = " ".join(
+            line.text.strip()
+            for line in lines
+            if line.kind in {AnswerLineKind.PROSE, AnswerLineKind.LIST_ITEM} and line.text.strip()
+        )
+        if len(re.findall(r"\w+", body)) < 8:
+            continue
+        record = re.sub(r"^#{1,6}\s*", "", headings[0]).strip()
+        safe_record = record.replace("|", "\\|")
+        safe_body = re.sub(r"\s+", " ", body).replace("|", "\\|")
+        table_header = (
+            "| Atributo | Valor | Fuente |\n|---|---|---|"
+            if language == "es"
+            else "| Attribute | Value | Source |\n|---|---|---|"
+        )
+        labels = ("Registro", "Detalles") if language == "es" else ("Record", "Details")
+        rows = (
+            f"| {labels[0]} | {safe_record} | [SOURCE {source_index}] |",
+            f"| {labels[1]} | {safe_body} | [SOURCE {source_index}] |",
+        )
+        return GroundedAnswer(
+            answer="\n".join((table_header, *rows)),
+            citations=[source_index],
+        )
+    return None
+
+
 # Words that describe the shape of a request rather than its subject. A label
 # built from these would match every population and filter nothing.
-_POPULATION_LABEL_STOP_WORDS = frozenset({
-    "all", "and", "another", "any", "are", "available", "can", "complete", "configured",
-    "defined", "describe", "detail", "details", "did", "do", "does", "each", "enumerate",
-    "every", "exist", "existing", "explain", "for", "from", "full", "get", "give", "has",
-    "have", "how", "in", "is", "its", "know", "list", "many", "me", "more", "much",
-    "need", "of", "on", "one", "only", "or", "please", "provide", "remain", "show",
-    "supported", "tell", "the", "their", "them", "there", "these", "this", "those",
-    "to", "use", "used", "uses", "want", "was", "were", "what", "when", "where",
-    "which", "who", "why", "will", "with", "you", "your",
-    "todos", "todas", "cada", "dame", "lista", "listado", "muestra", "cuales", "cual",
-    "que", "los", "las", "del", "para", "por", "con", "hay", "son", "tiene", "tienen",
-})
+_POPULATION_LABEL_STOP_WORDS = frozenset(
+    {
+        "all",
+        "and",
+        "another",
+        "any",
+        "are",
+        "available",
+        "can",
+        "complete",
+        "configured",
+        "defined",
+        "describe",
+        "detail",
+        "details",
+        "did",
+        "do",
+        "does",
+        "each",
+        "enumerate",
+        "every",
+        "exist",
+        "existing",
+        "explain",
+        "for",
+        "from",
+        "full",
+        "get",
+        "give",
+        "has",
+        "have",
+        "how",
+        "in",
+        "is",
+        "its",
+        "know",
+        "list",
+        "many",
+        "me",
+        "more",
+        "much",
+        "need",
+        "of",
+        "on",
+        "one",
+        "only",
+        "or",
+        "please",
+        "provide",
+        "remain",
+        "show",
+        "supported",
+        "tell",
+        "the",
+        "their",
+        "them",
+        "there",
+        "these",
+        "this",
+        "those",
+        "to",
+        "use",
+        "used",
+        "uses",
+        "want",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "will",
+        "with",
+        "you",
+        "your",
+        "todos",
+        "todas",
+        "cada",
+        "dame",
+        "lista",
+        "listado",
+        "muestra",
+        "cuales",
+        "cual",
+        "que",
+        "los",
+        "las",
+        "del",
+        "para",
+        "por",
+        "con",
+        "hay",
+        "son",
+        "tiene",
+        "tienen",
+    }
+)
 
 
-def _population_labels(
-    question: str, entities: tuple[str, ...] = ()
-) -> tuple[str, ...]:
+def _population_labels(question: str, entities: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Describe which population the question asks to enumerate.
 
     Numeric and version labels ("all 1xx items") were the only thing extracted
@@ -321,10 +509,7 @@ def _population_labels(
         # silently dropped the subject the question was about.
         if len(folded) > 5 and folded.endswith("ing"):
             gerund_stem = folded[:-3]
-            if (
-                len(gerund_stem) > 2
-                and gerund_stem[-1] == gerund_stem[-2]
-            ):
+            if len(gerund_stem) > 2 and gerund_stem[-1] == gerund_stem[-2]:
                 gerund_stem = gerund_stem[:-1]
             # A gerund before a plural noun describes the relation, not the
             # population member kind ("sending events"). Defer it so the noun
@@ -345,8 +530,6 @@ def _population_labels(
 def _coverage(expected: tuple[str, ...], answer: str) -> tuple[str, ...]:
     normalized_answer = answer.casefold()
     return tuple(key for key in expected if key.casefold() not in normalized_answer)
-
-
 
 
 def _member_label(value: str) -> str:
@@ -387,16 +570,12 @@ def _subject_label_frequencies(
 ) -> dict[str, int]:
     """Count how many candidates carry each subject label."""
 
-    labels = tuple(
-        dict.fromkeys(label.casefold() for label in subject_labels if label)
-    )
+    labels = tuple(dict.fromkeys(label.casefold() for label in subject_labels if label))
     if not labels or not documents:
         return {}
     fields = [_subject_fields(document) for document in documents]
     return {
-        label: sum(
-            1 for heading, body in fields if label in heading or label in body
-        )
+        label: sum(1 for heading, body in fields if label in heading or label in body)
         for label in labels
     }
 
@@ -466,9 +645,7 @@ def _required_subject_labels(
     return set()
 
 
-def _subject_is_evidenced(
-    documents: list[object], subject_labels: tuple[str, ...]
-) -> bool:
+def _subject_is_evidenced(documents: list[object], subject_labels: tuple[str, ...]) -> bool:
     """Return whether the asked-for subject appears in the candidates at all.
 
     Zero weight has two very different causes. A label every candidate carries
@@ -522,9 +699,7 @@ def _subject_score(heading: str, body: str, weights: dict[str, float]) -> float:
     return score
 
 
-def _subject_document_ranking(
-    documents: list[object], weights: dict[str, float]
-) -> list[object]:
+def _subject_document_ranking(documents: list[object], weights: dict[str, float]) -> list[object]:
     """Order candidates by informative subject overlap, ties keeping rank.
 
     Which source may define the contract is decided by subject, not by size: a
@@ -555,9 +730,7 @@ def _enumerable_blocks(document: object) -> list[tuple[str, list[str]]]:
     """
 
     blocks: list[tuple[str, list[str]]] = [("", [])]
-    for line in classify_answer_lines(
-        str(getattr(document, "page_content", "") or "")
-    ):
+    for line in classify_answer_lines(str(getattr(document, "page_content", "") or "")):
         if line.kind is AnswerLineKind.HEADING:
             blocks.append((line.text, []))
         elif line.kind in {AnswerLineKind.TABLE_ROW, AnswerLineKind.LIST_ITEM}:
@@ -565,9 +738,7 @@ def _enumerable_blocks(document: object) -> list[tuple[str, list[str]]]:
     return [(heading, rows) for heading, rows in blocks if rows]
 
 
-def _block_subject_fields(
-    document: object, heading: str, rows: list[str]
-) -> tuple[str, str]:
+def _block_subject_fields(document: object, heading: str, rows: list[str]) -> tuple[str, str]:
     """Return the local heading and rows for one enumerable block.
 
     The document title is deliberately excluded. A bilingual Confluence page can
@@ -581,9 +752,7 @@ def _block_subject_fields(
     structure_path = metadata.get("structure_path") or []
     if isinstance(structure_path, str):
         structure_path = [structure_path]
-    local_heading = " ".join(
-        [*(str(value) for value in structure_path), heading]
-    ).casefold()
+    local_heading = " ".join([*(str(value) for value in structure_path), heading]).casefold()
     return local_heading, " ".join(rows).casefold()
 
 
@@ -598,19 +767,20 @@ def _scope_is_evidenced(
 
     if not labels:
         return True
-    pattern_matches = lambda text: any(
-        re.search(rf"(?<![\w-]){re.escape(label.casefold())}(?![\w-])", text)
-        for label in labels
-        if label
-    )
+
+    def pattern_matches(text: str) -> bool:
+        return any(
+            re.search(rf"(?<![\w-]){re.escape(label.casefold())}(?![\w-])", text)
+            for label in labels
+            if label
+        )
+
     if heading_is_authoritative and heading.strip():
         return pattern_matches(heading)
     return pattern_matches(f"{heading} {body}")
 
 
-def _prefer_document_language(
-    documents: list[object], language: str
-) -> list[object]:
+def _prefer_document_language(documents: list[object], language: str) -> list[object]:
     """Put the user's indexed language first without discarding fallbacks."""
 
     requested = language.strip().casefold()
@@ -618,9 +788,9 @@ def _prefer_document_language(
         return list(documents)
 
     def rank(document: object) -> int:
-        value = str(
-            (getattr(document, "metadata", {}) or {}).get("language") or ""
-        ).strip().casefold()
+        value = (
+            str((getattr(document, "metadata", {}) or {}).get("language") or "").strip().casefold()
+        )
         if value == requested:
             return 0
         if not value or value not in {"en", "es"}:
@@ -672,9 +842,7 @@ def _evidence_population_members(
         for label, frequency in local_frequencies.items()
     }
     required = _required_subject_labels(local_frequencies, subject_labels)
-    selection_weights = {
-        label: weights.get(label, 0.0) or 1.0 for label in required
-    }
+    selection_weights = {label: weights.get(label, 0.0) or 1.0 for label in required}
     ranked = list(documents)
     if not required and not scope_labels:
         # With no discriminating labels, retrieval rank remains authoritative as
@@ -738,9 +906,7 @@ def _population_source_ids(
     primary_subject = required[0] if required else set()
     for document in documents:
         enumerable_match = bool(
-            _evidence_population_members(
-                [document], subject_labels, scope_labels
-            )
+            _evidence_population_members([document], subject_labels, scope_labels)
         )
         if not enumerable_match:
             metadata = getattr(document, "metadata", {}) or {}
@@ -754,18 +920,11 @@ def _population_source_ids(
             # That locally scoped mention may discover the authorized source,
             # but only enumerable sibling chunks pass the stricter gate later.
             if not (
-                any(
-                    label in local_heading or label in local_body
-                    for label in primary_subject
-                )
-                and _scope_is_evidenced(
-                    local_heading, local_body, scope_labels
-                )
+                any(label in local_heading or label in local_body for label in primary_subject)
+                and _scope_is_evidenced(local_heading, local_body, scope_labels)
             ):
                 continue
-        source_id = str(
-            (getattr(document, "metadata", {}) or {}).get("source_id") or ""
-        ).strip()
+        source_id = str((getattr(document, "metadata", {}) or {}).get("source_id") or "").strip()
         if source_id:
             source_ids.append(source_id)
     return tuple(dict.fromkeys(source_ids))
@@ -837,9 +996,7 @@ def _published_population_members(
     members: list[str] = []
     for document in documents:
         header: list[str] = []
-        for line in classify_answer_lines(
-            str(getattr(document, "page_content", "") or "")
-        ):
+        for line in classify_answer_lines(str(getattr(document, "page_content", "") or "")):
             if line.kind is AnswerLineKind.TABLE_HEADER:
                 header = _table_cells(line.text)
                 continue
@@ -850,9 +1007,7 @@ def _published_population_members(
                 continue
             normalized_header = [cell.casefold() for cell in header]
             scope_indexes = [
-                index
-                for index, name in enumerate(normalized_header)
-                if name in scopes
+                index for index, name in enumerate(normalized_header) if name in scopes
             ]
             if not scope_indexes:
                 continue
@@ -897,9 +1052,7 @@ def _publisher_destination_rows(
     seen: set[str] = set()
     for source_number, document in enumerate(documents, start=1):
         header: list[str] = []
-        for line in classify_answer_lines(
-            str(getattr(document, "page_content", "") or "")
-        ):
+        for line in classify_answer_lines(str(getattr(document, "page_content", "") or "")):
             if line.kind is AnswerLineKind.TABLE_HEADER:
                 header = _table_cells(line.text)
                 continue
@@ -936,17 +1089,13 @@ def _publisher_destination_rows(
             if publisher_index < 0 or destination_index < 0:
                 continue
             publisher_cell = cells[publisher_index].casefold()
-            if not re.search(
-                rf"(?<![\w-]){re.escape(publisher)}(?![\w-])", publisher_cell
-            ):
+            if not re.search(rf"(?<![\w-]){re.escape(publisher)}(?![\w-])", publisher_cell):
                 continue
             destination_cell = cells[destination_index].casefold()
             matched = [
                 label
                 for label in destinations[:2]
-                if re.search(
-                    rf"(?<![\w-]){re.escape(label)}(?![\w-])", destination_cell
-                )
+                if re.search(rf"(?<![\w-]){re.escape(label)}(?![\w-])", destination_cell)
             ]
             event_cell = cells[event_index]
             identifiers = re.findall(r"`([^`]+)`", event_cell)
@@ -989,9 +1138,7 @@ def _publisher_destination_members(
 ) -> tuple[str, ...]:
     groups = _publisher_destination_rows(documents, publisher, destination_labels)
     return tuple(
-        member
-        for group in (*destination_labels[:2], "both")
-        for member, _ in groups.get(group, [])
+        member for group in (*destination_labels[:2], "both") for member, _ in groups.get(group, [])
     )
 
 
@@ -1018,9 +1165,7 @@ def _coverage_expected_identifiers(
         if destination_members:
             return destination_members
     if evidence_documents and _publisher_population_requested(question):
-        published = _published_population_members(
-            evidence_documents, scope_labels
-        )
+        published = _published_population_members(evidence_documents, scope_labels)
         if published:
             return published
     # The metadata population is loaded by a filter that admits a chunk when
@@ -1039,10 +1184,7 @@ def _coverage_expected_identifiers(
             document
             for document in population_documents
             if not required
-            or any(
-                label in " ".join(_subject_fields(document))
-                for label in required
-            )
+            or any(label in " ".join(_subject_fields(document)) for label in required)
         ]
         if scope_labels:
             qualifying = [
@@ -1058,18 +1200,14 @@ def _coverage_expected_identifiers(
             dict.fromkeys(
                 str(getattr(document, "metadata", {}).get("entity_key") or "").strip()
                 for document in qualifying
-                if str(
-                    getattr(document, "metadata", {}).get("entity_key") or ""
-                ).strip()
+                if str(getattr(document, "metadata", {}).get("entity_key") or "").strip()
             )
         )
     if metadata_population:
         return metadata_population
     if not evidence_documents:
         return ()
-    return _evidence_population_members(
-        evidence_documents, subject_labels, scope_labels
-    )
+    return _evidence_population_members(evidence_documents, subject_labels, scope_labels)
 
 
 def _row_text(value: str) -> str:
@@ -1100,9 +1238,7 @@ def _population_rows_from_evidence(
     for source_number, document in enumerate(documents, start=1):
         if not remaining:
             break
-        for line in classify_answer_lines(
-            str(getattr(document, "page_content", "") or "")
-        ):
+        for line in classify_answer_lines(str(getattr(document, "page_content", "") or "")):
             if line.kind not in {AnswerLineKind.TABLE_ROW, AnswerLineKind.LIST_ITEM}:
                 continue
             label = _member_label(line.text)
@@ -1140,20 +1276,15 @@ def _deterministic_population_inventory_answer(
         return None
     sources: dict[str, int] = {}
     for source_number, document in enumerate(documents, start=1):
-        identifier = str(
-            getattr(document, "metadata", {}).get("entity_key") or ""
-        ).strip()
+        identifier = str(getattr(document, "metadata", {}).get("entity_key") or "").strip()
         if identifier in expected:
             sources.setdefault(identifier, source_number)
     if all(identifier in sources for identifier in expected):
         return GroundedAnswer(
             answer="\n".join(
-                f"- {identifier} [SOURCE {sources[identifier]}]."
-                for identifier in expected
+                f"- {identifier} [SOURCE {sources[identifier]}]." for identifier in expected
             ),
-            citations=list(
-                dict.fromkeys(sources[identifier] for identifier in expected)
-            ),
+            citations=list(dict.fromkeys(sources[identifier] for identifier in expected)),
             missing_information=[],
         )
     located = _population_rows_from_evidence(expected, documents)
@@ -1164,9 +1295,7 @@ def _deterministic_population_inventory_answer(
             f"- {located[identifier][0]} [SOURCE {located[identifier][1]}]."
             for identifier in expected
         ),
-        citations=list(
-            dict.fromkeys(located[identifier][1] for identifier in expected)
-        ),
+        citations=list(dict.fromkeys(located[identifier][1] for identifier in expected)),
         missing_information=[],
     )
 
@@ -1333,9 +1462,7 @@ def _scope_documents_to_entity(
     )
 
 
-def _expand_standalone_identifier_question(
-    question: str, documents: list[object]
-) -> str:
+def _expand_standalone_identifier_question(question: str, documents: list[object]) -> str:
     identifiers = member_identifiers(question)
     if len(identifiers) != 1:
         return question
@@ -1357,8 +1484,7 @@ def _expand_standalone_identifier_question(
     if not bare_identifier and not member_question:
         return question
     if not any(
-        getattr(document, "metadata", {}).get("identifier_anchor")
-        for document in documents
+        getattr(document, "metadata", {}).get("identifier_anchor") for document in documents
     ):
         return question
     return (
@@ -1367,6 +1493,7 @@ def _expand_standalone_identifier_question(
         "declared payload field. Include both code property names and serialized field names "
         "when the evidence provides them."
     )
+
 
 class AnswerNodesMixin:
     """AnswerNodes responsibilities."""
@@ -1378,9 +1505,7 @@ class AnswerNodesMixin:
         route_refusal_reason = state.get("canonical_route_refusal_reason", "")
         if route_refusal_reason:
             generated = GroundedAnswer(
-                answer=refusal_answer(
-                    route_refusal_reason, state.get("language", "mixed")
-                ),
+                answer=refusal_answer(route_refusal_reason, state.get("language", "mixed")),
                 citations=[],
                 outcome="REFUSAL",
                 refusal_reason=route_refusal_reason,
@@ -1411,9 +1536,7 @@ class AnswerNodesMixin:
         sibling_expanded_count = 0
         requested_entity = _normalized_entity(state.get("overview_entity", ""))
         if not requested_entity:
-            requested_entity = _explicit_entity_scope(
-                answer_question, self._vocabulary.entities
-            )
+            requested_entity = _explicit_entity_scope(answer_question, self._vocabulary.entities)
         inventory_question = is_inventory_question(answer_question)
         resolved_request = state.get("resolved_request")
         if inventory_question or state.get("query_intent") in {
@@ -1442,25 +1565,16 @@ class AnswerNodesMixin:
         population_retrieval_miss = False
         if inventory_question:
             population_loader = getattr(self._retriever, "ainvoke_population", None)
-            subject_labels = _population_labels(
-                answer_question, self._vocabulary.entities
-            )
+            subject_labels = _population_labels(answer_question, self._vocabulary.entities)
             scope_labels = (requested_entity,) if requested_entity else ()
             destination_labels = _mentioned_destination_entities(
                 answer_question,
                 self._vocabulary.entities,
                 requested_entity,
             )
-            sibling_loader = getattr(
-                self._retriever, "ainvoke_source_siblings", None
-            )
-            source_ids = _population_source_ids(
-                documents, subject_labels, scope_labels
-            )
-            if (
-                requested_entity
-                and _publisher_destination_population_requested(answer_question)
-            ):
+            sibling_loader = getattr(self._retriever, "ainvoke_source_siblings", None)
+            source_ids = _population_source_ids(documents, subject_labels, scope_labels)
+            if requested_entity and _publisher_destination_population_requested(answer_question):
                 destination_source_ids = [
                     str((getattr(document, "metadata", {}) or {}).get("source_id") or "")
                     for document in documents
@@ -1474,9 +1588,7 @@ class AnswerNodesMixin:
                     )
                 )
             if sibling_loader is not None and source_ids:
-                sibling_documents = await sibling_loader(
-                    source_ids, state.get("source_types", ())
-                )
+                sibling_documents = await sibling_loader(source_ids, state.get("source_types", ()))
                 population_siblings = [
                     document
                     for document in sibling_documents
@@ -1487,9 +1599,7 @@ class AnswerNodesMixin:
                         if _publisher_destination_population_requested(answer_question)
                         else _published_population_members([document], scope_labels)
                         if _publisher_population_requested(answer_question)
-                        else _evidence_population_members(
-                            [document], subject_labels, scope_labels
-                        )
+                        else _evidence_population_members([document], subject_labels, scope_labels)
                     )
                 ]
                 sibling_expanded_count = len(population_siblings)
@@ -1498,9 +1608,7 @@ class AnswerNodesMixin:
                     population_siblings,
                     top_n=len(documents) + len(population_siblings),
                 )
-                documents = _prefer_document_language(
-                    documents, state.get("language", "mixed")
-                )
+                documents = _prefer_document_language(documents, state.get("language", "mixed"))
             population_documents = (
                 await population_loader(
                     requested_entity,
@@ -1523,8 +1631,7 @@ class AnswerNodesMixin:
                 destination_labels,
             )
             initially_retrieved = {
-                str(document.metadata.get("entity_key") or "").strip()
-                for document in documents
+                str(document.metadata.get("entity_key") or "").strip() for document in documents
             }
             population_retrieval_miss = bool(coverage_expected_keys) and not bool(
                 initially_retrieved.intersection(coverage_expected_keys)
@@ -1538,24 +1645,17 @@ class AnswerNodesMixin:
             exact_loader = getattr(self._retriever, "ainvoke_exact_identifiers", None)
             aliases = structured_entity_aliases(answer_question, documents)
             if exact_loader is not None and aliases:
-                exact_documents = await exact_loader(
-                    aliases, state.get("source_types", ())
-                )
+                exact_documents = await exact_loader(aliases, state.get("source_types", ()))
                 documents = _merge_ranked_documents(
                     exact_documents,
                     documents,
                     top_n=len(exact_documents) + len(documents),
                 )
-            coverage_expected_fields = structured_entity_field_names(
-                answer_question, documents
-            )
+            coverage_expected_fields = structured_entity_field_names(answer_question, documents)
         structured_tabular_evidence = _structured_tabular_evidence(documents)
-        comparison_subjects = _comparison_subjects(
-            answer_question, self._vocabulary.entities
-        )
+        comparison_subjects = _comparison_subjects(answer_question, self._vocabulary.entities)
         comparison_table_selected = bool(
-            state.get("query_intent") == "CROSS_SOURCE"
-            and len(comparison_subjects) >= 2
+            state.get("query_intent") == "CROSS_SOURCE" and len(comparison_subjects) >= 2
         )
         structured_tabular_selected = bool(
             structured_tabular_evidence and _attribute_table_requested(answer_question)
@@ -1612,9 +1712,7 @@ class AnswerNodesMixin:
                 "Include every field exactly once. The expected fields are: "
                 f"{', '.join(coverage_expected_fields)}."
             )
-        answer_question = _expand_standalone_identifier_question(
-            generation_question, documents
-        )
+        answer_question = _expand_standalone_identifier_question(generation_question, documents)
         generated = _deterministic_identifier_answer(
             answer_question,
             documents,
@@ -1634,6 +1732,8 @@ class AnswerNodesMixin:
         )
         if destination_answer is not None:
             generated = destination_answer
+        if generated is None and state.get("reconstruct_parent_records"):
+            generated = _deterministic_single_record_table(documents, state.get("language", "en"))
         if state.get("query_intent") in {"STRUCTURED_INVENTORY", "STRUCTURED_ENTITY"}:
             if destination_answer is None:
                 generated = _deterministic_structured_inventory_answer(
@@ -1704,10 +1804,7 @@ class AnswerNodesMixin:
                 )
 
             async def verify_and_publish(sentence: str, index: int) -> bool:
-                citations = [
-                    int(value)
-                    for value in re.findall(r"\[SOURCE (\d+)\]", sentence)
-                ]
+                citations = [int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)]
                 verdict = await self._grounding_verifier.verify(
                     self._request.question,
                     documents,
@@ -1775,9 +1872,7 @@ class AnswerNodesMixin:
                     model_profile=self._request.model_profile,
                     language=state.get("language", "und"),
                     extra={
-                        "prose_stream_seconds": round(
-                            self._generator.last_prose_stream_seconds, 3
-                        ),
+                        "prose_stream_seconds": round(self._generator.last_prose_stream_seconds, 3),
                         "answer_metadata_seconds": round(
                             self._generator.last_answer_metadata_seconds, 3
                         ),
@@ -1828,6 +1923,8 @@ class AnswerNodesMixin:
                         "PROJECT_OVERVIEW",
                     }:
                         answer_style = "requested_list"
+                    if intent == "CODE_ASSISTED" and state.get("reconstruct_parent_records", False):
+                        answer_style = "single_record_details"
                     if answer_shape_selected in {
                         "structured_tabular",
                         "comparison_table",
@@ -1850,7 +1947,8 @@ class AnswerNodesMixin:
                 else:
                     generated = await generate_model_answer(
                         answer_shape_selected
-                        if answer_shape_selected in {
+                        if answer_shape_selected
+                        in {
                             "structured_tabular",
                             "comparison_table",
                         }
@@ -1861,9 +1959,7 @@ class AnswerNodesMixin:
             except TimeoutError as failure:
                 generation_failure = failure
                 canonical_fallback_reason = "STREAM_TIMEOUT"
-            generation_temperature = float(
-                getattr(self._generator, "last_temperature", 0.0)
-            )
+            generation_temperature = float(getattr(self._generator, "last_temperature", 0.0))
             if not canonical_fallback_reason:
                 canonical_fallback_reason = _model_fallback_reason(generated)
             if canonical_fallback_reason:
@@ -1935,7 +2031,11 @@ class AnswerNodesMixin:
         if (
             repairs_remaining > 0
             and not deterministic
-            and answer_style in {"structured_tabular", "comparison_table"}
+            and answer_style
+            in {
+                "structured_tabular",
+                "comparison_table",
+            }
             and (
                 answer_shape_metrics(generated.answer)["answer_table_count"] == 0
                 or not generated.answer.lstrip().startswith("|")
@@ -1978,6 +2078,8 @@ class AnswerNodesMixin:
             overview_style_repaired = True
             repairs_remaining -= 1
         generated = _normalize_citations(generated)
+        if answer_style == "single_record_details":
+            generated = _single_record_details_table(generated, state.get("language", "en"))
         if not (
             self._settings.incremental_verified_streaming_enabled
             and getattr(self, "_incremental_stream_active", False)
@@ -1991,13 +2093,9 @@ class AnswerNodesMixin:
         # what the client saw. The unchanged citation validator below rejects an
         # uncited sentence instead.
         generated = _normalize_citations(generated)
-        generated, answer_shape_claims_removed = _enforce_table_claim_shape(
-            generated, answer_style
-        )
+        generated, answer_shape_claims_removed = _enforce_table_claim_shape(generated, answer_style)
         coverage_missing = _coverage(coverage_expected_keys, generated.answer)
-        coverage_missing_fields = _coverage(
-            coverage_expected_fields, generated.answer
-        )
+        coverage_missing_fields = _coverage(coverage_expected_fields, generated.answer)
         stage_complete(
             "generate",
             self._request.project_id,
@@ -2017,6 +2115,8 @@ class AnswerNodesMixin:
                 if state.get("query_intent") == "DELIVERY" and deterministic
                 else "CODE_LOCATION_EXTRACTION"
                 if state.get("query_intent") == "IMPLEMENTATION" and deterministic
+                else "SINGLE_RECORD_EXTRACTION"
+                if state.get("reconstruct_parent_records") and deterministic
                 else "POPULATION_INVENTORY_EXTRACTION"
                 if deterministic and coverage_expected_keys
                 else "EXACT_IDENTIFIER_EXTRACTION"
@@ -2039,6 +2139,8 @@ class AnswerNodesMixin:
                 if state.get("query_intent") == "DELIVERY" and deterministic
                 else "code-location-extractor"
                 if state.get("query_intent") == "IMPLEMENTATION" and deterministic
+                else "locator-row-extractor"
+                if state.get("reconstruct_parent_records") and deterministic
                 else "population-inventory-extractor"
                 if deterministic and coverage_expected_keys
                 else "exact-identifier-extractor"
@@ -2070,12 +2172,8 @@ class AnswerNodesMixin:
                 - len(coverage_missing_fields),
                 "field_coverage_missing_count": len(coverage_missing_fields),
                 "population_retrieval_miss": population_retrieval_miss,
-                "documents_dropped": int(
-                    getattr(self._generator, "last_documents_dropped", 0)
-                ),
-                "documents_truncated": int(
-                    getattr(self._generator, "last_documents_truncated", 0)
-                ),
+                "documents_dropped": int(getattr(self._generator, "last_documents_dropped", 0)),
+                "documents_truncated": int(getattr(self._generator, "last_documents_truncated", 0)),
                 "prose_stream_seconds": round(
                     getattr(self._generator, "last_prose_stream_seconds", 0.0), 3
                 ),
@@ -2083,17 +2181,11 @@ class AnswerNodesMixin:
                     getattr(self._generator, "last_answer_metadata_seconds", 0.0), 3
                 ),
                 "time_to_first_chunk_seconds": round(
-                    getattr(
-                        self._generator, "last_time_to_first_chunk_seconds", 0.0
-                    ),
+                    getattr(self._generator, "last_time_to_first_chunk_seconds", 0.0),
                     3,
                 ),
-                "stream_timeout_kind": getattr(
-                    self._generator, "last_stream_timeout_kind", ""
-                ),
-                "stream_truncated": int(
-                    getattr(self._generator, "last_stream_truncated", False)
-                ),
+                "stream_timeout_kind": getattr(self._generator, "last_stream_timeout_kind", ""),
+                "stream_truncated": int(getattr(self._generator, "last_stream_truncated", False)),
                 "canonical_fallback_used": int(canonical_fallback_used),
                 "canonical_fallback_reason": canonical_fallback_reason,
                 **answer_shape_metrics(generated.answer),
@@ -2115,9 +2207,7 @@ class AnswerNodesMixin:
             "coverage_expected_fields": coverage_expected_fields,
             "coverage_missing_fields": coverage_missing_fields,
             "population_retrieval_miss": population_retrieval_miss,
-            "stream_truncated": bool(
-                getattr(self._generator, "last_stream_truncated", False)
-            ),
+            "stream_truncated": bool(getattr(self._generator, "last_stream_truncated", False)),
         }
 
     async def _validate_completeness(self, state: RagState) -> RagState:
@@ -2133,18 +2223,19 @@ class AnswerNodesMixin:
         if state.get("query_intent") in {
             "FEATURE_INVENTORY",
             "CODE_INVENTORY",
-        } and set(
-            state["generated"].citations
-        ) != set(range(1, len(state.get("documents", [])) + 1)):
+        } and set(state["generated"].citations) != set(
+            range(1, len(state.get("documents", [])) + 1)
+        ):
             missing = (*missing, "inventory:all_sources")
-        exhausted = bool(missing) and state.get("retrieval_attempt", 1) >= self._settings.max_retrieval_attempts
+        exhausted = (
+            bool(missing)
+            and state.get("retrieval_attempt", 1) >= self._settings.max_retrieval_attempts
+        )
         stage_complete(
             "answer_completeness",
             self._request.project_id,
             began,
-            input_count=len(
-                _answer_requirements(answer_question, self._vocabulary.entities)
-            ),
+            input_count=len(_answer_requirements(answer_question, self._vocabulary.entities)),
             output_count=0 if missing else 1,
             reason_code=(
                 "COMPLETE"
@@ -2243,8 +2334,7 @@ class AnswerNodesMixin:
         )
         repair_kwargs = (
             {"answer_style": state["answer_style"]}
-            if state.get("answer_style")
-            in {"structured_tabular", "comparison_table"}
+            if state.get("answer_style") in {"structured_tabular", "comparison_table"}
             else _overview_repair_kwargs(state.get("query_intent", "DIRECT"))
         )
         repaired = await self._generator.repair(
@@ -2325,6 +2415,7 @@ class AnswerNodesMixin:
     async def _verify_grounding(self, state: RagState) -> RagState:
         began = started()
         answer_question = state.get("resolved_question") or self._request.question
+        relevance_question = state.get("answer_relevance_query") or answer_question
         if state["generated"].outcome == "REFUSAL":
             reason = (
                 state["generated"].refusal_reason
@@ -2366,12 +2457,8 @@ class AnswerNodesMixin:
                 model_profile="grounding",
                 language=state.get("language", "und"),
                 extra={
-                    "canonical_fallback_used": int(
-                        state.get("canonical_fallback_used", False)
-                    ),
-                    "canonical_fallback_reason": str(
-                        state.get("canonical_fallback_reason") or ""
-                    ),
+                    "canonical_fallback_used": int(state.get("canonical_fallback_used", False)),
+                    "canonical_fallback_reason": str(state.get("canonical_fallback_reason") or ""),
                 },
             )
             return {
@@ -2448,9 +2535,7 @@ class AnswerNodesMixin:
                 input_count=len(state["generated"].citations),
                 output_count=1 if verified else 0,
                 reason_code=(
-                    "TITLE_INVENTORY_VERIFIED"
-                    if verified
-                    else "TITLE_INVENTORY_MISMATCH"
+                    "TITLE_INVENTORY_VERIFIED" if verified else "TITLE_INVENTORY_MISMATCH"
                 ),
                 model_provider="deterministic",
                 model_name="indexed-title-verifier",
@@ -2461,16 +2546,12 @@ class AnswerNodesMixin:
                 "generated": state["generated"],
                 "grounded": verified,
                 "grounding_reason": (
-                    "TITLE_INVENTORY_VERIFIED"
-                    if verified
-                    else "TITLE_INVENTORY_MISMATCH"
+                    "TITLE_INVENTORY_VERIFIED" if verified else "TITLE_INVENTORY_MISMATCH"
                 ),
                 "repaired": state.get("repaired", False),
             }
         if state.get("query_intent") == "CODE_INVENTORY":
-            verified = _code_inventory_answer_verified(
-                state["generated"], state["documents"]
-            )
+            verified = _code_inventory_answer_verified(state["generated"], state["documents"])
             stage_complete(
                 "verify_grounding",
                 self._request.project_id,
@@ -2487,7 +2568,9 @@ class AnswerNodesMixin:
             return {
                 "generated": state["generated"],
                 "grounded": verified,
-                "grounding_reason": "CODE_INVENTORY_VERIFIED" if verified else "CODE_INVENTORY_MISMATCH",
+                "grounding_reason": "CODE_INVENTORY_VERIFIED"
+                if verified
+                else "CODE_INVENTORY_MISMATCH",
                 "repaired": state.get("repaired", False),
             }
         authority_valid, authority_reason = _source_authority_valid(
@@ -2522,7 +2605,7 @@ class AnswerNodesMixin:
             )
             return {"grounded": True, "grounding_reason": "DISABLED"}
         verdict = await self._grounding_verifier.verify(
-            self._request.question,
+            answer_question,
             state["documents"],
             state["generated"],
             answer_language=state.get("language", ""),
@@ -2556,7 +2639,7 @@ class AnswerNodesMixin:
                 and _citations_valid(pruned, len(state["documents"]))
             ):
                 fallback_verdict = await self._grounding_verifier.verify(
-                    self._request.question,
+                    answer_question,
                     state["documents"],
                     pruned,
                     answer_language=state.get("language", ""),
@@ -2564,7 +2647,7 @@ class AnswerNodesMixin:
                 usage = _add_usage(usage, self._grounding_verifier.last_usage)
                 grounded = fallback_verdict.supported
                 if grounded and _missing_answer_requirements(
-                    self._request.question,
+                    answer_question,
                     pruned.answer,
                     self._vocabulary.entities,
                 ):
@@ -2606,7 +2689,7 @@ class AnswerNodesMixin:
                         regenerated = _normalize_citations(regenerated)
                         if _citations_valid(regenerated, len(state["documents"])):
                             regenerated_verdict = await self._grounding_verifier.verify(
-                                self._request.question,
+                                answer_question,
                                 state["documents"],
                                 regenerated,
                                 answer_language=state.get("language", ""),
@@ -2631,22 +2714,29 @@ class AnswerNodesMixin:
                         reason_code = "CLAIMS_REMOVED_THIN_NO_UNUSED_EVIDENCE"
                     # Say so in the response. An answer that quietly lost a
                     # claim looks complete, and the reader cannot tell what was omitted.
-                    state = {**state, "generated": _note_removed_claims(
-                        pruned,
-                        claim_fallback_removed_count,
-                        state.get("language", "en"),
-                    )}
+                    state = {
+                        **state,
+                        "generated": _note_removed_claims(
+                            pruned,
+                            claim_fallback_removed_count,
+                            state.get("language", "en"),
+                        ),
+                    }
                 else:
                     reason_code = fallback_verdict.reason_code
         if not grounded and not state.get("repaired", False):
             repair_kwargs = (
                 {"answer_style": state["answer_style"]}
                 if state.get("answer_style")
-                in {"structured_tabular", "comparison_table"}
+                in {
+                    "structured_tabular",
+                    "comparison_table",
+                    "single_record_details",
+                }
                 else _overview_repair_kwargs(state.get("query_intent", "DIRECT"))
             )
             repaired = await self._generator.repair(
-                self._request.question,
+                answer_question,
                 state["documents"],
                 state.get("language", "mixed"),
                 state["generated"],
@@ -2659,7 +2749,7 @@ class AnswerNodesMixin:
             repaired = _normalize_citations(repaired)
             if _citations_valid(repaired, len(state["documents"])):
                 verdict = await self._grounding_verifier.verify(
-                    self._request.question,
+                    answer_question,
                     state["documents"],
                     repaired,
                     answer_language=state.get("language", ""),
@@ -2667,7 +2757,7 @@ class AnswerNodesMixin:
                 usage = _add_usage(usage, self._grounding_verifier.last_usage)
                 grounded = verdict.supported
                 if grounded and _missing_answer_requirements(
-                    self._request.question,
+                    answer_question,
                     repaired.answer,
                     self._vocabulary.entities,
                 ):
@@ -2678,9 +2768,7 @@ class AnswerNodesMixin:
                 reason_code = "REPAIRED_SUPPORTED" if grounded else verdict.reason_code
                 state = {**state, "generated": repaired}
         population_expected = tuple(state.get("coverage_expected_identifiers", ()))
-        population_missing = _coverage(
-            population_expected, state["generated"].answer
-        )
+        population_missing = _coverage(population_expected, state["generated"].answer)
         field_expected = tuple(state.get("coverage_expected_fields", ()))
         field_missing = _coverage(field_expected, state["generated"].answer)
         population_summary_violation = bool(population_expected) and bool(
@@ -2701,13 +2789,72 @@ class AnswerNodesMixin:
         # Score topicality for accepted and rejected grounding outcomes alike.
         # Restricting this to supported answers biased calibration data toward
         # the population that had already passed the preceding gate.
-        addresses, answer_relevance = (
-            await self._grounding_verifier.answer_addresses_question(
-                answer_question,
-                generated.answer,
-                threshold=self._settings.answer_relevance_threshold,
-            )
+        addresses, answer_relevance = await self._grounding_verifier.answer_addresses_question(
+            relevance_question,
+            generated.answer,
+            threshold=self._settings.answer_relevance_threshold,
         )
+        initial_answer_relevance = answer_relevance
+        relevance_repair_attempted = 0
+        relevance_repair_succeeded = 0
+        # A supported answer can still miss the requested subject. Give that
+        # otherwise-terminal outcome one bounded rewrite using the same evidence
+        # and normalized question. The repaired draft must pass every unchanged
+        # citation, grounding, completeness, and relevance gate before acceptance.
+        if grounded and not addresses and reason_code != "REPAIRED_SUPPORTED":
+            relevance_repair_attempted = 1
+            repaired = await self._generator.repair(
+                answer_question,
+                state["documents"],
+                state.get("language", "mixed"),
+                generated,
+                answer_style=state.get("answer_style", "concise"),
+                repair_focus="answer_relevance",
+            )
+            usage = _add_usage(usage, self._generator.last_usage)
+            repaired = _normalize_citations(repaired)
+            repaired = await self._grounding_verifier.attach_missing_citations(
+                state["documents"], repaired
+            )
+            repaired = _normalize_citations(repaired)
+            repair_supported = _citations_valid(repaired, len(state["documents"]))
+            if repair_supported:
+                repair_verdict = await self._grounding_verifier.verify(
+                    answer_question,
+                    state["documents"],
+                    repaired,
+                    answer_language=state.get("language", ""),
+                )
+                usage = _add_usage(usage, self._grounding_verifier.last_usage)
+                repair_supported = repair_verdict.supported and not bool(
+                    _missing_answer_requirements(
+                        answer_question,
+                        repaired.answer,
+                        self._vocabulary.entities,
+                    )
+                )
+            repaired_population_missing = _coverage(population_expected, repaired.answer)
+            repaired_field_missing = _coverage(field_expected, repaired.answer)
+            repair_complete = not repaired_population_missing and not repaired_field_missing
+            repaired_addresses = False
+            repaired_relevance = 0.0
+            if repair_supported and repair_complete:
+                (
+                    repaired_addresses,
+                    repaired_relevance,
+                ) = await self._grounding_verifier.answer_addresses_question(
+                    relevance_question,
+                    repaired.answer,
+                    threshold=self._settings.answer_relevance_threshold,
+                )
+            answer_relevance = repaired_relevance
+            if repair_supported and repair_complete and repaired_addresses:
+                generated = repaired
+                population_missing = repaired_population_missing
+                field_missing = repaired_field_missing
+                addresses = True
+                relevance_repair_succeeded = 1
+                reason_code = "RELEVANCE_REPAIRED_SUPPORTED"
         if grounded and not addresses:
             grounded = False
             reason_code = "ANSWER_NOT_RELEVANT"
@@ -2724,6 +2871,9 @@ class AnswerNodesMixin:
             language=state.get("language", "und"),
             extra={
                 "answer_relevance": round(answer_relevance, 4),
+                "initial_answer_relevance": round(initial_answer_relevance, 4),
+                "relevance_repair_attempted": relevance_repair_attempted,
+                "relevance_repair_succeeded": relevance_repair_succeeded,
                 "claim_fallback_removed_count": claim_fallback_removed_count,
                 "post_prune_regenerated": post_prune_regenerated,
                 "post_prune_below_floor": post_prune_below_floor,
@@ -2741,9 +2891,7 @@ class AnswerNodesMixin:
                 # UNSUPPORTED_CLAIM; these fields say which check rejected it and
                 # by how much, which is the difference between reading a log and
                 # reproducing the request by hand.
-                **_rejection_telemetry(
-                    getattr(self._grounding_verifier, "last_rejections", [])
-                ),
+                **_rejection_telemetry(getattr(self._grounding_verifier, "last_rejections", [])),
                 **_accepted_score_telemetry(
                     getattr(self._grounding_verifier, "last_accepted_scores", [])
                 ),
@@ -2765,7 +2913,12 @@ class AnswerNodesMixin:
             "coverage_expected_fields": field_expected,
             "coverage_missing_fields": field_missing,
             "repaired": state.get("repaired", False)
-            or reason_code in {"REPAIRED_SUPPORTED", "CLAIMS_REMOVED_SUPPORTED"},
+            or reason_code
+            in {
+                "REPAIRED_SUPPORTED",
+                "CLAIMS_REMOVED_SUPPORTED",
+                "RELEVANCE_REPAIRED_SUPPORTED",
+            },
         }
 
 
@@ -2792,9 +2945,7 @@ def _note_removed_claims(value, removed: int, language: str = "en"):
         )
     if note in value.missing_information:
         return value
-    return value.model_copy(
-        update={"missing_information": [*value.missing_information, note]}
-    )
+    return value.model_copy(update={"missing_information": [*value.missing_information, note]})
 
 
 def _note_coverage_shortfall(
@@ -2816,9 +2967,7 @@ def _note_coverage_shortfall(
     )
     if note in value.missing_information:
         return value
-    return value.model_copy(
-        update={"missing_information": [*value.missing_information, note]}
-    )
+    return value.model_copy(update={"missing_information": [*value.missing_information, note]})
 
 
 def _accepted_score_telemetry(scores: list) -> dict[str, object]:

@@ -71,6 +71,7 @@ def test_failed_quality_run_has_no_child_annotations(monkeypatch) -> None:
                 "quality.failed_stage": "ragas",
                 "quality.dataset_version": "1",
                 "quality.commit_sha": "unknown",
+                "auth.boundary": "project:T2.0",
             },
         )
     ]

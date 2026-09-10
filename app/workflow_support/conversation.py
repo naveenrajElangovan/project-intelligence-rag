@@ -147,7 +147,7 @@ def _complete_explicit_question(value: str) -> bool:
         r"\b(?:it|its|that|this|these|those|their|them|same|above|previous|"
         r"here|earlier|previously|"
         r"eso|esto|esa|ese|esos|esas|mismo|misma|anterior|"
-        r"aqui|aqu\u00ed|arriba|antes|previamente)\b",
+        r"aqui|aqu\u00ed|arriba)\b",
         normalized,
     ):
         return False
@@ -219,8 +219,6 @@ def _conversation_resolution_decision(
         "aqui",
         "aqu\u00ed",
         "arriba",
-        "antes",
-        "previamente",
         "eso",
         "esto",
         "esa",

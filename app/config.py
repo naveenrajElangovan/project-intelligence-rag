@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +18,17 @@ class Settings(BaseSettings):
     default_response_language: str = "es"
     openinference_enabled: bool = False
     openinference_otlp_endpoint: str = "http://127.0.0.1:4318/v1/traces"
+    # metadata_only is safe for every environment. full_authorized may be used
+    # only after the server has resolved the project boundary; the tracing layer
+    # still redacts credentials and never records access-policy tokens.
+    openinference_content_mode: Literal["metadata_only", "full_authorized"] = (
+        "metadata_only"
+    )
+    openinference_project_name: str = "project-intelligence-rag"
+    openinference_success_sample_rate: float = 0.10
+    # Immutable release identifier (normally the Git SHA) bundled into the
+    # deployment. Runtime requests never read prompt text or versions from Phoenix.
+    prompt_version: str = "development"
     chroma_host: str = "chroma"
     chroma_port: int = 8000
     chroma_collection: str = "project-intelligence"
@@ -287,6 +299,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security(self) -> "Settings":
+        if not self.openinference_project_name.strip():
+            raise ValueError("PI_RAG_OPENINFERENCE_PROJECT_NAME must not be empty")
+        if not 0 <= self.openinference_success_sample_rate <= 1:
+            raise ValueError(
+                "PI_RAG_OPENINFERENCE_SUCCESS_SAMPLE_RATE must be between 0 and 1"
+            )
         if not self.supported_embedding_models or not all(self.supported_embedding_models):
             raise ValueError("PI_RAG_SUPPORTED_EMBEDDING_MODELS must not be empty")
         if not self.supported_schema_versions or not all(self.supported_schema_versions):
@@ -490,6 +508,8 @@ class Settings(BaseSettings):
                 missing.append("PI_RAG_FORCE_HTTPS must be true")
             if not self.allowed_host_list or "*" in self.allowed_host_list:
                 missing.append("PI_RAG_ALLOWED_HOSTS must contain explicit hosts")
+            if self.prompt_version == "development" or not self.prompt_version.strip():
+                missing.append("PI_RAG_PROMPT_VERSION must pin the released Git prompt version")
             if missing:
                 raise ValueError("Unsafe production RAG configuration: " + ", ".join(missing))
         return self

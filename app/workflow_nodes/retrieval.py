@@ -17,6 +17,10 @@ from app.workflow_support.completeness import (
     _merge_ranked_documents,
     _missing_evidence_requirements,
 )
+from app.workflow_support.answer_structure import (
+    AnswerLineKind,
+    classify_answer_lines,
+)
 from app.workflow_support.deterministic_answers import (
     _code_inventory_documents,
     _code_location_document_score,
@@ -30,7 +34,6 @@ from app.workflow_support.procedural_retrieval import (
     rerank_source_families,
 )
 from app.workflow_support.query_analysis import (
-    _dedupe_source_documents,
     _document_source_type,
     _entity_overview_source_ids,
     _exact_feature_source_ids,
@@ -42,7 +45,6 @@ from app.workflow_support.query_analysis import (
     _project_overview_evidence_order,
     _required_evidence_source_types,
     _safe_translation_variant,
-    _source_authority_valid,
     _source_diverse_order,
     _source_identity,
     _source_type_count,
@@ -58,16 +60,62 @@ from app.retrieval_pipeline import (
 from app.source_policy import SourcePolicyRegistry, deduplicate_authoritative_versions
 
 
-def _exact_identifier_tokens(
-    value: str, entities: tuple[str, ...] = ()
-) -> tuple[str, ...]:
-    ignored = {"CODE", "API", "HTTP", "JSON", "SQL"} | {
-        entity.upper() for entity in entities
-    }
+def _parent_reconstruction_anchors(
+    documents: list[Document], *, single_parent: bool
+) -> list[Document]:
+    """Bound a singular request to its highest-ranked parent before expansion."""
+
+    return documents[:1] if single_parent else documents
+
+
+def _single_record_structure_score(document: Document) -> int:
+    """Grade whether one chunk can support a complete record response.
+
+    Semantic relevance alone cannot distinguish a complete record from a
+    repeated heading or an empty Markdown table fragment.  This corpus-neutral
+    structural score is only a tie-breaking contract for singular record
+    requests; authorization, semantic reranking, and grounding remain intact.
+    """
+
+    lines = classify_answer_lines(document.page_content)
+    table_headers = sum(line.kind is AnswerLineKind.TABLE_HEADER for line in lines)
+    table_rows = sum(line.kind is AnswerLineKind.TABLE_ROW for line in lines)
+    if table_headers and not table_rows:
+        return -1
+    if table_rows:
+        locator = str(document.metadata.get("locator") or "").strip().casefold()
+        row_text = " ".join(
+            line.text.casefold() for line in lines if line.kind is AnswerLineKind.TABLE_ROW
+        )
+        locator_matches = bool(locator and locator in row_text)
+        has_structured_fact = bool(
+            document.metadata.get("field_path")
+            and document.metadata.get("normalized_value") is not None
+        )
+        if locator_matches or has_structured_fact:
+            return 2
+        return 0
+
+    locator = str(document.metadata.get("locator") or "").strip()
+    has_heading = any(line.kind is AnswerLineKind.HEADING for line in lines)
+    material_text = " ".join(
+        line.text for line in lines if line.kind in {AnswerLineKind.PROSE, AnswerLineKind.LIST_ITEM}
+    )
+    if locator and has_heading and len(re.findall(r"\w+", material_text)) >= 8:
+        return 1
+    return 0
+
+
+def _single_record_evidence_order(documents: list[Document]) -> list[Document]:
+    """Prefer complete records without allowing structure to invent relevance."""
+
+    return sorted(documents, key=_single_record_structure_score, reverse=True)
+
+
+def _exact_identifier_tokens(value: str, entities: tuple[str, ...] = ()) -> tuple[str, ...]:
+    ignored = {"CODE", "API", "HTTP", "JSON", "SQL"} | {entity.upper() for entity in entities}
     identifiers = (
-        identifier
-        for identifier in member_identifiers(value)
-        if identifier not in ignored
+        identifier for identifier in member_identifiers(value) if identifier not in ignored
     )
     labels = re.findall(
         r"(?i)(?<![A-Za-z0-9])(?:\d+[a-z]{1,4}|v\d+(?:\.\d+)+)(?![A-Za-z0-9])",
@@ -105,9 +153,7 @@ def _canonical_route_tokens(
     access-policy, and source-type filters as every other exact lookup.
     """
 
-    tokens, _refusal_reason = _canonical_route_directive(
-        question, documents, limit=limit
-    )
+    tokens, _refusal_reason = _canonical_route_directive(question, documents, limit=limit)
     return tokens
 
 
@@ -122,9 +168,7 @@ def _canonical_route_directive(
     through normal retrieval; no business keyword is inferred here.
     """
 
-    normalized_question = " ".join(
-        re.findall(r"[a-z0-9à-ÿ]+", question.casefold())
-    )
+    normalized_question = " ".join(re.findall(r"[a-z0-9à-ÿ]+", question.casefold()))
     if len(normalized_question.split()) < 3:
         return (), ""
     tokens: list[str] = []
@@ -138,19 +182,12 @@ def _canonical_route_directive(
         )
         if "QUESTION-" not in structure.upper():
             continue
-        normalized_body = " ".join(
-            re.findall(r"[a-z0-9à-ÿ]+", document.page_content.casefold())
-        )
+        normalized_body = " ".join(re.findall(r"[a-z0-9à-ÿ]+", document.page_content.casefold()))
         quoted_questions = {
             " ".join(re.findall(r"[a-z0-9à-ÿ]+", value.casefold()))
-            for value in re.findall(
-                r'["“]([^"”]{3,200})["”]', document.page_content
-            )
+            for value in re.findall(r'["“]([^"”]{3,200})["”]', document.page_content)
         }
-        if (
-            normalized_question not in quoted_questions
-            and normalized_body != normalized_question
-        ):
+        if normalized_question not in quoted_questions and normalized_body != normalized_question:
             continue
         if "QUESTION-OUT-OF-SCOPE" in structure.upper():
             refusal_reason = "INSUFFICIENT_EVIDENCE"
@@ -173,13 +210,9 @@ async def _load_canonical_route_directive(
 
     canonical_loader = getattr(retriever, "ainvoke_canonical_questions", None)
     canonical_documents = (
-        await canonical_loader(question, source_types)
-        if canonical_loader is not None
-        else []
+        await canonical_loader(question, source_types) if canonical_loader is not None else []
     )
-    return _canonical_route_directive(
-        question, [*canonical_documents, *semantic_documents]
-    )
+    return _canonical_route_directive(question, [*canonical_documents, *semantic_documents])
 
 
 def _retain_explicit_identifier_anchors(
@@ -234,10 +267,9 @@ def _prefilter_candidates(
         if str(metadata.get("record_kind") or "") == "__vocabulary__":
             reasons["vocabulary"] += 1
             continue
-        if (
-            str(metadata.get("doc_category") or "narrative").casefold() == "index"
-            and not metadata.get("identifier_anchor")
-        ):
+        if str(
+            metadata.get("doc_category") or "narrative"
+        ).casefold() == "index" and not metadata.get("identifier_anchor"):
             reasons["index"] += 1
             continue
         quality_candidates.append(document)
@@ -296,7 +328,10 @@ def _final_evidence_order(
 
 
 def _preserve_primary_query_candidates(
-    ranked: list[Document], *, limit: int, reserve: int = 4,
+    ranked: list[Document],
+    *,
+    limit: int,
+    reserve: int = 4,
     per_query_reserve: int = 8,
 ) -> list[Document]:
     """Keep a bounded window from every retrieval query for the cross-encoder.
@@ -330,13 +365,10 @@ def _preserve_primary_query_candidates(
                 (
                     document
                     for document in ranked
-                    if str(query_index)
-                    in (document.metadata.get("query_candidate_ranks") or {})
+                    if str(query_index) in (document.metadata.get("query_candidate_ranks") or {})
                 ),
                 key=lambda document: int(
-                    (document.metadata.get("query_candidate_ranks") or {})[
-                        str(query_index)
-                    ]
+                    (document.metadata.get("query_candidate_ranks") or {})[str(query_index)]
                 ),
             )[: min(per_query_reserve, limit)]
         )
@@ -386,9 +418,7 @@ def _preserve_identifier_anchors(
     return combined
 
 
-def _inventory_identifier_anchors(
-    candidates: list[Document], *, top_n: int
-) -> list[Document]:
+def _inventory_identifier_anchors(candidates: list[Document], *, top_n: int) -> list[Document]:
     """Deliver exact PAGE registry matches without redundant cross-encoding."""
 
     anchors = sorted(
@@ -398,9 +428,7 @@ def _inventory_identifier_anchors(
             if document.metadata.get("identifier_anchor")
             and _document_source_type(document) == "PAGE"
         ),
-        key=lambda item: float(
-            item.metadata.get("identifier_anchor_score") or 0
-        ),
+        key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),
         reverse=True,
     )[:top_n]
     for document in anchors:
@@ -425,9 +453,9 @@ def _fuse_reranked_groups(
                 max(existing[1] if existing else 0.0, score),
                 rrf,
             )
-    ordered = sorted(
-        fused.values(), key=lambda item: (item[1] + item[2], item[1]), reverse=True
-    )[:top_n]
+    ordered = sorted(fused.values(), key=lambda item: (item[1] + item[2], item[1]), reverse=True)[
+        :top_n
+    ]
     for document, score, rrf in ordered:
         document.metadata["rerank_score"] = score
         document.metadata["multilingual_rerank_rrf_score"] = rrf
@@ -437,19 +465,21 @@ def _fuse_reranked_groups(
 def _candidate_id(document: Document) -> str:
     """Return the stable identity used to prove rerank inputs are unchanged."""
 
-    return str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
-        (document.page_content + str(document.metadata.get("reference"))).encode()
-    ).hexdigest()
+    return (
+        str(document.metadata.get("chunk_id") or "")
+        or hashlib.sha256(
+            (document.page_content + str(document.metadata.get("reference"))).encode()
+        ).hexdigest()
+    )
 
 
 def _same_rerank_inputs(state: RagState, query: str, candidates: list[Document]) -> bool:
     """Only identical scorer pairs permit reuse of the previous ranked result."""
 
-    return (
-        state.get("scored_query") == query
-        and set(state.get("scored_candidate_ids", ()))
-        == {_candidate_id(document) for document in candidates}
-    )
+    return state.get("scored_query") == query and set(state.get("scored_candidate_ids", ())) == {
+        _candidate_id(document) for document in candidates
+    }
+
 
 class RetrievalNodesMixin:
     """RetrievalNodes responsibilities."""
@@ -466,15 +496,11 @@ class RetrievalNodesMixin:
         translation_slot = state.get("translation_slot")
         translation_task = None
         if translation_slot is not None:
-            planner = self._query_planner_factory(
-                self._settings, self._request.model_profile
-            )
+            planner = self._query_planner_factory(self._settings, self._request.model_profile)
             translate = getattr(planner, "translate_to_spanish", None)
             if translate is not None:
                 translation_task = asyncio.create_task(
-                    translate(
-                        state.get("resolved_question", self._request.question)
-                    )
+                    translate(state.get("resolved_question", self._request.question))
                 )
             else:
                 queries.pop(translation_slot)
@@ -511,9 +537,7 @@ class RetrievalNodesMixin:
             *(self._retrieve_scope(query, scope) for query, scope in requests)
         )
         resolved_question = state.get("resolved_question", self._request.question)
-        exact_identifiers = _exact_identifier_tokens(
-            resolved_question, self._vocabulary.entities
-        )
+        exact_identifiers = _exact_identifier_tokens(resolved_question, self._vocabulary.entities)
         # Execute deterministic structured/lexical channels before semantic
         # retrieval. Semantic similarity expands recall inside the selected
         # scope; it is never proof and never substitutes for an exact match.
@@ -531,13 +555,9 @@ class RetrievalNodesMixin:
         )
         rare_loader = getattr(self._retriever, "ainvoke_rare_terms", None)
         rare_terms = (
-            await rare_loader(resolved_question, source_types)
-            if rare_loader is not None
-            else ()
+            await rare_loader(resolved_question, source_types) if rare_loader is not None else ()
         )
-        rare_lookups = tuple(
-            value for value in rare_terms if value not in exact_identifiers
-        )
+        rare_lookups = tuple(value for value in rare_terms if value not in exact_identifiers)
         if exact_loader is not None and rare_lookups:
             anchored.extend(await exact_loader(rare_lookups, source_types))
         results = list(await base_results_task)
@@ -546,9 +566,10 @@ class RetrievalNodesMixin:
                 translated = await translation_task
             except Exception:
                 translated = ""
-            if _safe_translation_variant(
-                resolved_question, translated, self._vocabulary.entities
-            ) and translated not in queries:
+            if (
+                _safe_translation_variant(resolved_question, translated, self._vocabulary.entities)
+                and translated not in queries
+            ):
                 queries[translation_slot] = translated
                 terminology = retrieval_terminology_variant(translated)
                 if (
@@ -561,9 +582,7 @@ class RetrievalNodesMixin:
                     queries.append(terminology)
                 additional = list(
                     dict.fromkeys(
-                        (query, scope)
-                        for query in queries[translation_slot:]
-                        for scope in scopes
+                        (query, scope) for query in queries[translation_slot:] for scope in scopes
                     )
                 )
                 requests.extend(additional)
@@ -574,17 +593,16 @@ class RetrievalNodesMixin:
                 )
             else:
                 queries.pop(translation_slot)
-        canonical_route_tokens, canonical_route_refusal_reason = (
-            await _load_canonical_route_directive(
-                self._retriever,
-                resolved_question,
-                [document for group in results for document in group],
-                source_types,
-            )
+        (
+            canonical_route_tokens,
+            canonical_route_refusal_reason,
+        ) = await _load_canonical_route_directive(
+            self._retriever,
+            resolved_question,
+            [document for group in results for document in group],
+            source_types,
         )
-        structure_loader = getattr(
-            self._retriever, "ainvoke_structure_identifiers", None
-        )
+        structure_loader = getattr(self._retriever, "ainvoke_structure_identifiers", None)
         route_anchored = (
             await structure_loader(canonical_route_tokens, source_types)
             if structure_loader is not None and canonical_route_tokens
@@ -601,12 +619,8 @@ class RetrievalNodesMixin:
             document.metadata.pop("identifier_anchor", None)
             document.metadata.pop("identifier_anchor_score", None)
             document.metadata["canonical_route_candidate"] = True
-        route_query = (
-            retrieval_terminology_variant(resolved_question) or resolved_question
-        )
-        route_terms = set(
-            re.findall(r"[a-z0-9à-ÿ]{4,}", route_query.casefold())
-        ) - {
+        route_query = retrieval_terminology_variant(resolved_question) or resolved_question
+        route_terms = set(re.findall(r"[a-z0-9à-ÿ]{4,}", route_query.casefold())) - {
             "como",
             "cómo",
             "what",
@@ -620,10 +634,7 @@ class RetrievalNodesMixin:
             searchable = " ".join(
                 (
                     document.page_content,
-                    " ".join(
-                        str(value)
-                        for value in document.metadata.get("structure_path") or ()
-                    ),
+                    " ".join(str(value) for value in document.metadata.get("structure_path") or ()),
                 )
             )
             route_match_score = _exact_term_ratio(route_terms, searchable)
@@ -633,16 +644,22 @@ class RetrievalNodesMixin:
         unique: dict[str, Document] = {}
         if state.get("preserve_candidates"):
             for document in state.get("candidates", []):
-                identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
-                    (document.page_content + str(document.metadata.get("reference"))).encode()
-                ).hexdigest()
+                identity = (
+                    str(document.metadata.get("chunk_id") or "")
+                    or hashlib.sha256(
+                        (document.page_content + str(document.metadata.get("reference"))).encode()
+                    ).hexdigest()
+                )
                 unique[identity] = document
         query_indexes = {query: index for index, query in enumerate(queries)}
         for (query, _scope), group in zip(requests, results, strict=True):
             for rank, document in enumerate(group, start=1):
-                identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
-                    (document.page_content + str(document.metadata.get("reference"))).encode()
-                ).hexdigest()
+                identity = (
+                    str(document.metadata.get("chunk_id") or "")
+                    or hashlib.sha256(
+                        (document.page_content + str(document.metadata.get("reference"))).encode()
+                    ).hexdigest()
+                )
                 existing = unique.get(identity)
                 if existing is None:
                     existing = document
@@ -663,13 +680,9 @@ class RetrievalNodesMixin:
                 )
                 existing.metadata["query_candidate_ranks"] = query_ranks
                 if query == resolved_question:
-                    previous_primary_rank = int(
-                        existing.metadata.get("primary_query_rank") or 0
-                    )
+                    previous_primary_rank = int(existing.metadata.get("primary_query_rank") or 0)
                     existing.metadata["primary_query_rank"] = (
-                        min(previous_primary_rank, rank)
-                        if previous_primary_rank
-                        else rank
+                        min(previous_primary_rank, rank) if previous_primary_rank else rank
                     )
         authorized = validate_authorized_candidates(
             list(unique.values()),
@@ -687,23 +700,22 @@ class RetrievalNodesMixin:
         # channel during a total embedding outage. Count only records that did not
         # arrive through the fallback.
         dense_candidates = [
-            document
-            for document in authorized
-            if not document.metadata.get("retrieval_fallback")
+            document for document in authorized if not document.metadata.get("retrieval_fallback")
         ]
         fallback_candidates = len(authorized) - len(dense_candidates)
         if lexical_candidates is None:
-            lexical_candidates = self._sparse_retriever.rank(
-                resolved_question, authorized
-            )
+            lexical_candidates = self._sparse_retriever.rank(resolved_question, authorized)
         anchored = _retain_explicit_identifier_anchors(
             anchored, _forced_anchor_tokens(resolved_question)
         )
         anchored.extend(route_anchored)
         for document in anchored:
-            identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
-                (document.page_content + str(document.metadata.get("reference"))).encode()
-            ).hexdigest()
+            identity = (
+                str(document.metadata.get("chunk_id") or "")
+                or hashlib.sha256(
+                    (document.page_content + str(document.metadata.get("reference"))).encode()
+                ).hexdigest()
+            )
             document.metadata["retrieval_rrf_score"] = 1.0
             unique[identity] = document
             authorized.append(document)
@@ -713,7 +725,8 @@ class RetrievalNodesMixin:
             access_policy_ids=self._request.access_policy_ids,
         )
         lexical_candidates = [
-            document for document in lexical_candidates
+            document
+            for document in lexical_candidates
             if str(document.metadata.get("doc_category") or "narrative") != "index"
             or bool(document.metadata.get("identifier_anchor"))
         ]
@@ -743,9 +756,7 @@ class RetrievalNodesMixin:
         registry = SourcePolicyRegistry.from_categories(
             _document_source_type(document) for document in fused_candidates
         )
-        fused_candidates = deduplicate_authoritative_versions(
-            fused_candidates, registry
-        )
+        fused_candidates = deduplicate_authoritative_versions(fused_candidates, registry)
         query_terms = _exact_terms(resolved_question)
         source_candidate_counts = Counter(
             _source_identity(document) for document in fused_candidates
@@ -753,19 +764,15 @@ class RetrievalNodesMixin:
         for document in fused_candidates:
             exact_ratio = _exact_term_ratio(query_terms, document.page_content)
             document.metadata["exact_term_ratio"] = exact_ratio
-            boosted_score = float(
-                document.metadata.get("fusion_score", 0)
-            ) * (1 + self._settings.exact_term_boost * exact_ratio)
-            source_candidate_count = source_candidate_counts[
-                _source_identity(document)
-            ]
+            boosted_score = float(document.metadata.get("fusion_score", 0)) * (
+                1 + self._settings.exact_term_boost * exact_ratio
+            )
+            source_candidate_count = source_candidate_counts[_source_identity(document)]
             document.metadata["source_candidate_count"] = source_candidate_count
-            document.metadata["retrieval_fused_score"] = (
-                _source_volume_discounted_score(
-                    boosted_score,
-                    source_candidate_count=source_candidate_count,
-                    strength=self._settings.source_volume_discount_strength,
-                )
+            document.metadata["retrieval_fused_score"] = _source_volume_discounted_score(
+                boosted_score,
+                source_candidate_count=source_candidate_count,
+                strength=self._settings.source_volume_discount_strength,
             )
             if document.metadata.get("canonical_route_candidate"):
                 document.metadata["retrieval_fused_score"] = max(
@@ -777,11 +784,13 @@ class RetrievalNodesMixin:
             minimum_dense_score=self._settings.prefilter_min_dense_score,
             maximum_removed_fraction=self._settings.prefilter_max_removed_fraction,
         )
-        ranked_responsive = deduplicate_candidate_bodies(sorted(
-            responsive,
-            key=lambda value: float(value.metadata.get("retrieval_fused_score", 0)),
-            reverse=True,
-        ))
+        ranked_responsive = deduplicate_candidate_bodies(
+            sorted(
+                responsive,
+                key=lambda value: float(value.metadata.get("retrieval_fused_score", 0)),
+                reverse=True,
+            )
+        )
         candidates = _preserve_primary_query_candidates(
             ranked_responsive,
             limit=self._settings.max_candidates,
@@ -793,7 +802,10 @@ class RetrievalNodesMixin:
             if int(rank) <= 8
         }
         preserved_candidate_count = sum(
-            any(int(rank) <= 8 for rank in (document.metadata.get("query_candidate_ranks") or {}).values())
+            any(
+                int(rank) <= 8
+                for rank in (document.metadata.get("query_candidate_ranks") or {}).values()
+            )
             for document in candidates
         )
         usage = self._retriever.drain_usage()
@@ -819,9 +831,7 @@ class RetrievalNodesMixin:
                 "issue_candidates": _source_type_count(candidates, "ISSUE"),
                 "attachment_candidates": _source_type_count(candidates, "ATTACHMENT"),
                 "code_required": int(
-                    "CODE" in _required_evidence_source_types(
-                        state.get("query_intent", "DIRECT")
-                    )
+                    "CODE" in _required_evidence_source_types(state.get("query_intent", "DIRECT"))
                 ),
                 "lexical_candidate_count": len(lexical_candidates),
                 "dense_candidate_count": len(dense_candidates),
@@ -842,17 +852,21 @@ class RetrievalNodesMixin:
                 "queries_with_preserved_candidates": len(preserved_query_indexes),
                 "preserved_candidate_count": preserved_candidate_count,
                 "entity_vocabulary_size": len(self._vocabulary.entities),
-                "entity_capability": (
-                    "enabled" if self._vocabulary.entities else "disabled"
-                ),
+                "entity_capability": ("enabled" if self._vocabulary.entities else "disabled"),
                 "canonical_route_count": len(canonical_route_tokens),
             },
         )
+        planned_rerank_queries = (
+            (state.get("rerank_query", queries[0]),)
+            if state.get("reconstruct_parent_records")
+            else tuple(dict.fromkeys((*state.get("rerank_queries", ()), *queries)))
+        )
+        from app.quality_tracing import record_candidate_scores
+
+        record_candidate_scores(candidates)
         return {
             "queries": tuple(queries),
-            "rerank_queries": tuple(
-                dict.fromkeys((*state.get("rerank_queries", ()), *queries))
-            ),
+            "rerank_queries": planned_rerank_queries,
             "translation_slot": None,
             "candidates": candidates,
             "preserve_candidates": False,
@@ -864,9 +878,7 @@ class RetrievalNodesMixin:
             "canonical_route_refusal_reason": canonical_route_refusal_reason,
         }
 
-    async def _retrieve_scope(
-        self, query: str, source_types: tuple[str, ...]
-        ) -> list[Document]:
+    async def _retrieve_scope(self, query: str, source_types: tuple[str, ...]) -> list[Document]:
         """Keep lightweight test retrievers compatible while production stays scoped."""
 
         scoped = getattr(self._retriever, "ainvoke_scoped", None)
@@ -999,14 +1011,15 @@ class RetrievalNodesMixin:
             else self._settings.rerank_top_n
         )
         procedural_question = is_procedural_question(self._request.question)
-        evidence_rich_single_source = (
-            state.get("query_intent")
-            in {"STRUCTURED_INVENTORY", "ENTITY_OVERVIEW", "FEATURE_INVENTORY", "CODE_INVENTORY"}
-            or any(
-                str(document.metadata.get("doc_category") or "").casefold()
-                in {"entity-contract", "registry-table"}
-                for document in candidates
-            )
+        evidence_rich_single_source = state.get("query_intent") in {
+            "STRUCTURED_INVENTORY",
+            "ENTITY_OVERVIEW",
+            "FEATURE_INVENTORY",
+            "CODE_INVENTORY",
+        } or any(
+            str(document.metadata.get("doc_category") or "").casefold()
+            in {"entity-contract", "registry-table"}
+            for document in candidates
         )
         intent_source_limit = (
             max(result_top_n, self._settings.max_chunks_per_source)
@@ -1020,7 +1033,8 @@ class RetrievalNodesMixin:
                     for document in candidates
                     if _code_location_document_score(
                         rerank_query, document, self._vocabulary.code_extensions
-                    ) > 0
+                    )
+                    > 0
                 ),
                 key=lambda document: _code_location_document_score(
                     rerank_query, document, self._vocabulary.code_extensions
@@ -1030,9 +1044,7 @@ class RetrievalNodesMixin:
             if state.get("query_intent") == "IMPLEMENTATION"
             else []
         )
-        singleton_delivery = (
-            state.get("query_intent") == "DELIVERY" and len(candidates) == 1
-        )
+        singleton_delivery = state.get("query_intent") == "DELIVERY" and len(candidates) == 1
         exact_inventory_documents = (
             _inventory_identifier_anchors(all_candidates, top_n=result_top_n)
             if state.get("query_intent") == "STRUCTURED_INVENTORY"
@@ -1060,16 +1072,12 @@ class RetrievalNodesMixin:
         if code_location_documents:
             documents = code_location_documents
             for document in documents:
-                document.metadata["rerank_score"] = float(
-                    document.metadata.get("score", 0)
-                )
+                document.metadata["rerank_score"] = float(document.metadata.get("score", 0))
         elif singleton_delivery:
             # An ISSUE-only search with one authorized candidate cannot be reordered.
             # Preserve its retrieval score and avoid invoking the cross-encoder.
             documents = candidates[:1]
-            documents[0].metadata["rerank_score"] = float(
-                documents[0].metadata.get("score", 0)
-            )
+            documents[0].metadata["rerank_score"] = float(documents[0].metadata.get("score", 0))
         elif exact_inventory_documents:
             documents = exact_inventory_documents
         elif state.get("query_intent") == "PROJECT_OVERVIEW":
@@ -1096,9 +1104,7 @@ class RetrievalNodesMixin:
                 documents = _inventory_documents(
                     [*documents, *candidates],
                     state.get("overview_entity", ""),
-                )[
-                    : self._settings.feature_inventory_top_n
-                ]
+                )[: self._settings.feature_inventory_top_n]
         elif state.get("query_intent") == "CODE_INVENTORY":
             verified_candidates = _code_inventory_documents(
                 candidates,
@@ -1119,9 +1125,7 @@ class RetrievalNodesMixin:
             )
         elif procedural_question:
             ranked_groups = [
-                await rerank_source_families(
-                    self._reranker, query, candidates, top_n=result_top_n
-                )
+                await rerank_source_families(self._reranker, query, candidates, top_n=result_top_n)
                 for query in rerank_queries
             ]
             documents = _fuse_reranked_groups(
@@ -1203,18 +1207,14 @@ class RetrievalNodesMixin:
         # single cross-encoder pass, so re-imposing PAGE-first order and the code cap
         # after selection would silently undo that. FEATURE_INVENTORY keeps its
         # reserved-slot ordering until it is measured separately.
-        documentation_reserved_slots = (
-            state.get("query_intent") == "FEATURE_INVENTORY"
-        )
+        documentation_reserved_slots = state.get("query_intent") == "FEATURE_INVENTORY"
         # An exact identifier match is protected regardless of source family. This
         # used to exclude CODE whenever documentation was primary, so a Kotlin file
         # containing the literal constant got no anchor protection while a page
         # merely mentioning it did -- payload questions then cited prose instead of
         # the declaration. documentation_primary still governs the ordering
         # decisions below; it no longer governs anchor eligibility.
-        documents = _preserve_identifier_anchors(
-            documents, all_candidates, top_n=result_top_n
-        )
+        documents = _preserve_identifier_anchors(documents, all_candidates, top_n=result_top_n)
         if (
             self._settings.neighbor_expansion_enabled
             and documents
@@ -1252,14 +1252,10 @@ class RetrievalNodesMixin:
             documents = _project_overview_evidence_order(documents)
         if documentation_reserved_slots:
             primary = [
-                document
-                for document in documents
-                if _document_source_type(document) == "PAGE"
+                document for document in documents if _document_source_type(document) == "PAGE"
             ]
             supporting = [
-                document
-                for document in documents
-                if _document_source_type(document) != "PAGE"
+                document for document in documents if _document_source_type(document) != "PAGE"
             ][: self._settings.code_assisted_code_top_n]
             if primary:
                 documents = [
@@ -1294,20 +1290,18 @@ class RetrievalNodesMixin:
         )
         if documentation_reserved_slots:
             primary = [
-                document
-                for document in documents
-                if _document_source_type(document) == "PAGE"
+                document for document in documents if _document_source_type(document) == "PAGE"
             ]
             supporting = [
-                document
-                for document in documents
-                if _document_source_type(document) != "PAGE"
+                document for document in documents if _document_source_type(document) != "PAGE"
             ][: self._settings.code_assisted_code_top_n]
             if primary:
                 documents = [
                     *primary[: max(1, result_top_n - len(supporting))],
                     *supporting,
                 ]
+        if state.get("reconstruct_parent_records"):
+            documents = _single_record_evidence_order(documents)
         # Enumeration answers often live across consecutive chunks of one
         # registry. Preserve their relevance depth; for other questions, fill
         # the window by source depth so one source does not dominate by volume.
@@ -1316,13 +1310,26 @@ class RetrievalNodesMixin:
             top_n=result_top_n,
             enumeration=inventory_question,
         )
-        pre_reconstruction_count = len(documents)
+        reconstruct_single_parent = bool(state.get("reconstruct_parent_records"))
+        reconstruction_inputs = _parent_reconstruction_anchors(
+            documents, single_parent=reconstruct_single_parent
+        )
+        selected_structure_score = (
+            _single_record_structure_score(reconstruction_inputs[0])
+            if reconstruct_single_parent and reconstruction_inputs
+            else None
+        )
+        pre_reconstruction_count = len(reconstruction_inputs)
         if state.get("reconstruct_parent_records") or state.get("query_intent") in {
             "STRUCTURED_ENTITY",
             "STRUCTURED_INVENTORY",
         }:
             documents = await self._reconstruct_parent_records(
-                documents, state.get("source_types", ())
+                reconstruction_inputs,
+                state.get("source_types", ()),
+                max_chunks_per_parent=(
+                    self._settings.max_chunks_per_source if reconstruct_single_parent else None
+                ),
             )
         else:
             documents = documents[:result_top_n]
@@ -1343,8 +1350,7 @@ class RetrievalNodesMixin:
                 declared_entities.add(declared)
                 continue
             identity_text = " ".join(
-                str(document.metadata.get(field) or "")
-                for field in ("title", "path", "reference")
+                str(document.metadata.get(field) or "") for field in ("title", "path", "reference")
             )
             declared_entities.update(
                 str(entity).casefold()
@@ -1369,7 +1375,9 @@ class RetrievalNodesMixin:
         mismatch_requested = (
             uncertain_entity
             if uncertain_mismatch
-            else next(iter(requested_entities), "") if entity_mismatch else ""
+            else next(iter(requested_entities), "")
+            if entity_mismatch
+            else ""
         )
         mismatch_suggested = next(iter(declared_entities), "") if entity_mismatch else ""
         if entity_mismatch:
@@ -1396,9 +1404,7 @@ class RetrievalNodesMixin:
             retry_count=int(getattr(self._reranker, "last_retry_count", 0)),
             model_provider=(
                 "deterministic"
-                if code_location_documents
-                or singleton_delivery
-                or exact_inventory_documents
+                if code_location_documents or singleton_delivery or exact_inventory_documents
                 else "local"
             ),
             model_name=(
@@ -1439,6 +1445,7 @@ class RetrievalNodesMixin:
                 ),
                 "pre_reconstruction_count": pre_reconstruction_count,
                 "post_reconstruction_count": post_reconstruction_count,
+                "single_record_structure_score": selected_structure_score,
                 "entity_mismatch_clarification": entity_mismatch,
             },
         )
@@ -1452,9 +1459,13 @@ class RetrievalNodesMixin:
         }
 
     async def _reconstruct_parent_records(
-        self, documents: list[Document], source_types: tuple[str, ...]
+        self,
+        documents: list[Document],
+        source_types: tuple[str, ...],
+        *,
+        max_chunks_per_parent: int | None = None,
     ) -> list[Document]:
-        """Replace matching chunks with their complete authorized parent version."""
+        """Replace matches with an authorized parent or a centered bounded window."""
 
         loader = getattr(self._retriever, "ainvoke_source_siblings", None)
         parent_ids = {
@@ -1494,12 +1505,53 @@ class RetrievalNodesMixin:
             if key in emitted_parents:
                 continue
             emitted_parents.add(key)
-            for document in sorted(
-                family, key=lambda item: int(item.metadata.get("chunk_ordinal") or 0)
-            ):
-                identity = str(document.metadata.get("chunk_id") or "") or hashlib.sha256(
-                    (document.page_content + str(document.metadata.get("reference") or "")).encode()
-                ).hexdigest()
+            family = sorted(family, key=lambda item: int(item.metadata.get("chunk_ordinal") or 0))
+            unique_family: list[Document] = []
+            family_chunk_ids: set[str] = set()
+            for document in family:
+                family_identity = (
+                    str(document.metadata.get("chunk_id") or "")
+                    or hashlib.sha256(
+                        (
+                            document.page_content + str(document.metadata.get("reference") or "")
+                        ).encode()
+                    ).hexdigest()
+                )
+                if family_identity not in family_chunk_ids:
+                    family_chunk_ids.add(family_identity)
+                    unique_family.append(document)
+            family = unique_family
+            anchor_locator = str(anchor.metadata.get("locator") or "").strip()
+            if anchor_locator:
+                locator_family = [
+                    document
+                    for document in family
+                    if str(document.metadata.get("locator") or "").strip() == anchor_locator
+                ]
+                if locator_family:
+                    family = locator_family
+            if max_chunks_per_parent and len(family) > max_chunks_per_parent:
+                anchor_id = str(anchor.metadata.get("chunk_id") or "")
+                anchor_index = next(
+                    (
+                        index
+                        for index, document in enumerate(family)
+                        if str(document.metadata.get("chunk_id") or "") == anchor_id
+                    ),
+                    0,
+                )
+                start = max(0, anchor_index - max_chunks_per_parent // 2)
+                start = min(start, len(family) - max_chunks_per_parent)
+                family = family[start : start + max_chunks_per_parent]
+            for document in family:
+                identity = (
+                    str(document.metadata.get("chunk_id") or "")
+                    or hashlib.sha256(
+                        (
+                            document.page_content + str(document.metadata.get("reference") or "")
+                        ).encode()
+                    ).hexdigest()
+                )
                 if identity not in seen_chunks:
                     seen_chunks.add(identity)
                     result.append(document)
@@ -1507,7 +1559,7 @@ class RetrievalNodesMixin:
 
     async def _rerank_cross_source(
         self, query: str, candidates: list[Document], language: str = ""
-        ) -> list[Document]:
+    ) -> list[Document]:
         """Rank documentation and code independently before a bounded merge."""
 
         groups: list[list[Document]] = []
@@ -1549,7 +1601,7 @@ class RetrievalNodesMixin:
         *,
         rerank_queries: tuple[str, ...] = (),
         language: str = "",
-        ) -> list[Document]:
+    ) -> list[Document]:
         """Rank documentation and code together on relevance, with no reserved slots.
 
         PAGE and CODE used to be reranked in separate calls and merged as
@@ -1614,7 +1666,7 @@ class RetrievalNodesMixin:
 
     async def _rerank_project_overview(
         self, state: RagState, candidates: list[Document]
-        ) -> list[Document]:
+    ) -> list[Document]:
         """Fuse focused reranks so one broad wording cannot suppress all evidence."""
 
         fused: dict[str, Document] = {}
@@ -1624,9 +1676,9 @@ class RetrievalNodesMixin:
         # The retrieval side of this same route already slices its query list to
         # max_query_variants; the rerank side not doing so was an oversight, not
         # a design choice.
-        overview_queries = tuple(
-            state.get("project_rerank_queries", state.get("queries", ()))
-        )[: self._settings.max_query_variants]
+        overview_queries = tuple(state.get("project_rerank_queries", state.get("queries", ())))[
+            : self._settings.max_query_variants
+        ]
         for query in overview_queries:
             ranked = await self._reranker.rerank(
                 query,
@@ -1671,13 +1723,9 @@ class RetrievalNodesMixin:
 
     async def _validate_evidence_completeness(self, state: RagState) -> RagState:
         began = started()
-        requirements = _answer_requirements(
-            self._request.question, self._vocabulary.entities
-        )
+        requirements = _answer_requirements(self._request.question, self._vocabulary.entities)
         missing = _missing_evidence_requirements(requirements, state.get("documents", []))
-        required_source_types = _required_evidence_source_types(
-            state.get("query_intent", "DIRECT")
-        )
+        required_source_types = _required_evidence_source_types(state.get("query_intent", "DIRECT"))
         present_source_types = {
             _document_source_type(document) for document in state.get("documents", [])
         }
@@ -1699,7 +1747,10 @@ class RetrievalNodesMixin:
         # signal, but never let a sentence such as "more specific supporting
         # evidence" enter the repair requirement loop.
         context_missing_signal_count = len(quality.missing_information)
-        exhausted = bool(missing) and state.get("retrieval_attempt", 1) >= self._settings.max_retrieval_attempts
+        exhausted = (
+            bool(missing)
+            and state.get("retrieval_attempt", 1) >= self._settings.max_retrieval_attempts
+        )
         stage_complete(
             "evidence_completeness",
             self._request.project_id,
@@ -1748,9 +1799,6 @@ class RetrievalNodesMixin:
         # This floor is derived below every answered-and-grounded Layer 1 case.
         # It is consulted only after bounded repair is exhausted, so borderline
         # evidence still gets the same repair and truth-gate path as before.
-        if (
-            float(state.get("context_relevance") or 0.0)
-            < self._settings.context_relevance_floor
-        ):
+        if float(state.get("context_relevance") or 0.0) < self._settings.context_relevance_floor:
             return "end"
         return "generate" if state.get("documents") else "end"

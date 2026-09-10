@@ -85,6 +85,7 @@ def main() -> None:
                     "quality.failed_stage": args.failed_stage,
                     "quality.dataset_version": args.dataset_version,
                     "quality.commit_sha": args.commit_sha,
+                    "auth.boundary": f"project:{args.project_id}",
                 },
             ):
                 pass
@@ -154,6 +155,7 @@ def main() -> None:
     }
     try:
         tracer = provider.get_tracer("project-intelligence-quality")
+        boundary = f"project:{args.project_id}"
         with tracer.start_as_current_span(
             "rag.quality.run",
             attributes={
@@ -161,18 +163,19 @@ def main() -> None:
                 "quality.run_id": args.run_id,
                 "quality.project_id": args.project_id,
                 "quality.status": "completed",
+                "auth.boundary": boundary,
             },
         ):
             with tracer.start_as_current_span(
                 "rag.quality.retrieval",
-                attributes={"quality.section": "retrieval"},
+                attributes={"quality.section": "retrieval", "auth.boundary": boundary},
             ) as retrieval_span:
                 retrieval_span_id = format(
                     retrieval_span.get_span_context().span_id, "016x"
                 )
             with tracer.start_as_current_span(
                 "rag.quality.answer_generation",
-                attributes={"quality.section": "answer_generation"},
+                attributes={"quality.section": "answer_generation", "auth.boundary": boundary},
             ) as answer_span:
                 answer_span_id = format(answer_span.get_span_context().span_id, "016x")
         provider.force_flush()

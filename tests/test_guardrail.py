@@ -19,7 +19,7 @@ def test_rejects_direct_call_without_internal_credential() -> None:
         _env_file=None, environment="production", internal_api_key="x" * 32,
         llm_provider="openai",
         openai_api_key="openai-key", docs_enabled=False, force_https=True,
-        allowed_hosts="rag", chroma_host="chroma.internal"
+        allowed_hosts="rag", chroma_host="chroma.internal", prompt_version="test-sha"
     )
     try:
         response = TestClient(app).post(

@@ -232,6 +232,37 @@ def test_direct_english_plan_does_not_multiply_retrieval_queries(monkeypatch) ->
     assert planned["translation_slot"] == 1
 
 
+def test_single_record_plan_uses_a_canonical_answer_contract(monkeypatch) -> None:
+    monkeypatch.setattr(
+        workflow_module.ChromaAccessRetriever,
+        "create",
+        classmethod(lambda cls, **kwargs: FakeRetriever()),
+    )
+    monkeypatch.setattr(workflow_module, "build_reranker", lambda settings: FakeReranker())
+    request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="Give me one full audit entry details",
+        accessPolicyIds=["project:DEMO"],
+    )
+    workflow = workflow_module.AuthorizedRagWorkflow(
+        Settings(_env_file=None, environment="development"), request
+    )
+
+    planned = asyncio.run(workflow._plan_queries({"request": request}))
+    retrieved = asyncio.run(workflow._retrieve(planned))
+
+    canonical = (
+        "Provide one audit entry record with its details supported by the evidence."
+    )
+    assert planned["query_intent"] == "CODE_ASSISTED"
+    assert planned["resolved_question"] == canonical
+    assert planned["rerank_query"] == canonical
+    assert planned["answer_relevance_query"] == "audit entry record details"
+    assert planned["reconstruct_parent_records"] is True
+    assert retrieved["rerank_queries"] == (canonical,)
+
+
 def test_multi_part_english_question_is_decomposed_before_retrieval(monkeypatch) -> None:
     monkeypatch.setattr(workflow_module, "BilingualQueryPlanner", MultiPartEnglishPlanner)
     monkeypatch.setattr(workflow_module, "build_reranker", lambda settings: FakeReranker())

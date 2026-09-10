@@ -23,6 +23,7 @@ from app.llm import (
 )
 from app.models import AnswerStatus, Coverage, RagRequest, RagResponse
 from app.openinference_tracing import configure_openinference
+from app.quality_tracing import trace_authorized_request
 from app.embedding import build_embedder, warm_embedder
 from app.reranking import build_reranker
 from app.retrieval import warm_authorized_lexical_corpora
@@ -128,6 +129,7 @@ async def lifespan(_application: FastAPI):
 
     settings = get_settings()
     tracer_provider = configure_openinference(settings)
+    _application.state.tracer_provider = tracer_provider
     _application.state.lexical_corpus_ready = not (
         settings.lexical_fallback_enabled
         and settings.warm_lexical_corpus_on_startup
@@ -450,8 +452,13 @@ async def answer(request: RagRequest, settings: Settings = Depends(get_settings)
         )
     request_slot = await _acquire_request_slot(settings)
     try:
-        async with asyncio.timeout(settings.request_timeout_seconds):
-            return await AuthorizedRagWorkflow(settings, request).run()
+        with trace_authorized_request(
+            request, settings, streaming=False, language=language
+        ) as quality_trace:
+            async with asyncio.timeout(settings.request_timeout_seconds):
+                response = await AuthorizedRagWorkflow(settings, request).run()
+            quality_trace.response(response)
+            return response
     except Exception as failure:
         failure_code = re.sub(r"[^A-Z0-9]+", "_", type(failure).__name__.upper()).strip("_")
         stage_complete(
@@ -503,14 +510,24 @@ async def answer_stream(
         )
 
     request_slot = await _acquire_request_slot(settings)
+    language = resolve_response_language(
+        request.question, default=settings.default_response_language
+    )
 
     async def events():
         """Encode private-service stream events as newline-delimited JSON."""
 
         try:
-            async with asyncio.timeout(settings.request_timeout_seconds):
-                async for event in AuthorizedRagWorkflow(settings, request).stream():
-                    yield json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with trace_authorized_request(
+                request, settings, streaming=True, language=language
+            ) as quality_trace:
+                async with asyncio.timeout(settings.request_timeout_seconds):
+                    async for event in AuthorizedRagWorkflow(settings, request).stream():
+                        if event.get("type") == "complete" and isinstance(
+                            event.get("response"), dict
+                        ):
+                            quality_trace.response(RagResponse.model_validate(event["response"]))
+                        yield json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
         except Exception as failure:
             failure_code = re.sub(
                 r"[^A-Z0-9]+", "_", type(failure).__name__.upper()
@@ -535,10 +552,9 @@ async def answer_stream(
                 outcome="FAILED",
                 confidence="NONE",
                 model_profile=request.model_profile,
-                language=resolve_response_language(request.question),
+                language=language,
                 reason_code=failure_code,
             )
-            language = resolve_response_language(request.question)
             message = pipeline_unavailable_answer(language)
             yield json.dumps(
                 {"type": "error", "message": message},

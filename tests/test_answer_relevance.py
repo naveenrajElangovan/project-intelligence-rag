@@ -73,6 +73,20 @@ def test_citation_markers_are_not_scored_as_content() -> None:
     assert "[SOURCE" not in scored_answer
 
 
+def test_markdown_tables_are_linearized_before_relevance_scoring() -> None:
+    table = (
+        "| Attribute | Value | Source |\n"
+        "|---|---|---|\n"
+        "| identifier | entry-17 | [SOURCE 1] |"
+    )
+    verifier, _result = _check(table, 0.5)
+
+    _scored_question, scored_answer = verifier.scored_pairs[0]
+    assert "identifier" in scored_answer
+    assert "Value: entry-17" in scored_answer
+    assert "|" not in scored_answer
+
+
 def test_an_empty_answer_defers_rather_than_inventing_a_refusal() -> None:
     _verifier, (addresses, score) = _check("   ", 0.0)
 

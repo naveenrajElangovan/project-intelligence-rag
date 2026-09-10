@@ -246,6 +246,9 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
     async def _response_from_state(self, state: RagState, began: float) -> RagResponse:
         """Convert final graph state into an audited public response."""
         documents = state.get("documents", [])
+        from app.quality_tracing import record_selected_evidence
+
+        record_selected_evidence(documents, self._settings)
         generated = state.get("generated")
         resolved = resolved_request_for_state(
             state, self._request, self._vocabulary.entities
@@ -423,9 +426,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
         )
         return response
 
-    def _conversation_context_update(
-        self, state: RagState
-    ) -> ConversationContextUpdate:
+    def _conversation_context_update(self, state: RagState) -> ConversationContextUpdate:
         """Return bounded semantic memory without promoting chat text to evidence."""
 
         original = self._request.question

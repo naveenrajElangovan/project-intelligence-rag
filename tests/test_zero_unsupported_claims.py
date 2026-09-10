@@ -2,7 +2,12 @@ import asyncio
 
 from langchain_core.documents import Document
 
-from app.grounding_contract import evidence_facts, render_structured_facts, resolve_request, validate_output
+from app.grounding_contract import (
+    evidence_facts,
+    render_structured_facts,
+    resolve_request,
+    validate_output,
+)
 from app.llm import GroundedAnswer
 from app.models import AnswerStatus, Coverage, RagRequest, RagResponse, SourceReference
 from app.source_policy import (
@@ -12,11 +17,19 @@ from app.source_policy import (
     UnsupportedSourceCategory,
     deduplicate_authoritative_versions,
 )
-from app.workflow_nodes.retrieval import RetrievalNodesMixin
+from app.workflow_nodes.retrieval import (
+    RetrievalNodesMixin,
+    _parent_reconstruction_anchors,
+    _single_record_evidence_order,
+    _single_record_structure_score,
+)
 from app.workflow_nodes.planning import (
+    _single_record_canonical_question,
     _single_record_details_requested,
     _single_record_subject,
 )
+from app.workflow_nodes.answering import _list_response_requested
+from app.workflow_support.inventory_intent import is_inventory_question
 from app.workflow_support.fail_closed import apply_output_gate
 
 
@@ -66,6 +79,158 @@ def test_full_single_entity_request_is_not_an_exhaustive_inventory() -> None:
     assert _single_record_subject(resolved.standalone_request) == "event pos application"
 
 
+def test_single_record_contract_is_corpus_neutral_and_bilingual() -> None:
+    english = _single_record_canonical_question("audit entry", "en")
+    spanish = _single_record_canonical_question("entrada de auditoría", "es")
+    assert english == ("Provide one audit entry record with its details supported by the evidence.")
+    assert spanish == (
+        "Proporciona un ejemplo de entrada de auditoría con sus detalles respaldados por la evidencia."
+    )
+    assert not _list_response_requested(english)
+    assert not _list_response_requested(spanish)
+    assert not is_inventory_question(english)
+    assert not is_inventory_question(spanish)
+    assert _single_record_subject("Give me one full record details") == ""
+    assert _single_record_canonical_question("", "en") == (
+        "Provide one record with its details supported by the evidence."
+    )
+
+
+def test_single_record_parent_reconstruction_has_a_hard_one_parent_bound() -> None:
+    ranked = [_document("first"), _document("second", source_id="second")]
+
+    assert _parent_reconstruction_anchors(ranked, single_parent=True) == [ranked[0]]
+    assert _parent_reconstruction_anchors(ranked, single_parent=False) == ranked
+
+
+def test_complete_record_outranks_a_semantically_high_empty_table_fragment() -> None:
+    malformed = _document(
+        "### record-17\n| Field | Value |\n|---|---|\nUnrelated neighboring text.",
+        locator="record-17",
+        rerank_score=0.99,
+    )
+    complete = _document(
+        "### record-18\nIdentifier: 18. Version: 2. This record contains its own supported details.",
+        locator="record-18",
+        source_id="record-18",
+        rerank_score=0.80,
+    )
+
+    ordered = _single_record_evidence_order([malformed, complete])
+
+    assert ordered == [complete, malformed]
+    assert _single_record_structure_score(complete) == 1
+    assert _single_record_structure_score(malformed) == -1
+
+
+def test_structured_table_row_is_the_strongest_single_record_shape() -> None:
+    table = _document(
+        "| Name | Identifier |\n|---|---|\n| selected | 18 |",
+        locator="selected",
+    )
+    prose = _document(
+        "### selected\nIdentifier: 18. Version: 2. This record contains its own supported details.",
+        locator="selected",
+        source_id="selected",
+    )
+
+    assert _single_record_evidence_order([prose, table]) == [table, prose]
+    assert _single_record_structure_score(table) == 2
+
+
+def test_unmatched_support_table_does_not_displace_a_complete_record() -> None:
+    support_table = _document(
+        "| Layer | Example |\n|---|---|\n| Constant | selected |",
+        locator="contract-support",
+    )
+    complete = _document(
+        "### record-18\nIdentifier: 18. Version: 2. This record contains its own supported details.",
+        locator="record-18",
+        source_id="record-18",
+    )
+
+    assert _single_record_evidence_order([support_table, complete]) == [
+        complete,
+        support_table,
+    ]
+    assert _single_record_structure_score(support_table) == 0
+
+
+def test_unstructured_candidates_keep_semantic_rerank_order() -> None:
+    first = _document("Relevant source prose without a record boundary.")
+    second = _document(
+        "Another relevant source paragraph without a record boundary.",
+        source_id="record-2",
+    )
+
+    assert _single_record_evidence_order([first, second]) == [first, second]
+
+
+def test_single_record_reconstruction_centers_a_bounded_chunk_window() -> None:
+    siblings = [
+        _document(
+            f"chunk {ordinal}",
+            chunk_id=f"c{ordinal}",
+            parent_id="large-parent",
+            chunk_ordinal=ordinal,
+        )
+        for ordinal in range(10)
+    ]
+
+    class Retriever:
+        async def ainvoke_source_siblings(self, parent_ids, source_types):
+            return siblings
+
+    workflow = RetrievalNodesMixin()
+    workflow._retriever = Retriever()
+    reconstructed = asyncio.run(
+        workflow._reconstruct_parent_records([siblings[5]], (), max_chunks_per_parent=3)
+    )
+
+    assert [item.metadata["chunk_ordinal"] for item in reconstructed] == [4, 5, 6]
+
+
+def test_single_record_reconstruction_respects_the_anchor_locator_boundary() -> None:
+    siblings = [
+        _document(
+            "selected part one",
+            chunk_id="selected-1",
+            parent_id="shared-parent",
+            chunk_ordinal=1,
+            locator="record:selected",
+        ),
+        _document(
+            "selected part two",
+            chunk_id="selected-2",
+            parent_id="shared-parent",
+            chunk_ordinal=2,
+            locator="record:selected",
+        ),
+        _document(
+            "neighbor record",
+            chunk_id="neighbor",
+            parent_id="shared-parent",
+            chunk_ordinal=3,
+            locator="record:neighbor",
+        ),
+    ]
+
+    class Retriever:
+        async def ainvoke_source_siblings(self, parent_ids, source_types):
+            return siblings
+
+    workflow = RetrievalNodesMixin()
+    workflow._retriever = Retriever()
+    reconstructed = asyncio.run(
+        workflow._reconstruct_parent_records([siblings[0]], (), max_chunks_per_parent=6)
+    )
+
+    assert [item.metadata["chunk_id"] for item in reconstructed] == [
+        "selected-1",
+        "selected-2",
+    ]
+
+
 def test_named_event_all_parameters_requires_exhaustive_field_coverage() -> None:
     resolved = resolve_request(
         "Give me all LOGIN_POS_EVENT parameters",
@@ -94,9 +259,7 @@ def test_named_event_all_parameters_requires_exhaustive_field_coverage() -> None
 
 
 def test_source_registry_rejects_unknown_and_disallowed_routes() -> None:
-    registry = SourcePolicyRegistry(
-        [SourcePolicy("RECORD", frozenset({"LOOKUP"}))]
-    )
+    registry = SourcePolicyRegistry([SourcePolicy("RECORD", frozenset({"LOOKUP"}))])
 
     assert registry.select("LOOKUP", ("record",)) == ("RECORD",)
     try:
@@ -148,10 +311,7 @@ def test_explicit_derived_claim_requires_visible_reproducible_rule() -> None:
         resolved_request=resolved,
         documents=[_document()],
         generated=GroundedAnswer(
-            answer=(
-                "Inference (status open implies work remains): work remains "
-                "[SOURCE 1]."
-            ),
+            answer=("Inference (status open implies work remains): work remains [SOURCE 1]."),
             citations=[1],
         ),
         semantically_supported=True,
@@ -235,9 +395,7 @@ def test_output_gate_accepts_complete_answer_with_parent_document_keys() -> None
     report = validate_output(
         resolved_request=resolved,
         documents=documents,
-        generated=GroundedAnswer(
-            answer="- one [SOURCE 1]\n- two [SOURCE 2]", citations=[1, 2]
-        ),
+        generated=GroundedAnswer(answer="- one [SOURCE 1]\n- two [SOURCE 2]", citations=[1, 2]),
         semantically_supported=True,
         required_policy="project:DEMO",
         expected_identifiers=("one", "two"),
@@ -299,9 +457,7 @@ def test_output_gate_consumes_workflow_coverage_result() -> None:
     report = validate_output(
         resolved_request=resolved,
         documents=documents,
-        generated=GroundedAnswer(
-            answer="- one [SOURCE 1]\n- two [SOURCE 2]", citations=[1, 2]
-        ),
+        generated=GroundedAnswer(answer="- one [SOURCE 1]\n- two [SOURCE 2]", citations=[1, 2]),
         semantically_supported=True,
         required_policy="project:DEMO",
         expected_identifiers=("one", "two"),
@@ -380,10 +536,7 @@ def test_gate_prunes_uncited_claim_and_keeps_grounded_sibling() -> None:
     state = {
         "documents": [_document("The status is open.")],
         "generated": GroundedAnswer(
-            answer=(
-                "The status is open [SOURCE 1]. "
-                "Fabricated `ITEM-999` is closed."
-            ),
+            answer=("The status is open [SOURCE 1]. Fabricated `ITEM-999` is closed."),
             citations=[1],
             missing_information=[],
         ),
@@ -406,12 +559,8 @@ def test_equal_authority_current_values_conflict_but_newer_wins() -> None:
         intent="LOOKUP",
         allowed_source_categories=("RECORD",),
     )
-    answer = GroundedAnswer(
-        answer="The current status is closed [SOURCE 2].", citations=[2]
-    )
-    old = _document(
-        "open", field_path="status", normalized_value="open", observed_at="2025-01-01"
-    )
+    answer = GroundedAnswer(answer="The current status is closed [SOURCE 2].", citations=[2])
+    old = _document("open", field_path="status", normalized_value="open", observed_at="2025-01-01")
     new = _document(
         "closed",
         source_id="record-2",
@@ -445,9 +594,7 @@ def test_equal_authority_current_values_conflict_but_newer_wins() -> None:
 
 
 def test_authoritative_version_deduplication_preserves_parent_chunks() -> None:
-    registry = SourcePolicyRegistry(
-        [SourcePolicy("RECORD", authority_priority=10)]
-    )
+    registry = SourcePolicyRegistry([SourcePolicy("RECORD", authority_priority=10)])
     old = _document(source_version="1", chunk_id="old")
     first = _document(source_version="2", chunk_id="new-1")
     second = _document("More fields", source_version="2", chunk_id="new-2")
@@ -484,9 +631,7 @@ def test_matching_chunk_reconstructs_complete_parent_version() -> None:
 
     workflow = RetrievalNodesMixin()
     workflow._retriever = Retriever()
-    reconstructed = asyncio.run(
-        workflow._reconstruct_parent_records([second], ("RECORD",))
-    )
+    reconstructed = asyncio.run(workflow._reconstruct_parent_records([second], ("RECORD",)))
 
     assert [item.metadata["chunk_id"] for item in reconstructed] == ["one", "two"]
 

@@ -156,13 +156,27 @@ def _single_record_subject(value: str) -> str:
     subject = re.sub(
         r"\b(?:can|could|would|you|please|me|send|give|show|provide|return|"
         r"select|choose|one|single|example|sample|full|complete|details?|the|"
-        r"a|an|of|in|from|for|with|puedes|podrías|podrias|por\s+favor|envía|envia|"
+        r"records?|a|an|of|in|from|for|with|puedes|podrías|podrias|por\s+favor|envía|envia|"
         r"dame|muestra|mostrar|proporciona|devuelve|selecciona|elige|uno|una|ejemplo|"
-        r"completo|completa|detalles?|el|la|los|las|de|en|desde|para|con)\b",
+        r"completo|completa|detalles?|registros?|el|la|los|las|de|en|desde|para|con)\b",
         " ",
         normalized,
     )
-    return re.sub(r"\s+", " ", subject).strip(" ?.,") or normalized
+    return re.sub(r"\s+", " ", subject).strip(" ?.,")
+
+
+def _single_record_canonical_question(subject: str, language: str) -> str:
+    """Turn a terse example request into a stable, corpus-neutral answer contract."""
+
+    if language == "es":
+        if not subject:
+            return "Proporciona un ejemplo con sus detalles respaldados por la evidencia."
+        return (
+            f"Proporciona un ejemplo de {subject} con sus detalles respaldados por la evidencia."
+        )
+    if not subject:
+        return "Provide one record with its details supported by the evidence."
+    return f"Provide one {subject} record with its details supported by the evidence."
 
 
 def _entity_attribute_value_requested(value: str) -> bool:
@@ -329,10 +343,12 @@ class PlanningNodesMixin:
             question
         ) and not is_exhaustive_entity_detail_question(question):
             subject = _single_record_subject(question)
+            canonical_question = _single_record_canonical_question(subject, language)
+            search_subject = subject or ("registro" if language == "es" else "record")
             planned = (
                 question,
-                f"{subject} complete record fields identifiers values",
-                f"{subject} example definition documentation contract",
+                f"{search_subject} complete record fields identifiers values",
+                f"{search_subject} example definition documentation contract",
             )[: self._settings.max_query_variants]
             stage_complete(
                 "plan_queries",
@@ -352,10 +368,11 @@ class PlanningNodesMixin:
                 "language": language,
                 "retrieval_attempt": 1,
                 "query_intent": "CODE_ASSISTED",
-                "rerank_query": f"{subject} complete record details",
+                "rerank_query": canonical_question,
                 "source_types": (),
                 "source_route": "MIXED",
-                "resolved_question": question,
+                "resolved_question": canonical_question,
+                "answer_relevance_query": f"{search_subject} record details",
                 "query_quality": query_quality,
                 "query_quality_reason": quality_reason,
                 "reconstruct_parent_records": True,

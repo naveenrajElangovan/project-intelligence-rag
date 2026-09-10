@@ -47,6 +47,18 @@ def test_a_fragment_with_its_own_predicate_stays_standalone(question: str) -> No
     assert _conversation_resolution_decision(question, VOCABULARY)[0] is False
 
 
+@pytest.mark.parametrize(
+    "question",
+    (
+        "¿Qué debo revisar antes del cierre de caja?",
+        "¿Qué debo hacer previamente al cierre de día?",
+    ),
+)
+def test_temporal_store_procedure_is_not_an_anaphoric_followup(question: str) -> None:
+    assert _conversation_resolution_decision(question, VOCABULARY)[0] is False
+    assert clarification_response(_request(question), (), ("PAGE",)) is None
+
+
 def test_the_reason_code_is_content_free() -> None:
     assert _conversation_resolution_decision(
         "from the product types", VOCABULARY

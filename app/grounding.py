@@ -14,7 +14,12 @@ from app.reranking import (
     sanitize_evidence,
     scoring_evidence,
 )
-from app.table_evidence import contains_table, linearize_table_row, literal_table_row_evidence
+from app.table_evidence import (
+    contains_table,
+    linearize_table_row,
+    linearize_tables,
+    literal_table_row_evidence,
+)
 from app.workflow_support.answer_structure import (
     AnswerLineKind,
     material_claims as structured_material_claims,
@@ -437,7 +442,7 @@ class LocalCitationGroundingVerifier:
         """
 
         text = sanitize_evidence(
-            re.sub(r"\s*\[SOURCE \d+\]", "", answer)
+            linearize_tables(re.sub(r"\s*\[SOURCE \d+\]", "", answer))
         ).strip()
         prompt = " ".join(str(question or "").split())
         if not text or not prompt:

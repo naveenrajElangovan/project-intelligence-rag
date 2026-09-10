@@ -45,6 +45,24 @@ def test_unknown_refusal_reason_uses_the_existing_fallback() -> None:
     assert refusal_answer("UNKNOWN", "es") == insufficient_evidence_answer("es")
 
 
+def test_missing_evidence_messages_are_honest_and_bilingual() -> None:
+    english = insufficient_evidence_answer("en")
+    spanish = insufficient_evidence_answer("es")
+
+    assert "indexed documents" in english
+    assert "will not guess" in english
+    assert "documentos indexados" in spanish
+    assert "No voy a adivinar" in spanish
+
+
+@pytest.mark.parametrize("language", ("en", "es"))
+def test_scope_refusal_says_no_general_knowledge_fallback(language: str) -> None:
+    answer = refusal_answer("SOURCE_SCOPE_VIOLATION", language)
+
+    expected = "general knowledge" if language == "en" else "conocimiento general"
+    assert expected in answer
+
+
 def test_entity_mismatch_keeps_the_deterministic_clarification(monkeypatch) -> None:
     workflow = object.__new__(AuthorizedRagWorkflow)
     workflow._request = RagRequest(
