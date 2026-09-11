@@ -423,6 +423,19 @@ def _resolve_topic_filter(
     if not topics or not documents:
         return filters
     normalized_topics = tuple(_normalized(value) for value in topics)
+    observed_labels = {
+        _normalized(label): label
+        for document in documents
+        for label in _values(document.metadata.get("labels"))
+    }
+    exact_labels = tuple(
+        dict.fromkeys(observed_labels[topic] for topic in normalized_topics if topic in observed_labels)
+    )
+    if exact_labels:
+        resolved = dict(filters)
+        resolved.pop("topic", None)
+        resolved["topic_alias_label"] = exact_labels
+        return resolved
     direct_count = sum(
         all(
             topic
