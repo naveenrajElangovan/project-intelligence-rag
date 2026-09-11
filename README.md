@@ -63,6 +63,8 @@ On the validated Apple Silicon laptop, use `./scripts/start_local_macos.sh` and
 
 The implemented design, diagrams, security boundaries, code map, deployment topology, and failure
 behavior are documented in the single [current RAG architecture](docs/CURRENT_ARCHITECTURE.md).
+Provider selection, exact Jira aggregates, LiteLLM model routing, operational controls, and live
+verification are documented in [provider routing and Jira aggregates](docs/PROVIDER_ROUTING_AND_JIRA_AGGREGATES.md).
 The company-facing privacy, LLM data-use, threat-model, and production approval guidance is in the
 [enterprise security architecture](../project-intelligence-backend/PROJECT_INTELLIGENCE_SECURITY_ARCHITECTURE.md).
 Backend authorization and ingestion procedures live in their respective repositories.
