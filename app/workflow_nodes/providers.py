@@ -329,7 +329,7 @@ class ProviderNodesMixin:
                     fields = [
                         f"**{labels[0]}:** {row['status']}",
                         f"**{labels[1]}:** {row['issue_type']}",
-                        f"**{labels[2]}:** {row['priority']}",
+                        f"**{labels[2]}:** {row['priority'] or ('No definida' if language == 'es' else 'Not set')}",
                     ]
                     if row.get("assignee"):
                         fields.append(f"**{labels[3]}:** {row['assignee']}")
@@ -398,9 +398,9 @@ class ProviderNodesMixin:
                     else f"Mostrando **{start}–{end} de {result.total}**."
                 )
                 answer = (
-                    f"Found **{result.total} matching {ticket_noun}**{filter_summary}{rule_text} in **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
+                    f"Found **{result.total} {ticket_noun}**{filter_summary}{rule_text} in **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
                     if language == "en"
-                    else f"Se encontraron **{result.total} {ticket_noun} coincidentes**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
+                    else f"Se encontraron **{result.total} {ticket_noun}**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
                 )
             else:
                 answer = (

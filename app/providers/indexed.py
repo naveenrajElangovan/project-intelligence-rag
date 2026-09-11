@@ -362,6 +362,21 @@ def _section_row(documents: list[Document], section_kind: str) -> dict[str, obje
             document.page_content.strip() for document in ordered if document.page_content.strip()
         )
     )
+    text = "\n".join(parts)
+    lines = text.splitlines()
+    if lines and lines[0].upper().startswith(section_kind + " "):
+        text = "\n".join(lines[1:]).strip()
+    if section_kind == "CHANGELOG" and text.startswith("["):
+        try:
+            changes = json.loads(text)
+            text = "\n".join(
+                f"{change.get('field', 'Field')}: "
+                f"{change.get('fromString') or 'not set'} → {change.get('toString') or 'not set'}"
+                for change in changes
+                if isinstance(change, dict)
+            )
+        except (TypeError, ValueError):
+            pass
     return {
         "key": str(metadata.get("issue_key") or ""),
         "kind": section_kind,
@@ -369,6 +384,6 @@ def _section_row(documents: list[Document], section_kind: str) -> dict[str, obje
         "event_date": str(metadata.get("event_date") or metadata.get("attachment_created") or ""),
         "author": str(metadata.get("event_author") or metadata.get("attachment_author") or ""),
         "title": str(metadata.get("title") or metadata.get("file_name") or ""),
-        "text": "\n".join(parts)[:4000],
+        "text": text[:4000],
         "url": str(metadata.get("source_url") or ""),
     }

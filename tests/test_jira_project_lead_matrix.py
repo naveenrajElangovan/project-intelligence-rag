@@ -1,7 +1,9 @@
 import pytest
+from langchain_core.documents import Document
 
 from app.models import StructuredConversationScope
 from app.providers.contracts import ExecutionMode, ProviderName, StructuredOperation
+from app.providers.indexed import _section_row
 from app.providers.router import select_providers
 
 
@@ -140,3 +142,27 @@ def test_project_lead_followups_inherit_jira_scope(question, operation, field, v
     assert selection.structured_query.operation == StructuredOperation(operation)
     assert value in selection.structured_query.filters[field]
     assert selection.structured_query.filters["labels"] == ("POS",)
+
+
+def test_jira_event_rows_remove_ingestion_headers_and_format_changes() -> None:
+    metadata = {
+        "issue_key": "T0-13",
+        "event_id": "10206",
+        "event_author": "Developer",
+        "event_date": "2026-09-10",
+    }
+    row = _section_row(
+        [
+            Document(
+                page_content=(
+                    "CHANGELOG 10206; author: Developer; created: 2026-09-10\n"
+                    '[{"field":"status","fromString":"To Do","toString":"In Progress"}]'
+                ),
+                metadata=metadata,
+            )
+        ],
+        "CHANGELOG",
+    )
+
+    assert row["text"] == "status: To Do → In Progress"
+    assert "CHANGELOG 10206" not in row["text"]
