@@ -70,6 +70,15 @@ JIRA_ONLY = (ProviderName.JIRA,)
         ("What is the status of T0-13?", ALL, "DETAIL", "issue_key", "T0-13"),
         ("¿Quién está asignado a T0-13?", ALL, "DETAIL", "issue_key", "T0-13"),
         ("T0-13", ALL, "DETAIL", "issue_key", "T0-13"),
+        (
+            "T0-7 what is this about, can you give an all detailed list for this?",
+            ALL,
+            "DETAIL",
+            "issue_key",
+            "T0-7",
+        ),
+        ("Show the child work items of T0-7", ALL, "DETAIL", "issue_key", "T0-7"),
+        ("Muestra los issues hijos de T0-7", ALL, "DETAIL", "issue_key", "T0-7"),
     ),
 )
 def test_project_lead_jira_intents_are_deterministic(question, enabled, operation, field, value):

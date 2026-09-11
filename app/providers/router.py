@@ -47,9 +47,14 @@ _REPORT = re.compile(
     re.I,
 )
 _DETAIL = re.compile(
-    r"\b(?:detail|details|information|summary|status|priority|assignee|assigned|owner|reporter|"
+    r"\b(?:detail|details|detailed|information|summary|status|priority|assignee|assigned|owner|reporter|about|"
     r"due date|created|updated|detalle|detalles|informaci[oó]n|resumen|estado|"
-    r"prioridad|asignad[oa]|responsable|reportad[oa]|fecha l[ií]mite|cread[oa]|actualizad[oa])\b",
+    r"prioridad|asignad[oa]|responsable|reportad[oa]|fecha l[ií]mite|cread[oa]|actualizad[oa]|de qu[eé] trata)\b",
+    re.I,
+)
+_CHILDREN = re.compile(
+    r"\b(?:child work items?|child issues?|children|subtasks?|"
+    r"elementos? de trabajo secundarios?|issues? hijos?|hijos?|subtareas?)\b",
     re.I,
 )
 _SECTION_PATTERNS = (
@@ -185,6 +190,12 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
     section_kind = next(
         (kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question)), None
     )
+    if keys and _CHILDREN.search(question):
+        return StructuredQuery(
+            operation=StructuredOperation.DETAIL,
+            provider=ProviderName.JIRA,
+            filters={"issue_key": keys},
+        )
     if section_kind and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
         section_filters: dict[str, tuple[str, ...]] = {"section_kind": (section_kind,)}
         if keys:

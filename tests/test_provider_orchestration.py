@@ -117,6 +117,79 @@ def test_jira_aggregate_uses_current_chunks_explicit_labels_and_stable_dedup() -
     assert result.snapshot_at == "2026-09-11T10:00:00Z"
 
 
+class _HierarchySnapshotRetriever:
+    async def authorized_source_snapshot(self, source_types):
+        assert source_types == ("ISSUE",)
+        parent = _issue("jira:c:T0-7:CURRENT", "T0-7", "Merchandise", "BOT", "In Progress")
+        child_85 = _issue("jira:c:T0-85:CURRENT", "T0-85", "Column widths", "BOT", "In Review")
+        child_93 = _issue("jira:c:T0-93:CURRENT", "T0-93", "Shrinkage capture", "BOT", "In Review")
+        child_85.metadata["parent_issue_key"] = "T0-7"
+        child_93.metadata["parent_issue_key"] = "T0-7"
+        description = Document(
+            page_content="Manage merchandise transfers and shrinkage.",
+            metadata={
+                "provider": "JIRA",
+                "source_type": "ISSUE",
+                "source_id": "jira:c:T0-7:DESCRIPTION:intro",
+                "jira_chunk_kind": "DESCRIPTION",
+                "issue_key": "T0-7",
+                "title": "Merchandise",
+                "cloud_id": "c",
+                "access_policy_id": "project:T2.0",
+                "source_url": "https://example.atlassian.net/browse/T0-7",
+            },
+        )
+        return (parent, child_85, child_93, description), True
+
+
+def test_exact_jira_overview_includes_children_found_by_parent_issue_key() -> None:
+    selection = select_providers(
+        "T0-7 what is this about, can you give an all detailed list for this?", ENABLED
+    )
+    adapter = IndexedProviderAdapter(
+        ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever()
+    )
+
+    result = asyncio.run(adapter.aggregate(selection.structured_query))
+
+    assert result.total == 1
+    assert [row["key"] for row in result.rows] == ["T0-7", "T0-85", "T0-93"]
+    assert [row["row_role"] for row in result.rows] == ["PARENT", "CHILD", "CHILD"]
+    assert result.rows[0]["description"] == "Manage merchandise transfers and shrinkage."
+
+
+def test_exact_jira_overview_renders_child_work_items() -> None:
+    class Workflow(ProviderNodesMixin):
+        pass
+
+    class Registry:
+        def get(self, provider):
+            return IndexedProviderAdapter(
+                ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever()
+            )
+
+    workflow = Workflow()
+    workflow._request = RagRequest(
+        projectId="T2.0",
+        collectionName="project-intelligence",
+        question="Show child work items of T0-7",
+        accessPolicyIds=["project:T2.0"],
+    )
+    workflow._settings = SimpleNamespace(
+        provider_timeout_seconds=2.0,
+        provider_max_list_items=50,
+    )
+    workflow._provider_registry = Registry()
+    selection = select_providers(workflow._request.question, ENABLED)
+
+    state = asyncio.run(workflow._provider_execute({"provider_selection": selection}))
+
+    answer = state["provider_response"].answer
+    assert "Child work items (2)" in answer
+    assert "T0-85" in answer
+    assert "T0-93" in answer
+
+
 def test_ticket_count_uses_structured_jira_route_without_repeating_provider_name() -> None:
     selection = select_providers("all tickets count?", (ProviderName.JIRA,))
 

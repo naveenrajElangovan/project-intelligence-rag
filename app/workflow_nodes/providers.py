@@ -311,8 +311,9 @@ class ProviderNodesMixin:
                 else f"**{result.total} tickets de Jira**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\nDesglose por {query.group_by}:\n{buckets}{snapshot}"
             )
         elif query.operation == StructuredOperation.DETAIL:
-            rows = result.rows
-            if not rows:
+            parent_rows = [row for row in result.rows if row.get("row_role") != "CHILD"]
+            child_rows = [row for row in result.rows if row.get("row_role") == "CHILD"]
+            if not parent_rows:
                 answer = (
                     f"No matching Jira issue was found in **{self._request.project_id}**.{snapshot}"
                     if language == "en"
@@ -320,7 +321,7 @@ class ProviderNodesMixin:
                 )
             else:
                 rendered_details = []
-                for row in rows:
+                for row in parent_rows:
                     labels = (
                         ("Estado", "Tipo", "Prioridad", "Responsable", "Reportó", "Fecha límite")
                         if language == "es"
@@ -337,11 +338,28 @@ class ProviderNodesMixin:
                         fields.append(f"**{labels[4]}:** {row['reporter']}")
                     if row.get("due_date"):
                         fields.append(f"**{labels[5]}:** {row['due_date']}")
+                    if row.get("description"):
+                        fields.append(
+                            f"**{'Descripción' if language == 'es' else 'Description'}:** {row['description']}"
+                        )
                     rendered_details.append(
                         f"### {row['key']} — {row['summary']}\n"
                         + "\n".join(f"- {field}" for field in fields)
                     )
-                answer = "\n\n".join(rendered_details) + snapshot
+                children_heading = (
+                    f"#### Elementos de trabajo hijos ({len(child_rows)})"
+                    if language == "es"
+                    else f"#### Child work items ({len(child_rows)})"
+                )
+                children = (
+                    "\n".join(
+                        f"- **{row['key']}** — {row['summary']} · {row['issue_type']} · {row['status']}"
+                        for row in child_rows
+                    )
+                    if child_rows
+                    else ("- Ninguno" if language == "es" else "- None")
+                )
+                answer = "\n\n".join(rendered_details) + f"\n\n{children_heading}\n{children}" + snapshot
         elif query.operation == StructuredOperation.SECTION_COUNT:
             section_kind = _section_label(query.section_kind, language)
             answer = (

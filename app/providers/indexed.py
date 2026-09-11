@@ -144,6 +144,57 @@ class IndexedProviderAdapter(ProviderAdapter):
             if key != ":":
                 unique[key] = document
         ordered = sorted(unique.values(), key=_jira_sort_key)
+        if query.operation == StructuredOperation.DETAIL:
+            requested_keys = {
+                value.upper() for value in effective_filters.get("issue_key", ())
+            }
+            children_by_identity: dict[str, Document] = {}
+            for document in current:
+                if str(document.metadata.get("parent_issue_key") or "").upper() not in requested_keys:
+                    continue
+                identity = str(document.metadata.get("cloud_id") or "") + ":" + _identity(document)
+                children_by_identity[identity] = document
+            children = sorted(children_by_identity.values(), key=_jira_sort_key)
+            descriptions: dict[str, list[Document]] = {}
+            for document in documents:
+                if (
+                    str(document.metadata.get("jira_chunk_kind") or "").upper() == "DESCRIPTION"
+                    and str(document.metadata.get("issue_key") or "").upper() in requested_keys
+                ):
+                    descriptions.setdefault(
+                        str(document.metadata.get("issue_key") or "").upper(), []
+                    ).append(document)
+            rows: list[dict[str, object]] = []
+            for document in ordered:
+                row = _row(document)
+                row["row_role"] = "PARENT"
+                description_parts = descriptions.get(str(row["key"]).upper(), [])
+                if description_parts:
+                    row["description"] = _section_row(description_parts, "DESCRIPTION")["text"]
+                rows.append(row)
+            for document in children:
+                row = _row(document)
+                row["row_role"] = "CHILD"
+                rows.append(row)
+            evidence_documents = [
+                *ordered,
+                *children,
+                *(item for group in descriptions.values() for item in group),
+            ]
+            return StructuredResult(
+                operation=query.operation,
+                provider=self.name,
+                complete=complete,
+                snapshot_at=_snapshot_at(current),
+                total=len(ordered),
+                rows=tuple(rows),
+                evidence=tuple(
+                    _envelope(self.name, self._project_id, document)
+                    for document in evidence_documents
+                ),
+                degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
+                applied_filter_rule=fixed_rule,
+            )
         groups: dict[str, int] = {}
         if query.group_by:
             for document in ordered:
@@ -346,6 +397,7 @@ def _row(document: Document) -> dict[str, object]:
         "issue_type": str(metadata.get("issue_type") or ""),
         "priority": str(metadata.get("priority") or ""),
         "labels": _values(metadata.get("labels")),
+        "parent_issue_key": str(metadata.get("parent_issue_key") or ""),
         "assignee": str(metadata.get("assignee") or ""),
         "reporter": str(metadata.get("reporter") or ""),
         "due_date": str(metadata.get("due_date") or ""),

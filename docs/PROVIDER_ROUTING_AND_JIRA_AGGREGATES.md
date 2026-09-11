@@ -80,6 +80,8 @@ The structured route supports:
 - distributions by status, issue type, or priority;
 - project-lead status reports backed by complete distributions;
 - exact issue details for a Jira key;
+- exact-key overviews with the parent description and child work items discovered
+  from each current issue's `parent_issue_key`;
 - paged comments, changelog events, worklogs, attachments, relationships,
   acceptance criteria, requirements, descriptions, custom fields, and remote
   links;
@@ -105,6 +107,13 @@ The adapter groups split comment, changelog, and worklog chunks by stable event
 identity before counting or presenting them. This prevents a long comment split
 into two embedding windows from appearing as two comments. Section lists use a
 20-record page and preserve source links, authors, event dates, and identifiers.
+
+Exact-key overview language such as “what is this about,” “detailed,” “child
+work items,” “children,” and the corresponding Spanish phrases uses a complete
+authorized hierarchy scan. Child records are resolved from their own current
+`parent_issue_key`; the implementation does not depend on Jira returning an
+embedded `subtasks` list on the parent. This supports epic children and other
+parent-linked Jira work items while preserving stable child identities.
 
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the
