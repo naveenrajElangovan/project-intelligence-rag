@@ -49,7 +49,11 @@ _REPORT = re.compile(
 _OVERVIEW = re.compile(
     r"\b(?:jira overview|overview of jira|summari[sz]e jira|summari[sz]e (?:the )?(?:whole|entire) jira|"
     r"whole jira|entire jira|complete jira report|resumen (?:general )?de jira|"
-    r"resume (?:todo )?jira|informe completo de jira)\b",
+    r"resume (?:todo )?jira|informe completo de jira|"
+    r"summari[sz]e (?:the )?project status|project status (?:summary|overview)|"
+    r"(?:give|show) me (?:the )?project status|overall project status|how is the project doing|"
+    r"resumen del estado del proyecto|resume (?:el )?estado del proyecto|"
+    r"muestra (?:el )?estado del proyecto|c[oó]mo va el proyecto)\b",
     re.I,
 )
 _DETAIL = re.compile(

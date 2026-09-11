@@ -129,6 +129,12 @@ attachment, relationship, requirement, and worklog requests still use their
 dedicated paged operations. Project-level “whole Jira” summaries use the
 complete authorized current-state scan rather than an LLM prompt.
 
+When Jira is the only user-selected provider, ordinary project-lead wording
+such as “Summarize project status,” “How is the project doing?”, and their
+Spanish equivalents also selects this complete Jira overview. The same wording
+with multiple providers enabled remains on the established cross-source path,
+so a Jira-only selection does not change GitHub or Confluence summary behavior.
+
 The capability boundary is intentional: deterministic structured operations
 handle complete inventories and exact facts; other Jira questions remain
 scoped to Jira evidence in the established semantic RAG path. This provides a
