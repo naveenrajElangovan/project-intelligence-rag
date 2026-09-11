@@ -315,6 +315,13 @@ to RAG. An unavailable provider is rejected with HTTP 422. The client cannot
 create access policies or activate a provider absent from the project mapping.
 Leaving the field absent preserves the existing routing behavior.
 
+The validated selection is also language context. If Jira is selected,
+unqualified phrases such as “ticket count” are resolved as Jira work items and
+can use the exact structured route. Clients that omit `enabledProviders` retain
+the work-item-versus-receipt clarification for ambiguous uses of “ticket.” The
+selected set is enforced again on retrieval, so this disambiguation never
+widens the authorized provider scope.
+
 Changing the source selection can reset an inherited Jira structured scope when
 Jira is no longer selected. Selecting multiple sources allows the deterministic
 planner to federate only when the question requires cross-provider evidence.

@@ -35,6 +35,12 @@ def _filter_summary(filters: dict[str, tuple[str, ...]], language: str) -> str:
     return f" matching {joined}" if language == "en" else f" que coinciden con {joined}"
 
 
+def _ticket_noun(total: int, language: str) -> str:
+    if language == "es":
+        return "ticket de Jira" if total == 1 else "tickets de Jira"
+    return "Jira ticket" if total == 1 else "Jira tickets"
+
+
 def _fixed_rule_text(rule: str | None, language: str) -> str:
     if not rule:
         return ""
@@ -271,10 +277,11 @@ class ProviderNodesMixin:
             else ""
         )
         if query.operation == StructuredOperation.COUNT:
+            ticket_noun = _ticket_noun(result.total, language)
             answer = (
-                f"**{result.total} Jira tickets**{filter_summary}{rule_text} in **{self._request.project_id}**.{snapshot}"
+                f"**{result.total} {ticket_noun}**{filter_summary}{rule_text} in **{self._request.project_id}**.{snapshot}"
                 if language == "en"
-                else f"**{result.total} tickets de Jira**{filter_summary}{rule_text} en **{self._request.project_id}**.{snapshot}"
+                else f"**{result.total} {ticket_noun}**{filter_summary}{rule_text} en **{self._request.project_id}**.{snapshot}"
             )
         elif query.operation == StructuredOperation.DISTRIBUTION:
             buckets = "\n".join(f"- **{key}:** {value}" for key, value in result.groups.items())
@@ -294,15 +301,16 @@ class ProviderNodesMixin:
             start = query.offset + 1 if returned else min(query.offset, result.total)
             end = query.offset + returned
             if returned:
+                ticket_noun = _ticket_noun(result.total, language)
                 page_text = (
                     f"Showing **{start}–{end} of {result.total}**."
                     if language == "en"
                     else f"Mostrando **{start}–{end} de {result.total}**."
                 )
                 answer = (
-                    f"Found **{result.total} matching Jira tickets**{filter_summary}{rule_text} in **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
+                    f"Found **{result.total} matching {ticket_noun}**{filter_summary}{rule_text} in **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
                     if language == "en"
-                    else f"Se encontraron **{result.total} tickets de Jira coincidentes**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
+                    else f"Se encontraron **{result.total} {ticket_noun} coincidentes**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
                 )
             else:
                 answer = (

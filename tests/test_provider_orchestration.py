@@ -116,6 +116,15 @@ def test_jira_aggregate_uses_current_chunks_explicit_labels_and_stable_dedup() -
     assert result.snapshot_at == "2026-09-11T10:00:00Z"
 
 
+def test_ticket_count_uses_structured_jira_route_without_repeating_provider_name() -> None:
+    selection = select_providers("all tickets count?", (ProviderName.JIRA,))
+
+    assert selection.mode == ExecutionMode.STRUCTURED
+    assert selection.providers == (ProviderName.JIRA,)
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.COUNT
+
+
 def test_jira_aggregate_accepts_issue_records_without_provider_metadata() -> None:
     class LegacySnapshotRetriever(_SnapshotRetriever):
         async def authorized_source_snapshot(self, source_types):

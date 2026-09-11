@@ -82,6 +82,12 @@ def clarification_response(
         and bool(re.search(r"\b(?:tickets?|boletos?)\b", normalized))
         and not explicit_identifier
     )
+    # A server-validated source selection is explicit routing context. When Jira
+    # is among the selected providers, "ticket" means a Jira work item for this
+    # request and the provider router can safely resolve counts and lists. Older
+    # clients that omit enabledProviders retain the ambiguity guard.
+    selected_providers = {value.upper() for value in request.enabled_providers or ()}
+    jira_selected = "JIRA" in selected_providers
     explicit_delivery_context = bool(
         re.search(
             r"\b(?:jira|issues?|bugs?|sprints?|releases?|priority|priorities|"
@@ -97,7 +103,12 @@ def clarification_response(
             normalized,
         )
     )
-    if overloaded_record and not explicit_delivery_context and not document_context:
+    if (
+        overloaded_record
+        and not jira_selected
+        and not explicit_delivery_context
+        and not document_context
+    ):
         language = resolve_response_language(request.question)
         return RagResponse(
             status="NEEDS_CLARIFICATION",

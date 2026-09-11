@@ -43,20 +43,22 @@ def test_page_only_project_never_offers_a_work_item_sense(question: str) -> None
     ),
 )
 def test_print_stems_disambiguate_ticket_in_a_mixed_corpus(question: str) -> None:
-    assert clarification_response(
-        _request(question), (), ("PAGE", "CODE", "ISSUE")
-    ) is None
+    assert clarification_response(_request(question), (), ("PAGE", "CODE", "ISSUE")) is None
 
 
 @pytest.mark.parametrize(
     "question", ("¿Dónde veo el estado del ticket?", "¿Puedo copiar un ticket?")
 )
 def test_bare_ticket_remains_ambiguous_in_a_mixed_corpus(question: str) -> None:
-    response = clarification_response(
-        _request(question), (), ("PAGE", "CODE", "ISSUE")
-    )
+    response = clarification_response(_request(question), (), ("PAGE", "CODE", "ISSUE"))
     assert response is not None
     assert response.failure_reason == "AMBIGUOUS_SOURCE_FAMILY"
+
+
+def test_validated_jira_selection_disambiguates_ticket_aggregate() -> None:
+    request = _request("all tickets count?").model_copy(update={"enabled_providers": ["JIRA"]})
+
+    assert clarification_response(request, (), ("PAGE", "CODE", "ISSUE")) is None
 
 
 @pytest.mark.parametrize(
