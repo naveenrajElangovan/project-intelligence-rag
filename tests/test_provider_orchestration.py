@@ -1,10 +1,13 @@
 import asyncio
+from types import SimpleNamespace
 
 from langchain_core.documents import Document
 
+from app.models import RagRequest, StructuredConversationScope
 from app.providers.contracts import ExecutionMode, ProviderName, StructuredOperation
 from app.providers.indexed import IndexedProviderAdapter
 from app.providers.router import select_providers
+from app.workflow_nodes.providers import ProviderNodesMixin
 
 
 ENABLED = (ProviderName.JIRA, ProviderName.GITHUB, ProviderName.CONFLUENCE)
@@ -68,7 +71,11 @@ class _SnapshotRetriever:
                 _issue("jira:c:T0-2:CURRENT", "T0-2", "BOT order", "BOT", "To Do"),
                 Document(
                     page_content="historical",
-                    metadata={"provider": "JIRA", "jira_chunk_kind": "CHANGELOG", "issue_key": "T0-1"},
+                    metadata={
+                        "provider": "JIRA",
+                        "jira_chunk_kind": "CHANGELOG",
+                        "issue_key": "T0-1",
+                    },
                 ),
             ),
             True,
@@ -141,3 +148,234 @@ def test_jira_aggregate_exposes_truncation_instead_of_claiming_completeness() ->
 
     assert result.complete is False
     assert result.degradation == ("SNAPSHOT_TRUNCATED",)
+
+
+def _scope(**overrides) -> StructuredConversationScope:
+    values = {
+        "provider": "JIRA",
+        "resourceType": "ISSUE",
+        "filters": {"labels": ("POS",)},
+        "operation": "COUNT",
+        "complete": True,
+        "pageSize": 50,
+        "nextOffset": 0,
+        "activeSubject": "Jira tickets matching POS",
+    }
+    values.update(overrides)
+    return StructuredConversationScope(**values)
+
+
+def test_jira_fixed_followup_inherits_provider_and_label_scope() -> None:
+    selection = select_providers("what are all fixed?", ENABLED, _scope())
+
+    assert selection.mode == ExecutionMode.STRUCTURED
+    assert selection.reason == "JIRA_STRUCTURED_CONTEXT_INHERITED"
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.LIST
+    assert selection.structured_query.filters == {
+        "labels": ("POS",),
+        "fixed": ("AUTO",),
+    }
+
+
+def test_explicit_status_semantics_replace_conflicting_inherited_status() -> None:
+    fixed = select_providers(
+        "what are all fixed?",
+        ENABLED,
+        _scope(filters={"labels": ("POS",), "status": ("To Do",)}),
+    )
+    todo = select_providers(
+        "how many are To Do?",
+        ENABLED,
+        _scope(filters={"labels": ("POS",), "fixed": ("AUTO",)}),
+    )
+
+    assert fixed.structured_query.filters == {
+        "labels": ("POS",),
+        "fixed": ("AUTO",),
+    }
+    assert todo.structured_query.filters == {
+        "labels": ("POS",),
+        "status": ("To Do",),
+    }
+
+
+def test_jira_show_more_uses_saved_page_offset() -> None:
+    selection = select_providers(
+        "show more",
+        ENABLED,
+        _scope(operation="LIST", pageSize=25, nextOffset=50),
+    )
+
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.LIST
+    assert selection.structured_query.offset == 50
+    assert selection.structured_query.limit == 25
+
+
+def test_elliptical_label_change_replaces_inherited_label() -> None:
+    selection = select_providers("what about BOT?", ENABLED, _scope())
+
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.COUNT
+    assert selection.structured_query.filters == {"labels": ("BOT",)}
+
+
+def test_explicit_provider_and_unrelated_topic_do_not_inherit_jira_scope() -> None:
+    github = select_providers("What changed in GitHub?", ENABLED, _scope())
+    unrelated = select_providers("How does cash reconciliation work?", ENABLED, _scope())
+
+    assert github.mode == ExecutionMode.SINGLE_PROVIDER
+    assert github.providers == (ProviderName.GITHUB,)
+    assert unrelated.mode == ExecutionMode.LEGACY
+
+
+def test_structured_followup_without_scope_requests_clarification() -> None:
+    selection = select_providers("what are all fixed?", ENABLED)
+
+    assert selection.mode == ExecutionMode.CLARIFICATION
+    assert selection.reason == "STRUCTURED_CONTEXT_REQUIRED"
+
+
+class _ResolutionSnapshotRetriever:
+    def __init__(self, documents):
+        self.documents = tuple(documents)
+
+    async def authorized_source_snapshot(self, source_types):
+        assert source_types == ("ISSUE",)
+        return self.documents, True
+
+
+def test_fixed_prefers_observed_resolution_and_keeps_numeric_issue_order() -> None:
+    issue_10 = _issue("jira:c:T0-10:CURRENT", "T0-10", "Ten", "POS", "Done")
+    issue_2 = _issue("jira:c:T0-2:CURRENT", "T0-2", "Two", "POS", "Done")
+    issue_3 = _issue("jira:c:T0-3:CURRENT", "T0-3", "Three", "POS", "Done")
+    issue_10.metadata["resolution"] = "Fixed"
+    issue_2.metadata["resolution"] = "Fixed"
+    issue_3.metadata["resolution"] = "Won't Do"
+    adapter = IndexedProviderAdapter(
+        ProviderName.JIRA, "T2.0", _ResolutionSnapshotRetriever([issue_10, issue_2, issue_3])
+    )
+    query = select_providers("what are all fixed?", ENABLED, _scope(pageSize=1)).structured_query
+
+    result = asyncio.run(adapter.aggregate(query))
+
+    assert result.total == 2
+    assert [row["key"] for row in result.rows] == ["T0-2"]
+    assert result.applied_filter_rule == "RESOLUTION:Fixed"
+    assert len(result.evidence) == 1
+
+
+def test_fixed_falls_back_to_done_status_category() -> None:
+    done = _issue("jira:c:T0-1:CURRENT", "T0-1", "Done", "POS", "Closed")
+    open_issue = _issue("jira:c:T0-2:CURRENT", "T0-2", "Open", "POS", "Working")
+    done.metadata["status_category_key"] = "done"
+    open_issue.metadata["status_category_key"] = "indeterminate"
+    adapter = IndexedProviderAdapter(
+        ProviderName.JIRA, "T2.0", _ResolutionSnapshotRetriever([done, open_issue])
+    )
+    query = select_providers("what are all fixed?", ENABLED, _scope()).structured_query
+
+    result = asyncio.run(adapter.aggregate(query))
+
+    assert result.total == 1
+    assert result.applied_filter_rule == "STATUS_CATEGORY:DONE"
+
+
+def test_fixed_uses_legacy_done_status_before_metadata_refresh() -> None:
+    adapter = IndexedProviderAdapter(ProviderName.JIRA, "T2.0", _SnapshotRetriever())
+    query = select_providers("what are all fixed?", ENABLED, _scope()).structured_query
+
+    result = asyncio.run(adapter.aggregate(query))
+
+    assert result.total == 1
+    assert result.applied_filter_rule == "LEGACY_STATUS:DONE"
+
+
+def test_multiple_fixed_equivalent_resolutions_require_clarification() -> None:
+    fixed = _issue("jira:c:T0-1:CURRENT", "T0-1", "Fixed", "POS", "Done")
+    resolved = _issue("jira:c:T0-2:CURRENT", "T0-2", "Resolved", "POS", "Done")
+    fixed.metadata["resolution"] = "Fixed"
+    resolved.metadata["resolution"] = "Resolved"
+    adapter = IndexedProviderAdapter(
+        ProviderName.JIRA, "T2.0", _ResolutionSnapshotRetriever([fixed, resolved])
+    )
+    query = select_providers("what are all fixed?", ENABLED, _scope()).structured_query
+
+    result = asyncio.run(adapter.aggregate(query))
+
+    assert result.clarification_options == ("Fixed", "Resolved")
+    assert result.applied_filter_rule == "AMBIGUOUS_RESOLUTION"
+
+
+def test_structured_jira_answer_returns_scope_and_page_for_backend_memory() -> None:
+    class Workflow(ProviderNodesMixin):
+        pass
+
+    class Registry:
+        def get(self, provider):
+            assert provider == ProviderName.JIRA
+            return IndexedProviderAdapter(ProviderName.JIRA, "T2.0", _SnapshotRetriever())
+
+    workflow = Workflow()
+    workflow._request = RagRequest(
+        projectId="T2.0",
+        collectionName="project-intelligence",
+        question="List all Jira tickets for POS",
+        accessPolicyIds=["project:T2.0"],
+    )
+    workflow._settings = SimpleNamespace(
+        provider_timeout_seconds=2.0,
+        provider_max_list_items=50,
+    )
+    workflow._provider_registry = Registry()
+    selection = select_providers(workflow._request.question, ENABLED)
+
+    state = asyncio.run(workflow._provider_execute({"provider_selection": selection}))
+
+    response = state["provider_response"]
+    assert response.conversation_context_update is not None
+    scope = response.conversation_context_update.structured_scope
+    assert scope is not None
+    assert scope.provider == "JIRA"
+    assert scope.filters == {"labels": ("POS",)}
+    assert response.result_page is not None
+    assert response.result_page.total == 1
+    assert response.result_page.has_more is False
+
+
+def test_chroma_document_mapping_preserves_jira_fixed_fields() -> None:
+    from app.retrieval import ChromaAccessRetriever
+
+    retriever = ChromaAccessRetriever.model_construct(
+        index=None,
+        collection_name="project-intelligence",
+        text_field="chunk_text",
+        project_id="T2.0",
+        access_policy_ids=("project:T2.0",),
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+        score_threshold=0.0,
+    )
+    document = retriever._document_from_fields(
+        {
+            "chunk_text": "Current Jira state",
+            "project_id": "T2.0",
+            "access_policy_id": "project:T2.0",
+            "source_type": "ISSUE",
+            "schema_version": "3",
+            "embedding_model": "multilingual-e5-large",
+            "status": "Done",
+            "status_category": "Done",
+            "status_category_key": "done",
+            "resolution": "Fixed",
+            "resolution_id": "10000",
+        },
+        "chunk-1",
+        1.0,
+    )
+
+    assert document is not None
+    assert document.metadata["status_category_key"] == "done"
+    assert document.metadata["resolution"] == "Fixed"
+    assert document.metadata["resolution_id"] == "10000"

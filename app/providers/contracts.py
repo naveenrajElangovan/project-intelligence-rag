@@ -20,6 +20,7 @@ class ExecutionMode(StrEnum):
     FEDERATED = "FEDERATED"
     STRUCTURED = "STRUCTURED"
     UNAVAILABLE = "UNAVAILABLE"
+    CLARIFICATION = "CLARIFICATION"
 
 
 class StructuredOperation(StrEnum):
@@ -50,6 +51,8 @@ class StructuredQuery(BaseModel):
     provider: ProviderName
     filters: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     group_by: str | None = None
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=50, ge=1, le=500)
 
 
 class EvidenceEnvelope(BaseModel):
@@ -80,6 +83,8 @@ class StructuredResult(BaseModel):
     groups: dict[str, int] = Field(default_factory=dict)
     evidence: tuple[EvidenceEnvelope, ...] = ()
     degradation: tuple[str, ...] = ()
+    applied_filter_rule: str | None = None
+    clarification_options: tuple[str, ...] = ()
 
 
 class ProviderFailure(BaseModel):

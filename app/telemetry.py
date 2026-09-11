@@ -29,9 +29,7 @@ _TOKENS = Counter(
     "LLM and embedding token usage.",
     ("stage", "direction", "model_provider", "model_name", "model_profile"),
 )
-_RETRIES = Counter(
-    "pi_rag_retries_total", "Transient and semantic RAG retries.", ("stage",)
-)
+_RETRIES = Counter("pi_rag_retries_total", "Transient and semantic RAG retries.", ("stage",))
 _STAGE_ITEMS = Histogram(
     "pi_rag_stage_items",
     "Items entering and leaving RAG stages.",
@@ -129,6 +127,11 @@ _PROVIDER_ITEMS = Histogram(
     ("provider", "operation"),
     buckets=(0, 1, 5, 10, 25, 50, 100, 200, 500, 1000),
 )
+_STRUCTURED_CONTEXT = Counter(
+    "pi_rag_structured_context_total",
+    "Structured provider conversation context decisions.",
+    ("outcome",),
+)
 
 
 def provider_operation(
@@ -137,6 +140,10 @@ def provider_operation(
     _PROVIDER_OPERATIONS.labels(provider, operation, outcome).inc()
     if complete:
         _PROVIDER_ITEMS.labels(provider, operation).observe(max(0, items))
+
+
+def structured_context_decision(outcome: str) -> None:
+    _STRUCTURED_CONTEXT.labels(outcome).inc()
 
 
 def configure_telemetry_logging(level: str = "INFO") -> None:
@@ -152,7 +159,11 @@ def configure_telemetry_logging(level: str = "INFO") -> None:
 
 def new_request_id(candidate: str | None = None) -> str:
     value = (candidate or "").strip()
-    if value and len(value) <= 128 and all(character.isalnum() or character in "-_." for character in value):
+    if (
+        value
+        and len(value) <= 128
+        and all(character.isalnum() or character in "-_." for character in value)
+    ):
         return value
     return str(uuid.uuid4())
 
@@ -202,17 +213,13 @@ def canonical_quote_fallback(reason: str) -> None:
 
 def request_admitted(began: float) -> None:
     _REQUEST_ADMISSIONS.labels("accepted").inc()
-    _REQUEST_ADMISSION_WAIT.labels("accepted").observe(
-        max(0.0, time.perf_counter() - began)
-    )
+    _REQUEST_ADMISSION_WAIT.labels("accepted").observe(max(0.0, time.perf_counter() - began))
     _INFLIGHT_REQUESTS.inc()
 
 
 def request_shed(began: float) -> None:
     _REQUEST_ADMISSIONS.labels("shed").inc()
-    _REQUEST_ADMISSION_WAIT.labels("shed").observe(
-        max(0.0, time.perf_counter() - began)
-    )
+    _REQUEST_ADMISSION_WAIT.labels("shed").observe(max(0.0, time.perf_counter() - began))
 
 
 def request_released() -> None:
@@ -282,9 +289,7 @@ def stage_complete(
             if count:
                 _RETRIEVAL_CANDIDATES.labels(source_type).inc(count)
         if bool(extra.get("code_required")) and int(extra.get("code_candidates") or 0) == 0:
-            _CODE_REQUIRED_ZERO.labels(
-                str(extra.get("query_intent") or "DIRECT")
-            ).inc()
+            _CODE_REQUIRED_ZERO.labels(str(extra.get("query_intent") or "DIRECT")).inc()
     if extra and stage == "rerank":
         for source_type, field in (
             ("CODE", "code_selected"),
@@ -298,7 +303,9 @@ def stage_complete(
     if input_tokens:
         _TOKENS.labels(stage, "input", model_provider, model_name, model_profile).inc(input_tokens)
     if output_tokens:
-        _TOKENS.labels(stage, "output", model_provider, model_name, model_profile).inc(output_tokens)
+        _TOKENS.labels(stage, "output", model_provider, model_name, model_profile).inc(
+            output_tokens
+        )
     if retry_count:
         _RETRIES.labels(stage).inc(retry_count)
     # Mirror safe stage telemetry into the active OpenTelemetry span. Importing
@@ -319,9 +326,7 @@ def stage_complete(
             span.set_attribute("rag.reason_code", reason_code)
     except Exception:
         pass
-    LOGGER.info(
-        json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    )
+    LOGGER.info(json.dumps(payload, separators=(",", ":"), sort_keys=True))
 
 
 def request_complete(

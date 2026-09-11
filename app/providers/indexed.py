@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 
 from langchain_core.documents import Document
 
@@ -96,18 +98,23 @@ class IndexedProviderAdapter(ProviderAdapter):
     async def aggregate(self, query: StructuredQuery) -> StructuredResult:
         if self.name != ProviderName.JIRA:
             return StructuredResult(
-                operation=query.operation, provider=self.name, complete=False,
+                operation=query.operation,
+                provider=self.name,
+                complete=False,
                 degradation=("AGGREGATE_UNSUPPORTED",),
             )
         loader = getattr(self._retriever, "authorized_source_snapshot", None)
         if loader is None:
             return StructuredResult(
-                operation=query.operation, provider=self.name, complete=False,
+                operation=query.operation,
+                provider=self.name,
+                complete=False,
                 degradation=("COMPLETE_SNAPSHOT_UNAVAILABLE",),
             )
         documents, complete = await loader(("ISSUE",))
         current = [
-            document for document in documents
+            document
+            for document in documents
             # ISSUE is the established Jira source contract. Older Jira
             # snapshots predate the redundant provider metadata, so requiring
             # provider=JIRA would silently turn a complete legacy snapshot into
@@ -115,32 +122,46 @@ class IndexedProviderAdapter(ProviderAdapter):
             if str(document.metadata.get("source_type") or "").upper() == "ISSUE"
             and str(document.metadata.get("jira_chunk_kind") or "") == "CURRENT"
         ]
-        matched = [document for document in current if _matches(document, query.filters)]
+        effective_filters, fixed_rule, clarification_options = _resolve_fixed_filter(
+            current, query.filters
+        )
+        if clarification_options:
+            return StructuredResult(
+                operation=query.operation,
+                provider=self.name,
+                complete=True,
+                snapshot_at=_snapshot_at(current),
+                clarification_options=clarification_options,
+                applied_filter_rule="AMBIGUOUS_RESOLUTION",
+            )
+        matched = [document for document in current if _matches(document, effective_filters)]
         unique: dict[str, Document] = {}
         for document in matched:
             key = str(document.metadata.get("cloud_id") or "") + ":" + _identity(document)
             if key != ":":
                 unique[key] = document
-        ordered = sorted(unique.values(), key=lambda item: str(item.metadata.get("issue_key") or ""))
+        ordered = sorted(unique.values(), key=_jira_sort_key)
         groups: dict[str, int] = {}
         if query.group_by:
             for document in ordered:
                 value = str(document.metadata.get(query.group_by) or "Unspecified")
                 groups[value] = groups.get(value, 0) + 1
-        snapshot_at = max(
-            (str(document.metadata.get("issue_updated") or "") for document in current),
-            default="",
-        ) or None
+        snapshot_at = _snapshot_at(current)
+        page = ordered[query.offset : query.offset + query.limit]
+        evidence_documents = page if query.operation.value == "LIST" else ordered
         return StructuredResult(
             operation=query.operation,
             provider=self.name,
             complete=complete,
             snapshot_at=snapshot_at,
             total=len(ordered),
-            rows=tuple(_row(document) for document in ordered),
+            rows=tuple(_row(document) for document in page),
             groups=dict(sorted(groups.items())),
-            evidence=tuple(_envelope(self.name, self._project_id, document) for document in ordered),
+            evidence=tuple(
+                _envelope(self.name, self._project_id, document) for document in evidence_documents
+            ),
             degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
+            applied_filter_rule=fixed_rule,
         )
 
     async def health(self) -> bool:
@@ -154,10 +175,16 @@ class IndexedProviderAdapter(ProviderAdapter):
     async def freshness(self) -> str | None:
         loader = getattr(self._retriever, "authorized_source_snapshot")
         documents, _complete = await loader((_SOURCE_TYPES[self.name][0],))
-        return max(
-            (str(item.metadata.get("issue_updated") or item.metadata.get("event_date") or "") for item in documents),
-            default="",
-        ) or None
+        return (
+            max(
+                (
+                    str(item.metadata.get("issue_updated") or item.metadata.get("event_date") or "")
+                    for item in documents
+                ),
+                default="",
+            )
+            or None
+        )
 
 
 def _matches(document: Document, filters: dict[str, tuple[str, ...]]) -> bool:
@@ -173,12 +200,70 @@ def _matches(document: Document, filters: dict[str, tuple[str, ...]]) -> bool:
     return True
 
 
+def _normalized(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value).casefold()
+        if not unicodedata.combining(character)
+    )
+
+
+def _resolve_fixed_filter(
+    documents: list[Document], filters: dict[str, tuple[str, ...]]
+) -> tuple[dict[str, tuple[str, ...]], str | None, tuple[str, ...]]:
+    effective = {key: tuple(value) for key, value in filters.items() if key != "fixed"}
+    if "fixed" not in filters:
+        return effective, None, ()
+    fixed_aliases = {"fixed", "resolved", "corregido", "corregida", "resuelto", "resuelta"}
+    observed = sorted(
+        {
+            str(document.metadata.get("resolution") or "").strip()
+            for document in documents
+            if str(document.metadata.get("resolution") or "").strip()
+        }
+    )
+    matching = tuple(value for value in observed if _normalized(value) in fixed_aliases)
+    if len(matching) > 1:
+        return effective, "AMBIGUOUS_RESOLUTION", matching
+    if matching:
+        effective["resolution"] = matching
+        return effective, f"RESOLUTION:{matching[0]}", ()
+    if any("status_category_key" in document.metadata for document in documents):
+        effective["status_category_key"] = ("done",)
+        return effective, "STATUS_CATEGORY:DONE", ()
+    # Compatibility for Jira snapshots ingested before status-category metadata.
+    effective["status"] = ("Done",)
+    return effective, "LEGACY_STATUS:DONE", ()
+
+
+def _snapshot_at(documents: list[Document]) -> str | None:
+    return (
+        max(
+            (str(document.metadata.get("issue_updated") or "") for document in documents),
+            default="",
+        )
+        or None
+    )
+
+
+def _jira_sort_key(document: Document) -> tuple[str, int, str]:
+    key = str(document.metadata.get("issue_key") or "")
+    match = re.fullmatch(r"(.+?)-(\d+)", key)
+    if match:
+        return match.group(1).casefold(), int(match.group(2)), key.casefold()
+    return key.casefold(), 0, key.casefold()
+
+
 def _row(document: Document) -> dict[str, object]:
     metadata = document.metadata
     return {
         "key": str(metadata.get("issue_key") or ""),
         "summary": str(metadata.get("title") or ""),
         "status": str(metadata.get("status") or ""),
+        "status_category": str(metadata.get("status_category") or ""),
+        "status_category_key": str(metadata.get("status_category_key") or ""),
+        "resolution": str(metadata.get("resolution") or ""),
+        "resolution_id": str(metadata.get("resolution_id") or ""),
         "issue_type": str(metadata.get("issue_type") or ""),
         "priority": str(metadata.get("priority") or ""),
         "labels": _values(metadata.get("labels")),

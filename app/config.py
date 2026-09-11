@@ -36,9 +36,9 @@ class Settings(BaseSettings):
     llm_provider: str = "ollama"
     model_gateway: Literal["native", "litellm"] = "litellm"
     litellm_fallbacks_enabled: bool = True
-    litellm_routing_strategy: Literal[
-        "simple-shuffle", "least-busy", "latency-based-routing"
-    ] = "latency-based-routing"
+    litellm_routing_strategy: Literal["simple-shuffle", "least-busy", "latency-based-routing"] = (
+        "latency-based-routing"
+    )
     ollama_base_url: str = "http://host.docker.internal:11434"
     ollama_model: str = "qwen3.5:latest"
     # Defaults to the generator on purpose. Ollama holds one model resident per
@@ -85,11 +85,14 @@ class Settings(BaseSettings):
     provider_router_enabled: bool = True
     provider_federation_enabled: bool = True
     structured_jira_enabled: bool = True
+    structured_conversation_enabled: bool = True
     enabled_providers: tuple[Literal["JIRA", "GITHUB", "CONFLUENCE"], ...] = (
-        "JIRA", "GITHUB", "CONFLUENCE"
+        "JIRA",
+        "GITHUB",
+        "CONFLUENCE",
     )
     provider_timeout_seconds: float = 20.0
-    provider_max_list_items: int = 200
+    provider_max_list_items: int = 50
     admission_capacity_override: int | None = None
     load_shed_wait_seconds: float = 0.05
     openai_api_key: str = ""
@@ -344,7 +347,9 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_LOCAL_ACCELERATOR_RETRY_ATTEMPTS must be between 1 and 3")
         if not 1 <= self.accelerator_max_concurrency <= 8:
             raise ValueError("PI_RAG_ACCELERATOR_MAX_CONCURRENCY must be between 1 and 8")
-        if not self.enabled_providers or len(set(self.enabled_providers)) != len(self.enabled_providers):
+        if not self.enabled_providers or len(set(self.enabled_providers)) != len(
+            self.enabled_providers
+        ):
             raise ValueError("PI_RAG_ENABLED_PROVIDERS must contain unique provider names")
         if not 0.1 <= self.provider_timeout_seconds <= 120:
             raise ValueError("PI_RAG_PROVIDER_TIMEOUT_SECONDS must be between 0.1 and 120")

@@ -26,9 +26,7 @@ def clarification_response(
     known_entities: tuple[str, ...],
     source_types: tuple[str, ...] = (),
 ) -> RagResponse | None:
-    normalized = " ".join(
-        re.findall(r"[a-z0-9à-ÿ]+", request.question.casefold())
-    )
+    normalized = " ".join(re.findall(r"[a-z0-9à-ÿ]+", request.question.casefold()))
     # Underscores are word separators to the tokenizer above, so an underscored
     # identifier arrives here as separate words and trips the overloaded-record
     # guard on whichever of them happens to be an overloaded noun. The identifier
@@ -56,9 +54,8 @@ def clarification_response(
             normalized,
         )
     )
-    if (
-        (explicit_issue_system and not issue_sources_available)
-        or (explicit_developer_system and not code_sources_available)
+    if (explicit_issue_system and not issue_sources_available) or (
+        explicit_developer_system and not code_sources_available
     ):
         language = resolve_response_language(request.question)
         return RagResponse(
@@ -137,6 +134,7 @@ def clarification_response(
         or explicit_identifier
         or named_entity
         or request.conversation_context.active_subject.strip()
+        or request.conversation_context.structured_scope is not None
         or request.conversation_history
     ):
         return None
@@ -183,9 +181,7 @@ def apply_output_gate(
     language = state.get("language") or resolve_response_language(request.question)
     expected_identifiers = tuple(state.get("coverage_expected_identifiers", ()))
     coverage_missing = (
-        tuple(state.get("coverage_missing", ()))
-        if "coverage_missing" in state
-        else None
+        tuple(state.get("coverage_missing", ())) if "coverage_missing" in state else None
     )
     expected_fields = tuple(state.get("coverage_expected_fields", ()))
     field_coverage_missing = (
@@ -243,8 +239,7 @@ def apply_output_gate(
                     "answer": pruned_answer,
                     "citations": list(
                         dict.fromkeys(
-                            int(value)
-                            for value in re.findall(r"\[SOURCE (\d+)\]", pruned_answer)
+                            int(value) for value in re.findall(r"\[SOURCE (\d+)\]", pruned_answer)
                         )
                     ),
                     "missing_information": [
@@ -268,9 +263,7 @@ def apply_output_gate(
             state["generated"] = generated
     if coverage_unknown:
         contract_kind = (
-            "field definition"
-            if resolved.completeness.all_fields
-            else "population contract"
+            "field definition" if resolved.completeness.all_fields else "population contract"
         )
         if language == "es":
             contract_kind = (
@@ -289,9 +282,7 @@ def apply_output_gate(
             )
         if note not in generated.missing_information:
             generated = generated.model_copy(
-                update={
-                    "missing_information": [*generated.missing_information, note]
-                }
+                update={"missing_information": [*generated.missing_information, note]}
             )
             state["generated"] = generated
         state["coverage_partial"] = True
@@ -318,9 +309,7 @@ def apply_output_gate(
             )
         if missing and note not in generated.missing_information:
             generated = generated.model_copy(
-                update={
-                    "missing_information": [*generated.missing_information, note]
-                }
+                update={"missing_information": [*generated.missing_information, note]}
             )
             state["generated"] = generated
         state["coverage_partial"] = True
@@ -345,9 +334,7 @@ def apply_output_gate(
         language=state.get("language", "und"),
         extra={
             "resolved_intent": resolved.intent,
-            "selected_source_categories": ",".join(
-                resolved.allowed_source_categories
-            ),
+            "selected_source_categories": ",".join(resolved.allowed_source_categories),
             "evidence_fact_ids": ",".join(fact.fact_id for fact in facts),
             "claim_count": len(claims),
             "coverage_complete": validation.requested_coverage_complete,

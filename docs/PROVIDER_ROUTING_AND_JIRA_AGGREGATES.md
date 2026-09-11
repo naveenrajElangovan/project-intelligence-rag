@@ -21,7 +21,8 @@ reranking, generation, citation, and grounding flow.
 
 ```mermaid
 flowchart TD
-    A[Authorized RAG request] --> B[Deterministic provider plan]
+    A[Authorized RAG request] --> R[Resolve server-owned structured scope]
+    R --> B[Deterministic provider plan]
     B -->|Complete Jira aggregate| C[Jira structured adapter]
     B -->|Requested provider disabled| D[Fail-closed response]
     B -->|Single provider| E[Existing RAG workflow with provider source scope]
@@ -77,7 +78,8 @@ The structured route supports:
 - exact counts;
 - complete lists;
 - distributions by status, issue type, or priority;
-- exact filters for label, status, issue type, and priority.
+- exact filters for label, status, status category, resolution, issue type, and
+  priority.
 
 The router recognizes English and Spanish aggregate language. Uppercase label
 tokens are treated generically, so the implementation is not tied to a Jira
@@ -96,6 +98,40 @@ of presenting a partial result as a total.
 The response includes the newest observed issue-update timestamp as the
 snapshot boundary. This is the indexed snapshot time; new Jira changes become
 answerable after the ingestion service updates the project collection.
+
+## Structured conversation context
+
+Successful Jira aggregates return a version 3 `conversationContextUpdate`.
+The backend validates and stores its `structuredScope`, which contains only the
+typed provider query: provider, resource type, filters, operation, grouping,
+snapshot boundary, completeness, page size, next offset, and a display subject.
+It never stores retrieved ticket bodies or treats conversation state as answer
+evidence.
+
+Provider routing reads this scope before choosing the legacy path. This makes
+elliptical continuations deterministic:
+
+| Conversation | Resolved operation |
+| --- | --- |
+| “How many Jira tickets have the POS label?” | Jira `COUNT`, label `POS` |
+| “What are all fixed?” | Jira `LIST`, inherited label `POS`, fixed rule |
+| “Show more” | Same Jira filters, next 50-item page |
+| “What about BOT?” | Previous operation with label replaced by `BOT` |
+
+An explicit provider or unrelated subject clears the stored structured scope.
+Every inherited operation re-runs authorization and reads the current complete
+snapshot; an old snapshot timestamp is disclosure, not permission or evidence.
+
+“Fixed” first matches one unambiguous observed Jira resolution such as `Fixed`
+or `Resolved`. If no such resolution is present, it uses Jira's stable `done`
+status category. Collections created before status-category metadata use exact
+status `Done` until the Jira-only incremental refresh completes. Multiple
+matching resolution names produce a clarification response.
+
+List results are numerically ordered by Jira key and returned in pages of 50.
+`resultPage` reports `start`, `end`, `returned`, `total`, and `hasMore`; sources
+contain only the displayed page. A complete scan can therefore remain exact
+without producing an unbounded chat response.
 
 ## Authorization and collection safety
 
@@ -155,9 +191,10 @@ structured-output parser to fail.
 PI_RAG_PROVIDER_ROUTER_ENABLED=true
 PI_RAG_PROVIDER_FEDERATION_ENABLED=true
 PI_RAG_STRUCTURED_JIRA_ENABLED=true
+PI_RAG_STRUCTURED_CONVERSATION_ENABLED=true
 PI_RAG_ENABLED_PROVIDERS=["JIRA","GITHUB","CONFLUENCE"]
 PI_RAG_PROVIDER_TIMEOUT_SECONDS=20
-PI_RAG_PROVIDER_MAX_LIST_ITEMS=200
+PI_RAG_PROVIDER_MAX_LIST_ITEMS=50
 
 PI_RAG_MODEL_GATEWAY=litellm
 PI_RAG_LITELLM_FALLBACKS_ENABLED=true
@@ -169,6 +206,8 @@ Operational controls:
 - Disable `PI_RAG_PROVIDER_ROUTER_ENABLED` to send every question through the
   established workflow.
 - Disable `PI_RAG_STRUCTURED_JIRA_ENABLED` to turn off only Jira aggregates.
+- Disable `PI_RAG_STRUCTURED_CONVERSATION_ENABLED` to stop inheriting provider
+  filters while leaving direct Jira aggregates enabled.
 - Disable `PI_RAG_PROVIDER_FEDERATION_ENABLED` to keep cross-provider questions
   on the established path without provider-directed federation.
 - Remove a value from `PI_RAG_ENABLED_PROVIDERS` to exclude that provider from
@@ -192,6 +231,8 @@ Prometheus exports:
 
 - `pi_rag_provider_operations_total` by provider, operation, and outcome;
 - `pi_rag_provider_items` as the returned-item distribution.
+- `pi_rag_structured_context_total` for inherited scopes, explicit overrides,
+  scope resets, and ambiguous resolution handling.
 
 Structured Jira operations use `model_provider=deterministic`. Questions that
 continue to generation expose the configured model provider and profile through
@@ -253,3 +294,40 @@ new collection. Restarting RAG is unnecessary when the active collection is
 updated in place; changing the logical collection mapping requires the new
 collection to be on the configured allowlist.
 
+### User-selectable source scope
+
+The client renders `All`, `Jira`, `Confluence`, and `Github` filter chips from
+the current project's authenticated integration-status response. Only providers
+whose integration is available are displayed. `All` selects every displayed
+provider; a provider chip selects only that provider for the next request.
+
+The public chat request carries the selection as optional `enabledProviders`.
+The backend checks every requested value against its server-owned Jira,
+Confluence, and GitHub project mappings before forwarding the bounded selection
+to RAG. An unavailable provider is rejected with HTTP 422. The client cannot
+create access policies or activate a provider absent from the project mapping.
+Leaving the field absent preserves the existing routing behavior.
+
+Changing the source selection can reset an inherited Jira structured scope when
+Jira is no longer selected. Selecting multiple sources allows the deterministic
+planner to federate only when the question requires cross-provider evidence.
+
+### Jira refresh exclusions
+
+Jira documents rejected by the credential and content-security scanner are
+recorded as `excluded`, with a reason code in operational logs. They do not enter
+Chroma, and an older valid indexed version is retained. Intentional quarantine
+does not consume the processing-failure budget; network, parsing, embedding, and
+write errors still consume it and stop the scope at the configured threshold.
+The ingestion cursor advances only when there are no processing failures.
+
+### A Jira follow-up returns unrelated project documentation
+
+1. Confirm the first structured response contains `conversationContextUpdate`.
+2. Confirm MongoDB stores context version 3 with `structured_scope` for the same
+   owner, project, and conversation ID.
+3. Check `provider_plan` for reason `JIRA_STRUCTURED_CONTEXT_INHERITED`.
+4. Check `pi_rag_structured_context_total` for
+   `inherited_prevented_legacy_fallback`.
+5. For a conversation created by an older deployment, issue one direct Jira
+   aggregate so it receives version 3 state.

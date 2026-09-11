@@ -52,18 +52,60 @@ class ConversationEntity(BaseModel):
     canonical_value: str = Field(alias="canonicalValue", min_length=1, max_length=500)
 
 
+class StructuredConversationScope(BaseModel):
+    """Server-owned provider query state carried between conversational turns."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    provider: Literal["JIRA", "GITHUB", "CONFLUENCE"]
+    resource_type: str = Field(default="ISSUE", alias="resourceType", max_length=40)
+    filters: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    operation: Literal["COUNT", "LIST", "DISTRIBUTION"] = "COUNT"
+    group_by: str | None = Field(default=None, alias="groupBy", max_length=40)
+    snapshot_at: str | None = Field(default=None, alias="snapshotAt", max_length=100)
+    complete: bool = False
+    page_size: int = Field(default=50, alias="pageSize", ge=1, le=500)
+    next_offset: int = Field(default=0, alias="nextOffset", ge=0)
+    active_subject: str = Field(default="", alias="activeSubject", max_length=500)
+
+    @model_validator(mode="after")
+    def bound_typed_filters(self) -> "StructuredConversationScope":
+        allowed = {
+            "labels",
+            "status",
+            "status_category",
+            "status_category_key",
+            "resolution",
+            "resolution_id",
+            "issue_type",
+            "priority",
+            "fixed",
+        }
+        if len(self.filters) > 8 or any(key not in allowed for key in self.filters):
+            raise ValueError("structured Jira scope contains unsupported filters")
+        if any(
+            len(values) > 20 or any(not value.strip() or len(value) > 200 for value in values)
+            for values in self.filters.values()
+        ):
+            raise ValueError("structured Jira scope filter values exceed bounds")
+        return self
+
+
 class ConversationContext(BaseModel):
     """Server-owned semantic state; it helps retrieval but is never evidence."""
 
     model_config = ConfigDict(populate_by_name=True)
 
-    version: int = Field(default=2, ge=1, le=10)
+    version: int = Field(default=3, ge=1, le=10)
     summary: str = Field(default="", max_length=2000)
     active_subject: str = Field(default="", alias="activeSubject", max_length=500)
     entities: list[ConversationEntity] = Field(default_factory=list, max_length=12)
     last_intent: str = Field(default="", alias="lastIntent", max_length=80)
     last_resolved_question: str = Field(default="", alias="lastResolvedQuestion", max_length=4000)
     state_revision: int = Field(default=0, alias="stateRevision", ge=0)
+    structured_scope: StructuredConversationScope | None = Field(
+        default=None, alias="structuredScope"
+    )
 
 
 class ConversationContextUpdate(BaseModel):
@@ -71,12 +113,15 @@ class ConversationContextUpdate(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    version: int = Field(default=2, ge=1, le=10)
+    version: int = Field(default=3, ge=1, le=10)
     standalone_question: str = Field(alias="standaloneQuestion", min_length=2, max_length=4000)
     active_subject: str = Field(default="", alias="activeSubject", max_length=500)
     entities: list[ConversationEntity] = Field(default_factory=list, max_length=12)
     intent: str = Field(default="", max_length=80)
     resolution_confidence: float = Field(default=1.0, alias="resolutionConfidence", ge=0.0, le=1.0)
+    structured_scope: StructuredConversationScope | None = Field(
+        default=None, alias="structuredScope"
+    )
 
 
 class RetrievalProfile(BaseModel):
@@ -165,6 +210,16 @@ class SourceReference(BaseModel):
     url: str | None = None
     locator: str | None = None
     language: str | None = None
+
+
+class ResultPage(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    start: int = Field(ge=0)
+    end: int = Field(ge=0)
+    returned: int = Field(ge=0)
+    total: int = Field(ge=0)
+    has_more: bool = Field(alias="hasMore")
 
 
 class ArtifactReference(BaseModel):
@@ -256,6 +311,7 @@ class RagResponse(BaseModel):
     conversation_context_update: ConversationContextUpdate | None = Field(
         default=None, alias="conversationContextUpdate"
     )
+    result_page: ResultPage | None = Field(default=None, alias="resultPage")
 
     @model_validator(mode="after")
     def keep_legacy_sources_and_citations_compatible(self) -> "RagResponse":
