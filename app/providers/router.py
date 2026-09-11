@@ -257,7 +257,7 @@ def _jira_filters(question: str) -> dict[str, tuple[str, ...]]:
         (
             value
             for value, pattern in (
-                ("indeterminate", r"\b(?:in progress|active|en progreso|en curso|activ[oa]s?)\b"),
+                ("indeterminate", r"\b(?:active|en curso|activ[oa]s?)\b"),
                 (
                     "done",
                     r"\b(?:done|closed|completed|terminad[oa]s?|cerrad[oa]s?|completad[oa]s?)\b",
@@ -271,6 +271,7 @@ def _jira_filters(question: str) -> dict[str, tuple[str, ...]]:
     if status_category and "fixed" not in filters:
         filters["status_category_key"] = (status_category,)
     exact_statuses = {
+        "In Progress": r"\b(?:in progress|en progreso)\b",
         "In Review": r"\b(?:in review|review|en revisi[oó]n)\b",
         "Blocked": r"\b(?:blocked|bloquead[oa]s?)\b",
         "QA": r"\b(?:qa|quality assurance|control de calidad)\b",

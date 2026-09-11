@@ -132,7 +132,7 @@ def test_status_followup_keeps_jira_scope_and_uses_stable_status_category() -> N
     assert selection.mode == ExecutionMode.STRUCTURED
     assert selection.structured_query is not None
     assert selection.structured_query.operation == StructuredOperation.LIST
-    assert selection.structured_query.filters == {"status_category_key": ("indeterminate",)}
+    assert selection.structured_query.filters == {"status": ("In Progress",)}
 
 
 def test_spanish_status_followup_is_structured() -> None:
@@ -143,7 +143,7 @@ def test_spanish_status_followup_is_structured() -> None:
     assert selection.structured_query.operation == StructuredOperation.LIST
     assert selection.structured_query.filters == {
         "labels": ("POS",),
-        "status_category_key": ("indeterminate",),
+        "status": ("In Progress",),
     }
 
 
