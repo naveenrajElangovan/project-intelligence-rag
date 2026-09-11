@@ -592,3 +592,21 @@ def _safe_conversation_rewrite(
         "qué",
     }
     return set(_normalized_words(rewritten)) <= allowed | harmless
+
+
+def build_conversation_context_update(request, state, vocabulary):
+    """Build semantic conversation memory independently of graph composition."""
+    from app.models import ConversationContextUpdate, ConversationEntity
+
+    original = request.question
+    resolved = state.get("resolved_question", original)
+    subject, is_followup = _conversation_context_subject(
+        original, resolved, request.conversation_context.active_subject.strip(), vocabulary
+    )
+    return ConversationContextUpdate(
+        standaloneQuestion=resolved,
+        activeSubject=subject,
+        entities=[ConversationEntity(value=subject, canonicalValue=subject)] if subject else [],
+        intent=state.get("query_intent", ""),
+        resolutionConfidence=1.0 if resolved != original or not is_followup else 0.5,
+    )

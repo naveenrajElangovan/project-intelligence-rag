@@ -48,6 +48,8 @@ def deduplicate_candidate_bodies(documents: Sequence[Document]) -> list[Document
         identity = str(document.metadata.get("content_hash") or "").strip()
         if not identity:
             identity = " ".join(document.page_content.split()).casefold()
+        if document.metadata.get("provider") == "JIRA":
+            identity = str(document.metadata.get("source_id") or "") + ":" + str(document.metadata.get("locator") or "") + ":" + identity
         existing = by_body.get(identity)
         if existing is None:
             by_body[identity] = document

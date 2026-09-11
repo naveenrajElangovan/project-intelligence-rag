@@ -22,8 +22,9 @@ from app.llm import (
     pipeline_unavailable_answer,
 )
 from app.models import AnswerStatus, Coverage, RagRequest, RagResponse
+from app.evaluation_snapshot import SnapshotRequest, read_snapshot
 from app.openinference_tracing import configure_openinference
-from app.quality_tracing import trace_authorized_request
+from app.quality_tracing import capture_evaluation_evidence, trace_authorized_request
 from app.embedding import build_embedder, warm_embedder
 from app.reranking import build_reranker
 from app.retrieval import warm_authorized_lexical_corpora
@@ -65,10 +66,13 @@ async def _warm_lexical_corpora_until_ready(
 ) -> None:
     """Warm the optional lexical cache without holding the ASGI lifespan open."""
 
+    pending = None
     while not application.state.lexical_corpus_ready:
         try:
+            if pending is None:
+                pending = asyncio.create_task(warm_authorized_lexical_corpora(settings, embedder))
             await asyncio.wait_for(
-                warm_authorized_lexical_corpora(settings, embedder),
+                asyncio.shield(pending),
                 timeout=settings.lexical_corpus_warm_timeout_seconds,
             )
             application.state.lexical_corpus_ready = True
@@ -77,20 +81,25 @@ async def _warm_lexical_corpora_until_ready(
             )
             return
         except asyncio.CancelledError:
+            if pending is not None:
+                pending.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await pending
             raise
         except TimeoutError:
             if _cancellation_requested():
                 raise asyncio.CancelledError
             logging.getLogger("app.startup").warning(
                 "The lexical corpus warm-up exceeded %.1fs; serving with the "
-                "corpus cold and retrying in %.1fs. Chroma at %s:%s is the "
-                "usual cause.",
+                "corpus cold and waiting on the same attempt in %.1fs. "
+                "Chroma endpoint: %s:%s.",
                 settings.lexical_corpus_warm_timeout_seconds,
                 settings.lexical_corpus_warm_retry_seconds,
                 settings.chroma_host,
                 settings.chroma_port,
             )
         except Exception as failure:
+            pending = None
             if _cancellation_requested():
                 raise asyncio.CancelledError
             logging.getLogger("app.startup").warning(
@@ -125,14 +134,20 @@ async def _warm_or_report(name: str, awaitable) -> None:
 
 @asynccontextmanager
 async def lifespan(_application: FastAPI):
+    # Opt-in operator diagnostics: stack locations only, never local variables.
+    if os.environ.get("PI_RAG_DIAGNOSTIC_STACK_DUMPS") == "1":
+        import faulthandler
+        import signal
+
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
     """Warm local models and recover optional caches without blocking liveness."""
 
     settings = get_settings()
     tracer_provider = configure_openinference(settings)
     _application.state.tracer_provider = tracer_provider
     _application.state.lexical_corpus_ready = not (
-        settings.lexical_fallback_enabled
-        and settings.warm_lexical_corpus_on_startup
+        settings.lexical_fallback_enabled and settings.warm_lexical_corpus_on_startup
     )
     if settings.warm_local_models_on_startup:
         reranker = build_reranker(settings)
@@ -161,9 +176,7 @@ async def lifespan(_application: FastAPI):
         # to_thread because warm_embedder is synchronous and, against the
         # accelerator, performs a blocking socket read. On the event loop it
         # stalls everything else in startup, including liveness.
-        await _warm_or_report(
-            "embedder", asyncio.to_thread(warm_embedder, embedder)
-        )
+        await _warm_or_report("embedder", asyncio.to_thread(warm_embedder, embedder))
     warm_task = None
     if settings.lexical_fallback_enabled and settings.warm_lexical_corpus_on_startup:
         # Never await a downstream from inside startup. The ASGI server can expose
@@ -203,21 +216,16 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json" if settings.docs_enabled else None,
         lifespan=lifespan,
     )
-    application.add_middleware(
-        TrustedHostMiddleware, allowed_hosts=settings.allowed_host_list
-    )
+    application.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_host_list)
     if settings.force_https:
         application.add_middleware(HTTPSRedirectMiddleware)
     application.add_middleware(
         RequestSizeLimitMiddleware, maximum_bytes=settings.max_request_body_bytes
     )
     application.add_middleware(SecurityHeadersMiddleware, hsts=settings.force_https)
-    application.state.project_rate_limiter = ProjectRateLimiter(
-        settings.rate_limit_per_minute
-    )
+    application.state.project_rate_limiter = ProjectRateLimiter(settings.rate_limit_per_minute)
     application.state.lexical_corpus_ready = not (
-        settings.lexical_fallback_enabled
-        and settings.warm_lexical_corpus_on_startup
+        settings.lexical_fallback_enabled and settings.warm_lexical_corpus_on_startup
     )
     return application
 
@@ -287,9 +295,7 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
     semaphore = _REQUEST_SEMAPHORES[key]
     admission_began = started()
     try:
-        await asyncio.wait_for(
-            semaphore.acquire(), timeout=settings.load_shed_wait_seconds
-        )
+        await asyncio.wait_for(semaphore.acquire(), timeout=settings.load_shed_wait_seconds)
     except TimeoutError as failure:
         request_shed(admission_began)
         raise HTTPException(
@@ -335,11 +341,15 @@ async def ready(settings: Settings = Depends(get_settings)) -> dict[str, str]:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "The configured LLM provider is incomplete.",
         )
+    dependency = "Chroma"
     try:
-        from chromadb import HttpClient
+        from app.retrieval import shared_chroma_client
 
-        await asyncio.to_thread(HttpClient(host=settings.chroma_host, port=settings.chroma_port).heartbeat)
+        await asyncio.to_thread(
+            lambda: shared_chroma_client(settings.chroma_host, settings.chroma_port).heartbeat()
+        )
         if settings.local_accelerator_url:
+            dependency = "local inference accelerator"
             from app.accelerator import accelerator_request
 
             await asyncio.to_thread(
@@ -351,20 +361,36 @@ async def ready(settings: Settings = Depends(get_settings)) -> dict[str, str]:
                 timeout_seconds=5,
             )
         if settings.llm_provider == "ollama":
+            dependency = "Ollama"
             async with httpx.AsyncClient(timeout=5) as client:
-                response = await client.get(
-                    f"{settings.ollama_base_url.rstrip('/')}/api/tags"
-                )
+                response = await client.get(f"{settings.ollama_base_url.rstrip('/')}/api/tags")
                 response.raise_for_status()
             if settings.local_models_path:
+                dependency = "local reranker artifacts"
                 if not Path(settings.local_models_path).expanduser().is_dir():
                     raise RuntimeError("The configured local reranker artifacts are unavailable.")
     except Exception as failure:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Chroma is unavailable or incorrectly configured.",
+            f"The {dependency} dependency is unavailable or incorrectly configured.",
         ) from failure
     return {"status": "ok"}
+
+
+@app.post(
+    "/v1/internal/evaluation-snapshot",
+    dependencies=[Depends(require_internal_caller)],
+    include_in_schema=False,
+)
+async def evaluation_snapshot(request: SnapshotRequest, settings: Settings = Depends(get_settings)):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(read_snapshot, settings, request), timeout=60
+        )
+    except (ValueError, RuntimeError) as failure:
+        raise HTTPException(409, "Staging inventory is invalid or changed.") from failure
+    except TimeoutError as failure:
+        raise HTTPException(503, "Staging inventory inspection timed out.") from failure
 
 
 @app.post(
@@ -456,7 +482,10 @@ async def answer(request: RagRequest, settings: Settings = Depends(get_settings)
             request, settings, streaming=False, language=language
         ) as quality_trace:
             async with asyncio.timeout(settings.request_timeout_seconds):
-                response = await AuthorizedRagWorkflow(settings, request).run()
+                with capture_evaluation_evidence(request.evaluation) as evidence:
+                    response = await AuthorizedRagWorkflow(settings, request).run()
+                    if evidence is not None:
+                        response.evaluation_evidence = evidence
             quality_trace.response(response)
             return response
     except Exception as failure:
@@ -529,9 +558,10 @@ async def answer_stream(
                             quality_trace.response(RagResponse.model_validate(event["response"]))
                         yield json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
         except Exception as failure:
-            failure_code = re.sub(
-                r"[^A-Z0-9]+", "_", type(failure).__name__.upper()
-            ).strip("_") or "UNKNOWN_ERROR"
+            failure_code = (
+                re.sub(r"[^A-Z0-9]+", "_", type(failure).__name__.upper()).strip("_")
+                or "UNKNOWN_ERROR"
+            )
             LOGGER.exception(
                 json.dumps(
                     {
@@ -556,11 +586,14 @@ async def answer_stream(
                 reason_code=failure_code,
             )
             message = pipeline_unavailable_answer(language)
-            yield json.dumps(
-                {"type": "error", "message": message},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ) + "\n"
+            yield (
+                json.dumps(
+                    {"type": "error", "message": message},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
         finally:
             request_slot.release()
 

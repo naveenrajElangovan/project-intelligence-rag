@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.config import get_settings
 
 
-
 # Prose questions stay small: they are interpolated into every prompt, stored as
 # conversation history, and rewritten by the planner. A pasted JSON document is
 # none of those things -- it is converted deterministically before the graph runs
@@ -63,9 +62,7 @@ class ConversationContext(BaseModel):
     active_subject: str = Field(default="", alias="activeSubject", max_length=500)
     entities: list[ConversationEntity] = Field(default_factory=list, max_length=12)
     last_intent: str = Field(default="", alias="lastIntent", max_length=80)
-    last_resolved_question: str = Field(
-        default="", alias="lastResolvedQuestion", max_length=4000
-    )
+    last_resolved_question: str = Field(default="", alias="lastResolvedQuestion", max_length=4000)
     state_revision: int = Field(default=0, alias="stateRevision", ge=0)
 
 
@@ -79,9 +76,7 @@ class ConversationContextUpdate(BaseModel):
     active_subject: str = Field(default="", alias="activeSubject", max_length=500)
     entities: list[ConversationEntity] = Field(default_factory=list, max_length=12)
     intent: str = Field(default="", max_length=80)
-    resolution_confidence: float = Field(
-        default=1.0, alias="resolutionConfidence", ge=0.0, le=1.0
-    )
+    resolution_confidence: float = Field(default=1.0, alias="resolutionConfidence", ge=0.0, le=1.0)
 
 
 class RetrievalProfile(BaseModel):
@@ -106,6 +101,8 @@ class RetrievalProfile(BaseModel):
 
 class RagRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+    evaluation: bool = False
 
     project_id: str = Field(alias="projectId", min_length=1, max_length=100)
     collection_name: str = Field(
@@ -136,9 +133,7 @@ class RagRequest(BaseModel):
     model_profile: Literal["budget", "standard", "complex"] = Field(
         default="standard", alias="modelProfile"
     )
-    retrieval_profile: RetrievalProfile | None = Field(
-        default=None, alias="retrievalProfile"
-    )
+    retrieval_profile: RetrievalProfile | None = Field(default=None, alias="retrievalProfile")
     catalog_releases_enabled: bool = Field(default=False, alias="catalogReleasesEnabled")
     conversation_history: list[ConversationMessage] = Field(
         default_factory=list, alias="conversationHistory", max_length=12
@@ -229,13 +224,13 @@ class ResolvedRequest(BaseModel):
     expected_answer_shape: str = Field(
         default="NARRATIVE", alias="expectedAnswerShape", max_length=40
     )
-    completeness: CompletenessRequirements = Field(
-        default_factory=CompletenessRequirements
-    )
+    completeness: CompletenessRequirements = Field(default_factory=CompletenessRequirements)
 
 
 class RagResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+    evaluation_evidence: dict[str, object] | None = Field(default=None, alias="evaluationEvidence")
 
     answer: str
     status: AnswerStatus = AnswerStatus.INSUFFICIENT_EVIDENCE
@@ -245,9 +240,7 @@ class RagResponse(BaseModel):
     citations: list[SourceReference] = Field(default_factory=list)
     artifacts: list[ArtifactReference] = Field(default_factory=list)
     resolved_intent: str = Field(default="", alias="resolvedIntent")
-    resolved_entities: list[ResolvedEntity] = Field(
-        default_factory=list, alias="resolvedEntities"
-    )
+    resolved_entities: list[ResolvedEntity] = Field(default_factory=list, alias="resolvedEntities")
     coverage: Coverage = Coverage.NOT_APPLICABLE
     failure_reason: str | None = Field(default=None, alias="failureReason")
     missing_information: list[str] = Field(alias="missingInformation")

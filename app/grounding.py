@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 import re
+from itertools import combinations
 
 from langchain_core.documents import Document
 
@@ -52,6 +54,7 @@ class LocalCitationGroundingVerifier:
         self._accelerator_max_concurrency = settings.accelerator_max_concurrency
         self.last_usage = TokenUsage()
         self._pair_score_cache: dict[tuple[str, str], float] = {}
+        self.last_citation_realignments = 0
 
     def _predict_scores(
         self, pairs: list[tuple[str, str]], batch_size: int
@@ -171,17 +174,36 @@ class LocalCitationGroundingVerifier:
         self,
         documents: list[Document],
         answer: GroundedAnswer,
+        *,
+        answer_language: str = "",
     ) -> GroundedAnswer:
-        """Attach only citations independently supported by the local cross-encoder."""
+        """Attach missing citations and realign unsupported citations.
+
+        A generated claim may be supported by the retrieved evidence while its
+        source marker points at a neighbouring document.  Verification must not
+        lower its bar in that case, but deleting the claim is also wrong.  Score
+        every anchor-compatible authorized document with the same cross-encoder
+        and thresholds used by ``verify``; keep a current citation when it
+        passes, otherwise replace it with the strongest passing source.
+        """
 
         updated = answer.answer
         self._pair_score_cache.clear()
+        self.last_citation_realignments = 0
         # Build every (claim, evidence) pair first and score them in one batch.
         # Scoring per claim inside a loop serialised one cross-encoder forward pass
         # per sentence behind the shared inference lock, which dominated latency on
         # a multi-sentence answer.
-        pending: list[tuple[str, list[tuple[int, tuple[tuple[str, str], ...]]]]] = []
-        verification_pairs: list[tuple[str, str]] = []
+        pending: list[
+            tuple[
+                str,
+                list[int],
+                tuple[tuple[str, str], ...] | None,
+                float | None,
+                list[tuple[tuple[int, ...], tuple[tuple[str, str], ...], float]],
+            ]
+        ] = []
+        current_pairs: list[tuple[str, str]] = []
         for structured_claim in structured_material_claims(answer.answer):
             sentence = structured_claim.text
             source_numbers = [
@@ -190,83 +212,132 @@ class LocalCitationGroundingVerifier:
             claim = re.sub(r"\s*\[SOURCE \d+\]", "", sentence).strip()
             if structured_claim.kind is AnswerLineKind.LIST_ITEM:
                 claim = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", claim)
-            if source_numbers:
-                cited = list(dict.fromkeys(source_numbers))
-                if any(number < 1 or number > len(documents) for number in cited):
-                    continue
+            cited = list(dict.fromkeys(source_numbers))
+            current_group: tuple[tuple[str, str], ...] | None = None
+            current_threshold: float | None = None
+            if cited and not any(number < 1 or number > len(documents) for number in cited):
                 literal_evidence = "\n".join(
                     sanitize_evidence(documents[number - 1].page_content)
                     for number in cited
                 )
                 if _exact_anchors_supported(
-                    claim, literal_evidence
+                    claim, literal_evidence, [documents[number - 1] for number in cited]
                 ) and _negation_supported(claim, literal_evidence):
-                    verification_pairs.extend(
-                        self._verification_score_pairs(
-                            structured_claim,
-                            claim,
-                            documents,
-                            cited,
-                            literal_evidence,
-                        )
+                    current_group = self._verification_score_pairs(
+                        structured_claim,
+                        claim,
+                        documents,
+                        cited,
+                        literal_evidence,
                     )
-                continue
-            eligible: list[tuple[int, tuple[tuple[str, str], ...]]] = []
-            for index, document in enumerate(documents, start=1):
-                literal_evidence = sanitize_evidence(document.page_content)
-                if not _exact_anchors_supported(
-                    claim, literal_evidence
-                ) or not _negation_supported(claim, literal_evidence):
-                    continue
-                eligible.append(
-                    (
-                        index,
-                        self._verification_score_pairs(
-                            structured_claim,
-                            claim,
-                            documents,
-                            [index],
-                            literal_evidence,
+                    evidence_languages = {
+                        str(documents[number - 1].metadata.get("language") or "").casefold()
+                        for number in cited
+                    } - {"", "und", "mixed"}
+                    current_threshold = self._threshold_for(
+                        cross_language=(
+                            answer_language in {"en", "es"}
+                            and bool(evidence_languages)
+                            and answer_language not in evidence_languages
                         ),
+                        table_evidence=contains_table(literal_evidence),
                     )
+                    current_pairs.extend(current_group)
+            eligible: list[
+                tuple[tuple[int, ...], tuple[tuple[str, str], ...], float]
+            ] = []
+
+            def add_candidate(candidate_citations: tuple[int, ...]) -> None:
+                literal_evidence = "\n".join(
+                    sanitize_evidence(documents[number - 1].page_content)
+                    for number in candidate_citations
                 )
-            if eligible:
-                pending.append((sentence, eligible))
+                if not _exact_anchors_supported(
+                    claim, literal_evidence, [documents[number - 1] for number in candidate_citations]
+                ) or not _negation_supported(claim, literal_evidence):
+                    return
+                group = self._verification_score_pairs(
+                    structured_claim,
+                    claim,
+                    documents,
+                    list(candidate_citations),
+                    literal_evidence,
+                )
+                evidence_languages = {
+                    str(documents[number - 1].metadata.get("language") or "").casefold()
+                    for number in candidate_citations
+                } - {"", "und", "mixed"}
+                threshold = self._threshold_for(
+                    cross_language=(
+                        answer_language in {"en", "es"}
+                        and bool(evidence_languages)
+                        and answer_language not in evidence_languages
+                    ),
+                    table_evidence=contains_table(literal_evidence),
+                )
+                eligible.append((candidate_citations, group, threshold))
+
+            for index in range(1, len(documents) + 1):
+                add_candidate((index,))
+            # Exact anchors sometimes span adjacent selected chunks (for example,
+            # a symbol in one chunk and its numeric configuration in another).
+            # Only if no single source contains every literal anchor, search a
+            # bounded multi-source set. Cross-encoder scoring is still per source
+            # and verify() applies the same best-source rule afterward.
+            if not eligible:
+                for size in range(2, min(3, len(documents)) + 1):
+                    for candidate_citations in combinations(
+                        range(1, len(documents) + 1), size
+                    ):
+                        add_candidate(candidate_citations)
+            if current_group is not None or eligible:
+                pending.append(
+                    (sentence, cited, current_group, current_threshold, eligible)
+                )
         if pending:
-            flat_pairs = [
-                pair
-                for _sentence, eligible in pending
-                for _index, group in eligible
-                for pair in group
-            ]
-            # A citation must be attached under the same bar verify() will apply,
-            # or the answer gains a marker that the very next stage rejects.
-            flat_thresholds = [
-                self._threshold_for(
-                    cross_language=False,
-                    table_evidence=contains_table(sanitize_evidence(documents[index - 1].page_content)),
+            # Fast path: score the citations the model already supplied in one
+            # batch. Alternative documents are scored only for claims whose
+            # current citation fails, avoiding an N-claims × N-documents pass on
+            # the normal path.
+            await self._ensure_scores(current_pairs)
+            unresolved = [
+                item
+                for item in pending
+                if not (
+                    item[2] is not None
+                    and item[3] is not None
+                    and self._best_score(item[2]) >= item[3]
                 )
-                for _sentence, eligible in pending
-                for index, _group in eligible
             ]
-            await self._ensure_scores(flat_pairs + verification_pairs)
-            for sentence, eligible in pending:
-                thresholds = flat_thresholds[: len(eligible)]
-                del flat_thresholds[: len(eligible)]
+            await self._ensure_scores(
+                [
+                    pair
+                    for _sentence, _cited, _group, _threshold, eligible in unresolved
+                    for _citations, candidate_group, _candidate_threshold in eligible
+                    for pair in candidate_group
+                ]
+            )
+            for sentence, cited, current_group, current_threshold, eligible in unresolved:
+                if (
+                    current_group is not None
+                    and current_threshold is not None
+                    and self._best_score(current_group) >= current_threshold
+                ):
+                    continue
                 supported = [
-                    (self._best_score(group), index)
-                    for (index, group), threshold in zip(
-                        eligible, thresholds, strict=True
-                    )
+                    (self._best_score(group), -len(candidate_citations), candidate_citations)
+                    for candidate_citations, group, threshold in eligible
                     if self._best_score(group) >= threshold
                 ]
                 if not supported:
                     continue
-                _score, source_number = max(supported)
-                cited = _append_marker(sentence.strip(), source_number)
-                updated = updated.replace(sentence, cited, 1)
-        elif verification_pairs:
-            await self._ensure_scores(verification_pairs)
+                _score, _negative_count, aligned_citations = max(supported)
+                if cited == list(aligned_citations):
+                    continue
+                claim_text = re.sub(r"\s*\[SOURCE \d+\]", "", sentence).strip()
+                aligned = _append_markers(claim_text, aligned_citations)
+                updated = updated.replace(sentence, aligned, 1)
+                self.last_citation_realignments += 1
         citations = list(
             dict.fromkeys(int(value) for value in re.findall(r"\[SOURCE (\d+)\]", updated))
         )
@@ -319,7 +390,7 @@ class LocalCitationGroundingVerifier:
                 sanitize_evidence(documents[number - 1].page_content) for number in cited
             )
             table_evidence = contains_table(literal_evidence)
-            if not _exact_anchors_supported(claim, literal_evidence):
+            if not _exact_anchors_supported(claim, literal_evidence, [documents[number - 1] for number in cited]):
                 # Two failures wear one reason code here, and they need opposite
                 # responses. If the anchor is absent from every authorized
                 # document the model invented it and the claim must go. If it is
@@ -330,7 +401,7 @@ class LocalCitationGroundingVerifier:
                 all_evidence = "\n".join(
                     sanitize_evidence(document.page_content) for document in documents
                 )
-                anchored_elsewhere = _exact_anchors_supported(claim, all_evidence)
+                anchored_elsewhere = _exact_anchors_supported(claim, all_evidence, documents)
                 invalid_claims.append(sentence)
                 rejections.append(
                     ClaimRejection(
@@ -411,6 +482,9 @@ class LocalCitationGroundingVerifier:
                 accepted_scores.append(round(score, 4))
 
         self.last_rejections = rejections
+        from app.quality_tracing import record_evaluation_rejections
+
+        record_evaluation_rejections(invalid_claims)
         self.last_accepted_scores = accepted_scores
         # Cache lifetime is one attach->verify pipeline. Keeping scores beyond a
         # completed verdict would make a later answer reuse stale model output.
@@ -460,7 +534,19 @@ def _material_claims(answer: str) -> list[str]:
     return [claim.text for claim in structured_material_claims(answer)]
 
 
-def _exact_anchors_supported(claim: str, evidence: str) -> bool:
+def _exact_anchors_supported(claim: str, evidence: str, documents=()) -> bool:
+    # Jira keys are authoritative citation identity metadata. A section body
+    # need not repeat its issue key. Remove only an exactly matching cited key
+    # from anchor checking, not its numeric suffix as a free-standing value.
+    # Status, dates, quantities and every other factual anchor still require
+    # support in the cited body; historical metadata cannot supply current state.
+    for document in documents:
+        key = str(document.metadata.get("issue_key") or "")
+        if document.metadata.get("provider") != "JIRA" or not re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", key, re.I):
+            continue
+        pattern = rf"(?<![\w-])`?{re.escape(key)}`?(?![\w-])"
+        claim = re.sub(pattern, "", claim, flags=re.I)
+        evidence = re.sub(pattern, "", evidence, flags=re.I)
     claim_numbers = _numeric_anchors(claim)
     evidence_numbers = _numeric_anchors(evidence)
     if not claim_numbers.issubset(evidence_numbers):
@@ -470,7 +556,37 @@ def _exact_anchors_supported(claim: str, evidence: str) -> bool:
 
 
 def _numeric_anchors(value: str) -> set[str]:
-    return {
+    # Compare whole calendar dates, not a bag of their component numbers.
+    # Spanish prose may render a source ISO date as "10 de septiembre de 2026".
+    # ISO's adjacent T also used to hide the day from the numeric regex.
+    dates: set[str] = set()
+    months = {
+        "january": 1, "enero": 1, "february": 2, "febrero": 2,
+        "march": 3, "marzo": 3, "april": 4, "abril": 4,
+        "may": 5, "mayo": 5, "june": 6, "junio": 6,
+        "july": 7, "julio": 7, "august": 8, "agosto": 8,
+        "september": 9, "septiembre": 9, "setiembre": 9,
+        "october": 10, "octubre": 10, "november": 11, "noviembre": 11,
+        "december": 12, "diciembre": 12,
+    }
+
+    def replace_date(match):
+        parts = match.groupdict()
+        try:
+            month = int(parts["month"]) if parts.get("month") else months[parts["name"].lower()]
+            canonical = date(int(parts["year"]), month, int(parts["day"])).isoformat()
+        except (ValueError, KeyError):
+            return match.group(0)
+        dates.add("date:" + canonical)
+        # A complete date also explicitly supports a year-only answer.
+        dates.add(str(int(parts["year"])))
+        return " "
+
+    value = re.sub(r"\b(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})(?:T(?=\d{2}:)|\b)", replace_date, value)
+    names = "|".join(months)
+    value = re.sub(rf"\b(?P<day>\d{{1,2}})\s+(?:de\s+)?(?P<name>{names})\s+(?:de\s+)?(?P<year>\d{{4}})\b", replace_date, value, flags=re.I)
+    value = re.sub(rf"\b(?P<name>{names})\s+(?P<day>\d{{1,2}}),?\s+(?P<year>\d{{4}})\b", replace_date, value, flags=re.I)
+    return dates | {
         _canonical_number(number)
         for number in re.findall(r"(?<![\w])\d+(?:[.,]\d+)*(?![\w])", value)
     }
@@ -501,7 +617,12 @@ def _negation_supported(claim: str, evidence: str) -> bool:
 
 
 def _append_marker(sentence: str, source_number: int) -> str:
+    return _append_markers(sentence, (source_number,))
+
+
+def _append_markers(sentence: str, source_numbers: tuple[int, ...]) -> str:
+    markers = "".join(f" [SOURCE {number}]" for number in source_numbers)
     match = re.search(r"([.!?])\s*$", sentence)
     if match:
-        return sentence[: match.start()] + f" [SOURCE {source_number}]" + match.group(1)
-    return sentence + f" [SOURCE {source_number}]"
+        return sentence[: match.start()] + markers + match.group(1)
+    return sentence + markers

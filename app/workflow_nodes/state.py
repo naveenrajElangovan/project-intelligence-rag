@@ -28,6 +28,7 @@ class RagState(TypedDict, total=False):
     missing_requirements: tuple[str, ...]
     preserve_candidates: bool
     feature_affinity_applied: bool
+    jira_exact_section_loaded: bool
     repair_requirements: tuple[str, ...]
     prior_documents: list[Document]
     query_intent: str

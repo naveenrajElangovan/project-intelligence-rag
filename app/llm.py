@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import json
 import re
 import secrets
 import time
@@ -866,6 +867,18 @@ class LangChainGroundedAnswerGenerator:
                 "an open, planned, or blocked ticket into completed product behavior. For multiple issues, "
                 "use compact bullets with one issue per bullet. Include dates, assignees, priorities, and keys "
                 "only when the question asks for them or they are necessary to distinguish the result."
+                " For comments and history, distinguish the actual posting timestamp from dates mentioned "
+                "inside retrospective text. Preserve timestamp, date, and identifier spellings exactly, "
+                "including in Spanish answers; do not translate numeric dates into named months. "
+                "Use separate cited sentences for the event's content and its posting date. "
+                "For relationships, identify the linked issue key, summary, and relationship direction "
+                "from the corresponding fields. Issue-type IDs and status IDs are not issue IDs. "
+                "In relationship evidence, issue_key, issue_type, summary and related_issue_status "
+                "describe the RELATED issue, not the ticket owning the relationship. Name that related "
+                "issue as the subject of any type or status claim. "
+                "Do not infer that other relationships are absent from a partial evidence selection. "
+                "Every factual sentence must cite its directly supporting SOURCE, including when "
+                "translating a short JSON field or historical change."
             )
         elif answer_style == "structured_inventory":
             style_instruction = (
@@ -930,7 +943,7 @@ class LangChainGroundedAnswerGenerator:
                 (
                     "system",
                     _GROUNDED_ANSWER_RULES
-                    "Every material sentence "
+                    + "Every material sentence "
                     "MUST end with one or more exact citations such as [SOURCE 1]. The citations array "
                     "MUST contain each one-based SOURCE number used in the answer. Never return a "
                     "factual answer with an empty citations array. "
@@ -987,7 +1000,7 @@ class LangChainGroundedAnswerGenerator:
                         (
                             "system",
                             _GROUNDED_ANSWER_RULES
-                            "Write the answer prose only, not JSON. Every material sentence must end "
+                            + "Write the answer prose only, not JSON. Every material sentence must end "
                             "with one or more exact citations such as [SOURCE 1]. Never invent a "
                             "fact, source, or identifier. When the evidence answers the question, "
                             "give that answer directly. Safety cautions, retry limits, and escalation "
@@ -1771,6 +1784,25 @@ def _neutralize_frame_controls(value: str) -> str:
     )
 
 
+def _jira_relationship_subject(document: Document) -> str:
+    if (document.metadata.get("provider") != "JIRA"
+            or document.metadata.get("jira_chunk_kind") != "RELATIONSHIP"):
+        return ""
+    try:
+        related = json.loads(document.page_content)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(related, dict):
+        return ""
+    key = str(related.get("issue_key") or "")
+    owner = str(document.metadata.get("issue_key") or "")
+    if not all(re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", value, re.I) for value in (key, owner)):
+        return ""
+    return (f"RELATIONSHIP OWNER: {owner}\nRELATED ISSUE: {key}\n"
+            f"The JSON issue type, summary and related status describe {key}. "
+            f"They do not establish the type or status of {owner}.\n")
+
+
 def _evidence_with_diagnostics(
     documents: list[Document], maximum_tokens: int
 ) -> tuple[str, int, int]:
@@ -1779,7 +1811,7 @@ def _evidence_with_diagnostics(
     truncated = 0
     nonce = secrets.token_hex(16)
     for index, document in enumerate(documents, start=1):
-        content = _neutralize_frame_controls(document.page_content)
+        content = _neutralize_frame_controls(_jira_relationship_subject(document) + document.page_content)
         metadata = {
             key: sanitize_evidence(str(document.metadata.get(key, ""))).replace("\n", " ")
             for key in (

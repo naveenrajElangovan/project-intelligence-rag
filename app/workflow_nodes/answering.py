@@ -131,6 +131,9 @@ def _normalized_entity(value: object) -> str:
 def _explicit_entity_scope(question: str, entities: tuple[str, ...] = ()) -> str:
     """Extract a user-named application/repository present in corpus vocabulary."""
 
+    # A Jira key is one identifier. Its project prefix is not an application
+    # entity (OPS-72 must not become an implicit request for entity OPS).
+    question = re.sub(r"\b[A-Z][A-Z0-9_]*-\d+\b", "", question, flags=re.I)
     known_entities = {_normalized_entity(entity) for entity in entities}
     known_entities.discard("")
     patterns = (
@@ -1532,7 +1535,12 @@ class AnswerNodesMixin:
                 "canonical_fallback_reason": "",
             }
         list_response_requested = _list_response_requested(answer_question)
-        retrieved_documents = list(state.get("documents", []))
+        from app.jira_query import current_jira_status_evidence
+        # Parent reconstruction and evidence repair must not reintroduce Jira
+        # history into a current-status answer after retrieval has filtered it.
+        retrieved_documents = current_jira_status_evidence(
+            answer_question, list(state.get("documents", [])), state.get("query_intent")
+        )
         sibling_expanded_count = 0
         requested_entity = _normalized_entity(state.get("overview_entity", ""))
         if not requested_entity:
@@ -1652,6 +1660,9 @@ class AnswerNodesMixin:
                     top_n=len(exact_documents) + len(documents),
                 )
             coverage_expected_fields = structured_entity_field_names(answer_question, documents)
+        documents = current_jira_status_evidence(
+            answer_question, documents, state.get("query_intent")
+        )
         structured_tabular_evidence = _structured_tabular_evidence(documents)
         comparison_subjects = _comparison_subjects(answer_question, self._vocabulary.entities)
         comparison_table_selected = bool(
@@ -2080,18 +2091,12 @@ class AnswerNodesMixin:
         generated = _normalize_citations(generated)
         if answer_style == "single_record_details":
             generated = _single_record_details_table(generated, state.get("language", "en"))
-        if not (
-            self._settings.incremental_verified_streaming_enabled
-            and getattr(self, "_incremental_stream_active", False)
-        ):
-            generated = await self._grounding_verifier.attach_missing_citations(
-                documents, generated
-            )
-        # The live path has already checked every citation-complete sentence
-        # before publishing it. Mutating that prose afterward both repeats the
-        # expensive cross-encoder pass and makes the final answer diverge from
-        # what the client saw. The unchanged citation validator below rejects an
-        # uncited sentence instead.
+        # Provisional generation events are withheld by the streaming reducer;
+        # both transports therefore use the same citation alignment before any
+        # answer prose reaches the client.
+        generated = await self._grounding_verifier.attach_missing_citations(
+            documents, generated
+        )
         generated = _normalize_citations(generated)
         generated, answer_shape_claims_removed = _enforce_table_claim_shape(generated, answer_style)
         coverage_missing = _coverage(coverage_expected_keys, generated.answer)
@@ -2174,6 +2179,9 @@ class AnswerNodesMixin:
                 "population_retrieval_miss": population_retrieval_miss,
                 "documents_dropped": int(getattr(self._generator, "last_documents_dropped", 0)),
                 "documents_truncated": int(getattr(self._generator, "last_documents_truncated", 0)),
+                "citation_realignments": int(
+                    getattr(self._grounding_verifier, "last_citation_realignments", 0)
+                ),
                 "prose_stream_seconds": round(
                     getattr(self._generator, "last_prose_stream_seconds", 0.0), 3
                 ),

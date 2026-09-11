@@ -206,6 +206,14 @@ class PlanningNodesMixin:
     async def _plan_queries(self, state: RagState) -> RagState:
         planned = await self._plan_queries_core(state)
         source_types = planned.get("source_types", ())
+        if planned.get("query_intent") == "DELIVERY" and re.search(
+            r"\b(?:attachments?|attached|adjuntos?|adjuntad[oa]s?|anexos?)\b",
+            planned.get("resolved_question", self._request.question), re.I,
+        ):
+            # Record the same explicit scope used by Jira attachment retrieval
+            # before resolving the request, so the final gate can validate it.
+            source_types = ("ISSUE", "ATTACHMENT")
+            planned["source_types"] = source_types
         if not source_types:
             source_types = tuple(
                 str(value).upper()
@@ -236,7 +244,7 @@ class PlanningNodesMixin:
         # and never touches identifiers, acronyms or project entities.
         original_question = autocorrect_question(
             self._request.question,
-            vocabulary=getattr(self._vocabulary, "entities", ()),
+            vocabulary=(*getattr(self._vocabulary, "entities", ()), *getattr(self._vocabulary, "jira_terms", ())),
         )
         history = [
             (message.role, message.content)
@@ -361,7 +369,7 @@ class PlanningNodesMixin:
                 model_provider="deterministic",
                 model_name="single-record-details-planner",
                 model_profile="retrieval",
-                extra={"query_intent": "CODE_ASSISTED", "source_route": "MIXED"},
+                extra={"query_intent": "CODE_ASSISTED", "source_route": "CONFLUENCE_GITHUB"},
             )
             return {
                 "queries": planned,
@@ -519,8 +527,8 @@ class PlanningNodesMixin:
                 "retrieval_attempt": 1,
                 "query_intent": "CODE_ASSISTED",
                 "rerank_query": f"{question} implementation workflow source code documentation",
-                "source_types": (),
-                "source_route": "MIXED",
+                "source_types": ("CODE", "PAGE"),
+                "source_route": "CONFLUENCE_GITHUB",
                 "resolved_question": question,
                 "query_quality": query_quality,
                 "query_quality_reason": quality_reason,

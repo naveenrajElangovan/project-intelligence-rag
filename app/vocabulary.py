@@ -18,6 +18,7 @@ class CorpusVocabulary:
     source_types: tuple[str, ...] = ()
     code_extensions: tuple[str, ...] = ()
     languages: tuple[str, ...] = ()
+    jira_terms: tuple[str, ...] = ()
     intent_terms: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
@@ -49,6 +50,7 @@ class CorpusVocabulary:
             source_types=_normalized_values(values.get("source_types"), upper=True),
             code_extensions=_extensions(values.get("code_extensions")),
             languages=_normalized_values(values.get("languages"), casefold=True),
+            jira_terms=_normalized_values(values.get("jira_terms"), casefold=True),
             intent_terms=_intent_terms(values.get("intent_terms")),
         )
 
@@ -72,6 +74,7 @@ class CorpusVocabulary:
                     "source_types",
                     "code_extensions",
                     "languages",
+                    "jira_terms",
                 )
             }
         intent_names = tuple(

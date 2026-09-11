@@ -79,6 +79,9 @@ except ModuleNotFoundError:  # Direct `python evaluation/run_retrieval_eval.py` 
 # heading, so a gold predicate can address it without the manifest having to
 # carry chunk text.
 _MANIFEST_FIELDS = (
+    "issue_key",
+    "jira_chunk_kind",
+    "locator",
     "structure_path",
     "title",
     "source_id",
@@ -89,7 +92,7 @@ _MANIFEST_FIELDS = (
 # has no entity_key, and reusing it would not fail -- it would silently resolve
 # fewer cases, which is exactly the class of error this preflight exists to
 # stop.
-_MANIFEST_VERSION = 4
+_MANIFEST_VERSION = 5
 _MINIMUM_GOLD_RESOLUTION_RATE = 0.95
 _PARAPHRASE_GROUPS_PATH = Path(__file__).with_name("paraphrase_groups.json")
 _DEFAULT_SUITES_PATH = Path(__file__).with_name("gold_suites.jsonl")

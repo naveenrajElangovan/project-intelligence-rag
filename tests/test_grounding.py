@@ -224,6 +224,90 @@ def test_local_grounding_attaches_only_a_supported_missing_citation(monkeypatch)
     assert answer.citations == [1]
 
 
+def test_local_grounding_realigns_a_supported_claim_cited_to_the_wrong_source(
+    monkeypatch,
+) -> None:
+    verifier = _verifier(monkeypatch, [])
+    monkeypatch.setattr(
+        "app.grounding.predict_local_scores",
+        lambda *args, **kwargs: [
+            0.91 if "OrderEventSerializer" in evidence else 0.10
+            for _claim, evidence in kwargs["pairs"]
+        ],
+    )
+    answer = asyncio.run(
+        verifier.attach_missing_citations(
+            [
+                Document(page_content="The checkout screen displays the current total."),
+                Document(page_content="OrderEventSerializer encodes the event payload."),
+            ],
+            GroundedAnswer(
+                answer="OrderEventSerializer encodes the event payload [SOURCE 1].",
+                citations=[1],
+            ),
+        )
+    )
+
+    assert answer.answer == "OrderEventSerializer encodes the event payload [SOURCE 2]."
+    assert answer.citations == [2]
+    assert verifier.last_citation_realignments == 1
+
+
+def test_local_grounding_does_not_realign_without_verified_support(monkeypatch) -> None:
+    verifier = _verifier(monkeypatch, [])
+    monkeypatch.setattr(
+        "app.grounding.predict_local_scores",
+        lambda *args, **kwargs: [0.20] * len(kwargs["pairs"]),
+    )
+    original = GroundedAnswer(
+        answer="The event payload is encrypted before serialization [SOURCE 1].",
+        citations=[1],
+    )
+    answer = asyncio.run(
+        verifier.attach_missing_citations(
+            [
+                Document(page_content="Events are serialized before persistence."),
+                Document(page_content="The application supports offline operation."),
+            ],
+            original,
+        )
+    )
+
+    assert answer == original
+    assert verifier.last_citation_realignments == 0
+
+
+def test_local_grounding_realigns_when_literal_anchors_span_two_sources(
+    monkeypatch,
+) -> None:
+    verifier = _verifier(monkeypatch, [])
+    monkeypatch.setattr(
+        "app.grounding.predict_local_scores",
+        lambda *args, **kwargs: [
+            0.92 if "EventEnvelope" in evidence else 0.30
+            for _claim, evidence in kwargs["pairs"]
+        ],
+    )
+    answer = asyncio.run(
+        verifier.attach_missing_citations(
+            [
+                Document(page_content="The checkout screen displays the current total."),
+                Document(page_content="EventEnvelope contains the serialized payload."),
+                Document(page_content="SerializationModule registers EventCodec."),
+            ],
+            GroundedAnswer(
+                answer="`EventEnvelope` is registered by `EventCodec` [SOURCE 1].",
+                citations=[1],
+            ),
+        )
+    )
+
+    assert answer.answer == (
+        "`EventEnvelope` is registered by `EventCodec` [SOURCE 2] [SOURCE 3]."
+    )
+    assert answer.citations == [2, 3]
+
+
 def test_exact_filename_can_pass_bounded_code_threshold(monkeypatch) -> None:
     monkeypatch.setattr("app.reranking.predict_local_scores", lambda *args, **kwargs: [-2.0])
     verifier = LocalMultilingualReranker(
@@ -291,3 +375,28 @@ def test_access_denial_and_insufficient_evidence_are_not_conflated() -> None:
     assert "authorized" in no_access_answer("en")
     assert "authorized" not in insufficient_evidence_answer("en")
     assert "enough evidence" in insufficient_evidence_answer("en")
+
+
+def test_jira_citation_identity_supports_key_but_not_unrelated_numeric_claims(monkeypatch):
+    from app.grounding import _exact_anchors_supported
+    doc = Document(page_content='Verify the shift closes after confirmation.',
+        metadata={'provider':'JIRA','issue_key':'OPS-72','status':'Done'})
+    assert _exact_anchors_supported('OPS-72 requires confirmation.', doc.page_content, [doc])
+    assert _exact_anchors_supported('`OPS-72` requires confirmation.', doc.page_content, [doc])
+    assert not _exact_anchors_supported('OPS-72 requires 72 confirmations.', doc.page_content, [doc])
+    assert not _exact_anchors_supported('OPS-720 requires confirmation.', doc.page_content, [doc])
+    assert not _exact_anchors_supported('OTHER-72 requires confirmation.', doc.page_content, [doc])
+    verifier = _verifier(monkeypatch, [0.91])
+    verdict = asyncio.run(verifier.verify('What does OPS-72 require?', [doc],
+        GroundedAnswer(answer='OPS-72 requires shift closure after confirmation [SOURCE 1].',citations=[1])))
+    assert verdict.supported
+
+
+def test_jira_key_in_another_source_does_not_validate_wrong_citation(monkeypatch):
+    verifier = _verifier(monkeypatch, [0.91])
+    docs = [Document(page_content='Confirmation is required.', metadata={'provider':'JIRA','issue_key':key})
+        for key in ['OPS-1','OPS-72']]
+    verdict = asyncio.run(verifier.verify('What does OPS-72 require?', docs,
+        GroundedAnswer(answer='OPS-72 requires confirmation [SOURCE 1].',citations=[1])))
+    assert not verdict.supported
+    assert verifier.last_rejections[0].reason == 'ANCHOR_CITED_TO_WRONG_SOURCE'

@@ -79,3 +79,10 @@ def test_entity_scope_still_excludes_mismatches_when_some_evidence_remains() -> 
         }
     ]
     assert scope_bypassed is False
+
+
+def test_jira_key_prefix_is_not_a_named_application_but_explicit_app_still_is():
+    entities = ("ops", "pos", "bot", "custom")
+    assert _explicit_entity_scope("What additional field values are recorded for OPS-72?", entities) == ""
+    assert _explicit_entity_scope("¿Qué valores de campos adicionales tiene OPS-72?", entities) == ""
+    assert _explicit_entity_scope("Explain OPS-72 in the BOT application", entities) == "bot"

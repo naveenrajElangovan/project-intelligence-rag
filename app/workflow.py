@@ -11,7 +11,7 @@ from app.config import Settings
 from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedAnswer,
                      LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator,
                      TokenUsage, insufficient_evidence_answer, refusal_answer)
-from app.models import ConversationContextUpdate, ConversationEntity, RagRequest, RagResponse, SourceReference
+from app.models import ConversationContextUpdate, RagRequest, RagResponse, SourceReference
 from app.catalog_answers import deterministic_catalog_response
 from app.grounding import LocalCitationGroundingVerifier
 from app.embedding import build_embedder
@@ -114,6 +114,7 @@ from app.workflow_nodes.retrieval import RetrievalNodesMixin
 from app.workflow_nodes.state import RagState
 from app.workflow_support.conversation import (
     _conversation_context_subject,
+    build_conversation_context_update,
     _conversation_resolution_needed,
     _conversation_subject,
     _deterministic_conversation_rewrite,
@@ -138,7 +139,9 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
         policies = authorized_project_policies(request.project_id, request.access_policy_ids)
         request = request.model_copy(update={"access_policy_ids": list(policies)})
         self._request = request
-        if request.collection_name != settings.chroma_collection:
+        if request.collection_name not in (
+            settings.chroma_collection, *settings.additional_chroma_collections
+        ):
             raise ValueError("The project collection does not match the configured Chroma collection.")
         self._retriever = ChromaAccessRetriever.create(
             chroma_host=settings.chroma_host,
@@ -429,22 +432,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
     def _conversation_context_update(self, state: RagState) -> ConversationContextUpdate:
         """Return bounded semantic memory without promoting chat text to evidence."""
 
-        original = self._request.question
-        resolved = state.get("resolved_question", original)
-        existing = self._request.conversation_context.active_subject.strip()
-        vocabulary = tuple(
-            getattr(getattr(self, "_vocabulary", None), "entities", ()) or ()
-        )
-        subject, is_followup = _conversation_context_subject(
-            original, resolved, existing, vocabulary
-        )
-        entities = (
-            [ConversationEntity(value=subject, canonicalValue=subject)] if subject else []
-        )
-        return ConversationContextUpdate(
-            standaloneQuestion=resolved,
-            activeSubject=subject,
-            entities=entities,
-            intent=state.get("query_intent", ""),
-            resolutionConfidence=1.0 if resolved != original or not is_followup else 0.5,
+        return build_conversation_context_update(
+            self._request, state,
+            tuple(getattr(getattr(self, "_vocabulary", None), "entities", ()) or ()),
         )

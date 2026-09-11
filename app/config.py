@@ -21,9 +21,7 @@ class Settings(BaseSettings):
     # metadata_only is safe for every environment. full_authorized may be used
     # only after the server has resolved the project boundary; the tracing layer
     # still redacts credentials and never records access-policy tokens.
-    openinference_content_mode: Literal["metadata_only", "full_authorized"] = (
-        "metadata_only"
-    )
+    openinference_content_mode: Literal["metadata_only", "full_authorized"] = "metadata_only"
     openinference_project_name: str = "project-intelligence-rag"
     openinference_success_sample_rate: float = 0.10
     # Immutable release identifier (normally the Git SHA) bundled into the
@@ -32,6 +30,7 @@ class Settings(BaseSettings):
     chroma_host: str = "chroma"
     chroma_port: int = 8000
     chroma_collection: str = "project-intelligence"
+    additional_chroma_collections: tuple[str, ...] = ()
     supported_embedding_models: tuple[str, ...] = ("multilingual-e5-large",)
     supported_schema_versions: tuple[str, ...] = ("4", "3")
     llm_provider: str = "ollama"
@@ -302,9 +301,7 @@ class Settings(BaseSettings):
         if not self.openinference_project_name.strip():
             raise ValueError("PI_RAG_OPENINFERENCE_PROJECT_NAME must not be empty")
         if not 0 <= self.openinference_success_sample_rate <= 1:
-            raise ValueError(
-                "PI_RAG_OPENINFERENCE_SUCCESS_SAMPLE_RATE must be between 0 and 1"
-            )
+            raise ValueError("PI_RAG_OPENINFERENCE_SUCCESS_SAMPLE_RATE must be between 0 and 1")
         if not self.supported_embedding_models or not all(self.supported_embedding_models):
             raise ValueError("PI_RAG_SUPPORTED_EMBEDDING_MODELS must not be empty")
         if not self.supported_schema_versions or not all(self.supported_schema_versions):

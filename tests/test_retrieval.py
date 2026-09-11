@@ -627,7 +627,7 @@ def test_startup_warms_each_project_scoped_lexical_corpus(monkeypatch) -> None:
     import chromadb
     from app.config import Settings
 
-    monkeypatch.setattr(chromadb, "HttpClient", lambda **_kwargs: Client())
+    monkeypatch.setattr("app.retrieval.shared_chroma_client", lambda *_args: Client())
     monkeypatch.setattr(
         ChromaAccessRetriever,
         "create",

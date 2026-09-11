@@ -202,7 +202,9 @@ def uncertain_entity_token(
     """Find one identifier-like unknown token close to corpus-owned entities."""
 
     entities = {str(entity).casefold() for entity in known_entities if str(entity).strip()}
-    for token in re.findall(r"\b[A-Z][A-Z0-9]{1,30}\b", value):
+    # A fragment of a project version, Jira key or compound identifier is
+    # not a misspelled application name, even if new routing vocabulary is close.
+    for token in re.findall(r"(?<![\w.-])[A-Z][A-Z0-9]{1,30}(?![\w.-])", value):
         folded = token.casefold()
         if folded in entities:
             continue
@@ -297,13 +299,18 @@ def _add_usage(first: TokenUsage, second: TokenUsage) -> TokenUsage:
 
 
 def _dedupe_source_documents(documents: list[Document]) -> list[Document]:
-    unique: dict[tuple[str, str, str], Document] = {}
+    unique: dict[tuple[str, ...], Document] = {}
     for document in documents:
         identity = (
             str(document.metadata.get("source_type") or "DOCUMENT"),
             str(document.metadata.get("reference") or ""),
             str(document.metadata.get("source_url") or ""),
         )
+        if document.metadata.get("provider") == "JIRA":
+            identity += (
+                str(document.metadata.get("source_id") or ""),
+                str(document.metadata.get("locator") or ""),
+            )
         unique.setdefault(identity, document)
     return list(unique.values())
 
@@ -616,7 +623,24 @@ def _source_authority_valid(
         valid = bool(cited_types) and cited_types <= {"PAGE", "CODE"}
         return valid, "PROJECT_AUTHORITY_VERIFIED" if valid else "PROJECT_AUTHORITY_REQUIRED"
     if intent == "DELIVERY":
-        valid = bool(cited_types) and cited_types <= {"ISSUE"}
+        cited = [documents[index - 1] for index in generated.citations
+                 if 1 <= index <= len(documents)]
+        # Jira attachment evidence has its own source type but remains issue
+        # evidence when ingestion recorded the owning issue in the same cloud.
+        def issue_attachment(document):
+            metadata = document.metadata
+            source = str(metadata.get("source_id") or "").split(":")
+            parent = str(metadata.get("parent_issue_source_id") or "").split(":")
+            return (metadata.get("provider") == "JIRA" and len(source) == 4
+                    and len(parent) == 4 and source[:2] == parent[:2]
+                    and source[0] == "jira" and source[2] == "attachment"
+                    and parent[2] == "issue" and bool(source[3]) and bool(parent[3]))
+
+        valid = bool(cited) and all(
+            _document_source_type(document) == "ISSUE"
+            or (_document_source_type(document) == "ATTACHMENT" and issue_attachment(document))
+            for document in cited
+        )
         return valid, "ISSUE_AUTHORITY_VERIFIED" if valid else "ISSUE_AUTHORITY_REQUIRED"
     if intent == "CROSS_SOURCE":
         valid = {"PAGE", "CODE"} <= cited_types

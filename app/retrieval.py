@@ -4,6 +4,7 @@ import math
 import re
 import threading
 import time
+import httpx
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
@@ -13,7 +14,7 @@ from langchain_core.retrievers import BaseRetriever
 from pydantic import ConfigDict, Field
 
 from app.chroma_collections import project_collection_name, verify_project_collection
-from app.retry import with_transient_retry
+from app.retry import with_transient_retry, is_transient_error
 from app.retrieval_errors import classify_retrieval_failure
 from app.lexical_tokens import tokens as lexical_tokens
 from app.retrieval_pipeline import BM25Retriever
@@ -52,7 +53,7 @@ _VOCABULARY_CACHE_LOCK = threading.Lock()
 
 def _authorized_policy_filter(
     access_policy_ids: tuple[str, ...],
-) -> dict[str, dict[str, str | list[str]]]:
+) -> dict[str, object]:
     policies = tuple(dict.fromkeys(value for value in access_policy_ids if value))
     if not policies:
         raise PermissionError("At least one authorized access policy is required.")
@@ -91,12 +92,32 @@ def lexical_cache_size() -> int:
         return len(_FALLBACK_CORPUS_CACHE)
 
 
+def shared_chroma_client(host: str, port: int):
+    """Reuse transport resources; project/policy filters stay on each read."""
+    key = (host.lower().rstrip("."), port)
+    if not key[0] or not 1 <= port <= 65535:
+        raise ValueError("Chroma is not configured.")
+    with _CHROMA_CLIENTS_LOCK:
+        client = _CHROMA_CLIENTS.get(key)
+        if client is None:
+            from chromadb import HttpClient
+
+            client = HttpClient(host=host, port=port)
+            # The pinned Chroma HTTP client defaults to timeout=None. Async
+            # cancellation cannot stop its worker thread's blocking socket read.
+            # Bound the actual transport before sharing it with any caller.
+            transport = getattr(getattr(client, "_server", None), "_session", None)
+            if not isinstance(transport, httpx.Client):
+                raise RuntimeError("The configured Chroma client has no bounded HTTP transport")
+            transport.timeout = httpx.Timeout(15.0, connect=5.0, pool=5.0)
+            _CHROMA_CLIENTS[key] = client
+        return client
+
+
 async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
     """Build each project-scoped BM25 corpus before readiness succeeds."""
 
-    from chromadb import HttpClient
-
-    client = HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+    client = shared_chroma_client(settings.chroma_host, settings.chroma_port)
     warmed = 0
     for collection in await asyncio.to_thread(client.list_collections):
         metadata = getattr(collection, "metadata", None) or {}
@@ -469,6 +490,11 @@ class ChromaAccessRetriever(BaseRetriever):
                 "chunk_char_count": int(fields.get("chunk_char_count") or 0),
                 "chunk_token_count": int(fields.get("chunk_token_count") or 0),
                 "issue_key": str(fields.get("issue_key") or ""),
+                **{name: str(fields.get(name) or "") for name in (
+                    "jira_chunk_kind", "event_id", "event_date", "event_author",
+                    "event_author_id", "parent_issue_key", "parent_issue_source_id",
+                    "cloud_id", "issue_updated", "glossary_term", "link_url", "link_kind",
+                )},
                 "issue_type": str(fields.get("issue_type") or ""),
                 "status": str(fields.get("status") or ""),
                 "priority": str(fields.get("priority") or ""),
@@ -601,6 +627,38 @@ class ChromaAccessRetriever(BaseRetriever):
         return await asyncio.to_thread(
             self._exact_identifier_documents, identifiers, source_types
         )
+
+    async def ainvoke_jira_sections(self, question: str) -> list[Document]:
+        return await asyncio.to_thread(self._jira_section_documents, question)
+
+    def _jira_section_documents(self, question: str) -> list[Document]:
+        from app.jira_query import jira_section_query
+
+        route = jira_section_query(question)
+        if route is None:
+            return []
+        key, kind, event = route
+        filters = [
+            {"project_id": {"$eq": self.project_id}},
+            _authorized_policy_filter(self.access_policy_ids),
+            {"provider": "JIRA"}, {"issue_key": key},
+            {"source_type": "ATTACHMENT" if kind == "ATTACHMENT" else "ISSUE"},
+        ]
+        if kind and kind != "ATTACHMENT":
+            filters.append({"jira_chunk_kind": kind})
+        if event:
+            filters.append({"event_id": event})
+        response = self.index.get(where={"$and": filters}, limit=64,
+            include=["documents", "metadatas"])
+        documents, drops = [], {}
+        for identity, text, metadata in zip(response.get("ids", []),
+            response.get("documents", []), response.get("metadatas", []), strict=True):
+            fields = {**(metadata or {}), self.text_field: text or ""}
+            document = self._document_from_fields(fields, str(identity), 1.0, drops)
+            if document is not None:
+                document.metadata["identifier_anchor"] = True
+                documents.append(document)
+        return documents
 
     async def ainvoke_structure_identifiers(
         self, identifiers: tuple[str, ...], source_types: tuple[str, ...] = ()
@@ -779,7 +837,11 @@ class ChromaAccessRetriever(BaseRetriever):
                 found[str(document.metadata.get("chunk_id") or chunk_id)] = document
         return sorted(
             found.values(),
-            key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),
+            key=lambda item: (
+                str(item.metadata.get("issue_key") or "").upper() in {value.upper() for value in identifiers},
+                item.metadata.get("jira_chunk_kind") == "CURRENT",
+                float(item.metadata.get("identifier_anchor_score") or 0),
+            ),
             reverse=True,
         )[:12]
 
@@ -1079,11 +1141,12 @@ class ChromaAccessRetriever(BaseRetriever):
             if source_type is not None:
                 filters.append({"source_type": {"$eq": source_type}})
             offset = 0
+            page_size = 500
             while len(records) < self.lexical_fallback_max_records:
-                response = self.index.get(
+                response = self._read_cache_page(
                     where={"$and": filters},
                     limit=min(
-                        100, self.lexical_fallback_max_records - len(records)
+                        page_size, self.lexical_fallback_max_records - len(records)
                     ),
                     offset=offset,
                     include=["documents", "metadatas"],
@@ -1103,7 +1166,7 @@ class ChromaAccessRetriever(BaseRetriever):
                     if document is not None:
                         records.append(document)
                 offset += len(ids)
-                if len(ids) < 100:
+                if len(ids) < page_size:
                     break
             if len(records) >= self.lexical_fallback_max_records:
                 truncated = True
@@ -1111,6 +1174,17 @@ class ChromaAccessRetriever(BaseRetriever):
         if len(records) >= self.lexical_fallback_max_records:
             truncated = True
         return records, truncated
+
+    def _read_cache_page(self, **parameters):
+        # Retry only a completed failed read. The shared transport bounds its
+        # socket, so a retry never leaves an earlier read running in a thread.
+        for attempt in range(max(1, self.retry_attempts)):
+            try:
+                return self.index.get(**parameters)
+            except Exception as failure:
+                if attempt + 1 >= self.retry_attempts or not is_transient_error(failure):
+                    raise
+                time.sleep(min(2.0, 0.1 * (2 ** attempt)))
     def drain_usage(self) -> dict[str, int]:
         with self._usage_lock:
             events = self._usage_events

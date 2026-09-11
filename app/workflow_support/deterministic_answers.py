@@ -327,14 +327,62 @@ def _balanced_call_body(value: str, opening_index: int) -> str:
     return ""
 
 
+def exact_current_issue_evidence(question: str, documents: list[Document]) -> list[Document]:
+    """Select an unambiguous current Jira record from authorized candidates.
+
+    Issue-key equality is authoritative for a current-status lookup; semantic
+    similarity to a related ticket must never replace it. Multiple cloud/source
+    identities remain ambiguous and are not collapsed here.
+    """
+    keys = _jira_identifiers(question)
+    if len(keys) != 1 or not re.search(r"\b(?:status|estado)\b", question, re.I):
+        return []
+    if re.search(r"\b(?:previous|previously|history|historical|changed|change|why|when|before|anterior|antes|historial|histórico|históricos|cambi[oó]|cambios|por qu[eé]|cu[aá]ndo)\b", question, re.I):
+        return []
+    matched = [document for document in documents
+        if str(document.metadata.get("issue_key") or "").upper() == keys[0]
+        and document.metadata.get("jira_chunk_kind") == "CURRENT"
+        and _document_source_type(document) == "ISSUE"]
+    sources = {document.metadata.get("source_id") for document in matched}
+    return matched if len(sources) == 1 and None not in sources else []
+
+
 def _deterministic_delivery_answer(
     question: str, documents: list[Document], language: str
 ) -> GroundedAnswer | None:
-    """Answer an unambiguous single-issue Jira lookup without an LLM call."""
+    """Render unambiguous Jira facts while preserving each issue's citation."""
 
+    from app.jira_query import jira_current_status_question
+    requested_keys = tuple(dict.fromkeys(key.upper() for key in re.findall(
+        r"\b[A-Z][A-Z0-9_]*-\d+\b", question, re.I
+    )))
+    if len(requested_keys) > 1 and jira_current_status_question(question):
+        by_key = {}
+        for index, document in enumerate(documents, 1):
+            metadata = document.metadata
+            key = str(metadata.get("issue_key") or "").upper()
+            if (metadata.get("provider") != "JIRA"
+                    or metadata.get("jira_chunk_kind") != "CURRENT"
+                    or key not in requested_keys or key in by_key
+                    or not metadata.get("status")):
+                return None
+            by_key[key] = (index, metadata)
+        if set(by_key) != set(requested_keys):
+            return None
+        lines, citations = [], []
+        for key in requested_keys:
+            index, metadata = by_key[key]
+            label = "Estado actual" if language == "es" else "Current status"
+            lines.append(f"- {key}: {label}: {metadata['status']} [SOURCE {index}].")
+            citations.append(index)
+        return GroundedAnswer(answer="\n".join(lines), citations=citations, missing_information=[])
     if len(documents) != 1 or _document_source_type(documents[0]) != "ISSUE":
         return None
     normalized = " ".join(_normalized_words(question))
+    if re.search(r"\b(?:previous|previously|history|historical|changed|change|why|when|before|anterior|antes|historial|cambi[oó]|por qu[eé]|cu[aá]ndo)\b", question, re.I):
+        return None
+    if documents[0].metadata.get("jira_chunk_kind") not in (None, "", "CURRENT"):
+        return None
     status_question = bool(re.search(
         r"\b(?:status|project status|delivery status|release status|estado)\b",
         normalized,

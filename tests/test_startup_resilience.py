@@ -49,7 +49,8 @@ async def _run_lifespan(monkeypatch, settings, warm) -> bool:
 
     application = Application()
     async with main_module.lifespan(application):
-        await asyncio.sleep(0)
+        # Warm-up has its own shielded task so timeout retries cannot overlap.
+        await asyncio.sleep(0.01)
     return application.state.lexical_corpus_ready
 
 

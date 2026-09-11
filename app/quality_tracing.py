@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import re
 from typing import Any, Iterator
 
@@ -13,6 +14,45 @@ from opentelemetry.trace import Status, StatusCode
 from app.config import Settings
 from app.models import RagRequest, RagResponse
 from app.telemetry import request_id
+
+_evaluation_evidence: ContextVar[dict | None] = ContextVar("evaluation_evidence", default=None)
+
+
+@contextmanager
+def capture_evaluation_evidence(enabled: bool):
+    """Private evaluation evidence; never source bodies or routing vocabulary."""
+    evidence = {"candidates": [], "selected": [], "overflow": False} if enabled else None
+    token = _evaluation_evidence.set(evidence)
+    try:
+        yield evidence
+    finally:
+        _evaluation_evidence.reset(token)
+
+
+def _capture_evidence(kind, documents):
+    evidence = _evaluation_evidence.get()
+    if evidence is None:
+        return
+    for document in documents:
+        metadata = getattr(document, "metadata", {}) or {}
+        if len(evidence[kind]) >= 2000:
+            evidence["overflow"] = True
+            break
+        evidence[kind].append(
+            {
+                key: str(metadata.get(key) or "")
+                for key in (
+                    "chunk_id",
+                    "source_id",
+                    "locator",
+                    "project_id",
+                    "access_policy_id",
+                    "source_type",
+                    "jira_chunk_kind",
+                    "issue_key",
+                )
+            }
+        )
 
 
 _SECRET_PATTERNS = (
@@ -29,6 +69,24 @@ def redact_trace_text(value: str, *, limit: int = 100_000) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         redacted = pattern.sub(replacement, redacted)
     return redacted
+
+
+def record_evaluation_rejections(claims: list[str]) -> None:
+    """Return bounded rejected answer text only to the authorized evaluator.
+
+    This never writes telemetry, logs, or normal chat responses. Generated
+    rejected claims let the evaluator distinguish an invented fact from a
+    formatting mismatch against the already authorized source evidence.
+    """
+    evidence = _evaluation_evidence.get()
+    if evidence is None:
+        return
+    rows = evidence.setdefault("rejected_answer_claims", [])
+    for claim in claims:
+        if len(rows) >= 64:
+            evidence["overflow"] = True
+            break
+        rows.append(redact_trace_text(claim, limit=2000))
 
 
 def _source_payload(response: RagResponse) -> list[dict[str, str | None]]:
@@ -48,6 +106,7 @@ def _source_payload(response: RagResponse) -> list[dict[str, str | None]]:
 def record_selected_evidence(documents: list[Any], settings: Settings) -> None:
     """Record identifiers/scores for selected evidence and bodies only by policy."""
 
+    _capture_evidence("selected", documents)
     span = trace.get_current_span()
     try:
         for index, document in enumerate(documents):
@@ -56,8 +115,12 @@ def record_selected_evidence(documents: list[Any], settings: Settings) -> None:
                 "evidence.index": index,
                 "evidence.source_id": str(metadata.get("source_id") or metadata.get("id") or ""),
                 "evidence.title": str(metadata.get("title") or ""),
-                "evidence.locator": str(metadata.get("locator") or metadata.get("structure_path") or ""),
-                "evidence.score": float(metadata.get("rerank_score", metadata.get("score", 0.0)) or 0.0),
+                "evidence.locator": str(
+                    metadata.get("locator") or metadata.get("structure_path") or ""
+                ),
+                "evidence.score": float(
+                    metadata.get("rerank_score", metadata.get("score", 0.0)) or 0.0
+                ),
             }
             if settings.openinference_content_mode == "full_authorized":
                 attributes["evidence.body"] = redact_trace_text(
@@ -71,6 +134,7 @@ def record_selected_evidence(documents: list[Any], settings: Settings) -> None:
 def record_candidate_scores(documents: list[Any]) -> None:
     """Record every candidate identity and score, never its body."""
 
+    _capture_evidence("candidates", documents)
     span = trace.get_current_span()
     try:
         for index, document in enumerate(documents):
@@ -79,7 +143,12 @@ def record_candidate_scores(documents: list[Any]) -> None:
                 "rag.candidate",
                 attributes={
                     "candidate.index": index,
-                    "candidate.id": str(metadata.get("chunk_id") or metadata.get("source_id") or metadata.get("id") or ""),
+                    "candidate.id": str(
+                        metadata.get("chunk_id")
+                        or metadata.get("source_id")
+                        or metadata.get("id")
+                        or ""
+                    ),
                     "candidate.source_id": str(metadata.get("source_id") or ""),
                     "candidate.dense_score": float(metadata.get("score", 0.0) or 0.0),
                     "candidate.rerank_score": float(metadata.get("rerank_score", 0.0) or 0.0),
@@ -107,9 +176,7 @@ class QualityTrace:
             if self._settings.openinference_content_mode == "full_authorized":
                 import json
 
-                self._span.set_attribute(
-                    "output.value", redact_trace_text(response.answer)
-                )
+                self._span.set_attribute("output.value", redact_trace_text(response.answer))
                 self._span.set_attribute(
                     "rag.selected_evidence",
                     json.dumps(_source_payload(response), ensure_ascii=False),

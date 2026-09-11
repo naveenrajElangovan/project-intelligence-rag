@@ -69,6 +69,9 @@ def test_noisy_variant_is_additive_and_never_rewrites_known_entity() -> None:
     assert "prioritarios" in priority_variant
     assert uncertain_entity_token("HOW DOES NAVA WORK?", ("nova", "atlas")) == "NAVA"
     assert uncertain_entity_token("HOW DOES NOVA WORK?", ("nova", "atlas")) == ""
+    assert uncertain_entity_token("For project T2.0, explain this event", ("t0", "pos")) == ""
+    assert uncertain_entity_token("What is the status of OPS-72?", ("opsx",)) == ""
+    assert uncertain_entity_token("Explain release APP.2 and APP_ID", ("appx",)) == ""
 
 
 def test_multilingual_rerank_keeps_max_qualifying_score_and_rrf() -> None:
