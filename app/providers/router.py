@@ -46,6 +46,12 @@ _REPORT = re.compile(
     r"reporte de estado|informe de estado|reporte del proyecto|informe de jira)\b",
     re.I,
 )
+_OVERVIEW = re.compile(
+    r"\b(?:jira overview|overview of jira|summari[sz]e jira|summari[sz]e (?:the )?(?:whole|entire) jira|"
+    r"whole jira|entire jira|complete jira report|resumen (?:general )?de jira|"
+    r"resume (?:todo )?jira|informe completo de jira)\b",
+    re.I,
+)
 _DETAIL = re.compile(
     r"\b(?:detail|details|detailed|information|summary|status|priority|assignee|assigned|owner|reporter|about|"
     r"due date|created|updated|detalle|detalles|informaci[oó]n|resumen|estado|"
@@ -211,11 +217,7 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             section_kind=section_kind,
             limit=20,
         )
-    if (
-        keys
-        and not _CROSS.search(question)
-        and (_DETAIL.search(question) or len(question.split()) <= 5)
-    ):
+    if keys and not _CROSS.search(question):
         return StructuredQuery(
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
@@ -223,7 +225,9 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
         )
     filters = _jira_filters(question)
     operation = (
-        StructuredOperation.DISTRIBUTION
+        StructuredOperation.OVERVIEW
+        if _OVERVIEW.search(question)
+        else StructuredOperation.DISTRIBUTION
         if _DISTRIBUTION.search(question) or _REPORT.search(question)
         else StructuredOperation.COUNT
         if _COUNT.search(question)

@@ -294,7 +294,40 @@ class ProviderNodesMixin:
             if result.snapshot_at
             else ""
         )
-        if query.operation == StructuredOperation.COUNT:
+        if query.operation == StructuredOperation.OVERVIEW:
+            overview = result.rows[0] if result.rows else {}
+
+            def breakdown(values: object) -> str:
+                if not isinstance(values, dict) or not values:
+                    return "- None" if language == "en" else "- Ninguno"
+                return "\n".join(f"- **{key}:** {value}" for key, value in values.items())
+
+            labels = breakdown(overview.get("labels"))
+            components = breakdown(overview.get("components"))
+            answer = (
+                (
+                    f"## Jira project overview — {self._request.project_id}\n\n"
+                    f"- **Total work items:** {result.total}\n"
+                    f"- **Top-level work items:** {overview.get('top_level_work_items', 0)}\n"
+                    f"- **Child work items:** {overview.get('child_work_items', 0)}\n\n"
+                    f"### Statuses\n{breakdown(overview.get('statuses'))}\n\n"
+                    f"### Work item types\n{breakdown(overview.get('issue_types'))}\n\n"
+                    f"### Priorities\n{breakdown(overview.get('priorities'))}\n\n"
+                    f"### Labels\n{labels}\n\n### Components\n{components}{snapshot}"
+                )
+                if language == "en"
+                else (
+                    f"## Resumen del proyecto Jira — {self._request.project_id}\n\n"
+                    f"- **Total de elementos:** {result.total}\n"
+                    f"- **Elementos de nivel superior:** {overview.get('top_level_work_items', 0)}\n"
+                    f"- **Elementos hijos:** {overview.get('child_work_items', 0)}\n\n"
+                    f"### Estados\n{breakdown(overview.get('statuses'))}\n\n"
+                    f"### Tipos de elemento\n{breakdown(overview.get('issue_types'))}\n\n"
+                    f"### Prioridades\n{breakdown(overview.get('priorities'))}\n\n"
+                    f"### Etiquetas\n{labels}\n\n### Componentes\n{components}{snapshot}"
+                )
+            )
+        elif query.operation == StructuredOperation.COUNT:
             ticket_noun = _ticket_noun(result.total, language)
             answer = (
                 f"**{result.total} {ticket_noun}**{filter_summary}{rule_text} in **{self._request.project_id}**.{snapshot}"
@@ -338,6 +371,31 @@ class ProviderNodesMixin:
                         fields.append(f"**{labels[4]}:** {row['reporter']}")
                     if row.get("due_date"):
                         fields.append(f"**{labels[5]}:** {row['due_date']}")
+                    if row.get("parent_issue_key"):
+                        fields.append(
+                            f"**{'Padre' if language == 'es' else 'Parent'}:** {row['parent_issue_key']}"
+                        )
+                    if row.get("labels"):
+                        fields.append(
+                            f"**{'Etiquetas' if language == 'es' else 'Labels'}:** {', '.join(row['labels'])}"
+                        )
+                    if row.get("resolution"):
+                        fields.append(
+                            f"**{'Resolución' if language == 'es' else 'Resolution'}:** {row['resolution']}"
+                        )
+                    if row.get("updated"):
+                        fields.append(
+                            f"**{'Actualizado' if language == 'es' else 'Updated'}:** {row['updated']}"
+                        )
+                    section_counts = row.get("section_counts")
+                    if isinstance(section_counts, dict) and section_counts:
+                        fields.append(
+                            f"**{'Contenido indexado' if language == 'es' else 'Indexed content'}:** "
+                            + ", ".join(
+                                f"{kind.replace('_', ' ').title()} {count}"
+                                for kind, count in section_counts.items()
+                            )
+                        )
                     if row.get("description"):
                         fields.append(
                             f"**{'Descripción' if language == 'es' else 'Description'}:** {row['description']}"
@@ -403,7 +461,10 @@ class ProviderNodesMixin:
         else:
             rows = result.rows[: self._settings.provider_max_list_items]
             rendered = "\n".join(
-                f"- **{row['key']}** — {row['summary']} · {row['status']}" for row in rows
+                f"- **{row['key']}** — {row['summary']} · {row['issue_type']} · {row['status']}"
+                + (f" · {row['priority']}" if row.get("priority") else "")
+                + (f" · parent {row['parent_issue_key']}" if row.get("parent_issue_key") else "")
+                for row in rows
             )
             returned = len(rows)
             start = query.offset + 1 if returned else min(query.offset, result.total)

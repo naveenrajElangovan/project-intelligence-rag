@@ -37,6 +37,8 @@ JIRA_ONLY = (ProviderName.JIRA,)
         ("Lista los tickets pendientes", JIRA_ONLY, "LIST", "status_category_key", "new"),
         ("Give me a Jira status report", ALL, "DISTRIBUTION", None, None),
         ("Dame un informe de estado de Jira", ALL, "DISTRIBUTION", None, None),
+        ("Summarize the whole Jira", ALL, "OVERVIEW", None, None),
+        ("Dame un resumen general de Jira", ALL, "OVERVIEW", None, None),
         ("Jira breakdown by issue type", ALL, "DISTRIBUTION", None, None),
         ("Desglose de Jira por prioridad", ALL, "DISTRIBUTION", None, None),
         ("Show high priority Jira bugs", ALL, "LIST", "issue_type", "Bug"),

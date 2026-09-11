@@ -114,7 +114,12 @@ class IndexedProviderAdapter(ProviderAdapter):
             )
         if query.operation in {StructuredOperation.SECTION, StructuredOperation.SECTION_COUNT}:
             return await self._jira_sections(query, loader)
-        documents, complete = await loader(("ISSUE",))
+        source_types = (
+            ("ISSUE", "ATTACHMENT")
+            if query.operation in {StructuredOperation.OVERVIEW, StructuredOperation.DETAIL}
+            else ("ISSUE",)
+        )
+        documents, complete = await loader(source_types)
         current = [
             document
             for document in documents
@@ -144,6 +149,40 @@ class IndexedProviderAdapter(ProviderAdapter):
             if key != ":":
                 unique[key] = document
         ordered = sorted(unique.values(), key=_jira_sort_key)
+        if query.operation == StructuredOperation.OVERVIEW:
+            def distribution(field: str) -> dict[str, int]:
+                counts: dict[str, int] = {}
+                for document in ordered:
+                    values = _values(document.metadata.get(field)) or ("Unspecified",)
+                    for value in values:
+                        counts[value] = counts.get(value, 0) + 1
+                return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold())))
+
+            child_count = sum(
+                bool(str(document.metadata.get("parent_issue_key") or ""))
+                for document in ordered
+            )
+            overview = {
+                "statuses": distribution("status"),
+                "issue_types": distribution("issue_type"),
+                "priorities": distribution("priority"),
+                "labels": distribution("labels"),
+                "components": distribution("components"),
+                "child_work_items": child_count,
+                "top_level_work_items": len(ordered) - child_count,
+            }
+            return StructuredResult(
+                operation=query.operation,
+                provider=self.name,
+                complete=complete,
+                snapshot_at=_snapshot_at(current),
+                total=len(ordered),
+                rows=(overview,),
+                evidence=tuple(
+                    _envelope(self.name, self._project_id, document) for document in ordered
+                ),
+                degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
+            )
         if query.operation == StructuredOperation.DETAIL:
             requested_keys = {
                 value.upper() for value in effective_filters.get("issue_key", ())
@@ -156,13 +195,26 @@ class IndexedProviderAdapter(ProviderAdapter):
                 children_by_identity[identity] = document
             children = sorted(children_by_identity.values(), key=_jira_sort_key)
             descriptions: dict[str, list[Document]] = {}
+            section_identities: dict[str, dict[str, set[str]]] = {}
             for document in documents:
-                if (
-                    str(document.metadata.get("jira_chunk_kind") or "").upper() == "DESCRIPTION"
-                    and str(document.metadata.get("issue_key") or "").upper() in requested_keys
-                ):
+                issue_key = str(document.metadata.get("issue_key") or "").upper()
+                kind = str(
+                    document.metadata.get("jira_chunk_kind")
+                    or ("ATTACHMENT" if document.metadata.get("source_type") == "ATTACHMENT" else "")
+                ).upper()
+                if issue_key not in requested_keys or not kind or kind == "CURRENT":
+                    continue
+                identity = str(
+                    document.metadata.get("event_id")
+                    or document.metadata.get("attachment_id")
+                    or document.metadata.get("locator")
+                    or document.metadata.get("source_id")
+                    or ""
+                )
+                section_identities.setdefault(issue_key, {}).setdefault(kind, set()).add(identity)
+                if kind == "DESCRIPTION":
                     descriptions.setdefault(
-                        str(document.metadata.get("issue_key") or "").upper(), []
+                        issue_key, []
                     ).append(document)
             rows: list[dict[str, object]] = []
             for document in ordered:
@@ -171,6 +223,12 @@ class IndexedProviderAdapter(ProviderAdapter):
                 description_parts = descriptions.get(str(row["key"]).upper(), [])
                 if description_parts:
                     row["description"] = _section_row(description_parts, "DESCRIPTION")["text"]
+                row["section_counts"] = {
+                    kind: len(identities)
+                    for kind, identities in sorted(
+                        section_identities.get(str(row["key"]).upper(), {}).items()
+                    )
+                }
                 rows.append(row)
             for document in children:
                 row = _row(document)

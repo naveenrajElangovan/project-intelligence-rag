@@ -75,6 +75,8 @@ new adapter and registry entry; it does not require changing Jira aggregation.
 
 The structured route supports:
 
+- complete project overviews with status, type, priority, label, component, and
+  parent/child distributions;
 - exact counts;
 - complete lists;
 - distributions by status, issue type, or priority;
@@ -114,6 +116,21 @@ authorized hierarchy scan. Child records are resolved from their own current
 `parent_issue_key`; the implementation does not depend on Jira returning an
 embedded `subtasks` list on the parent. This supports epic children and other
 parent-linked Jira work items while preserving stable child identities.
+
+Any Jira key without an explicit cross-provider comparison now defaults to the
+exact-key overview. This prevents wording variations from dropping into a
+one-row list or semantic top-K result. The overview includes current fields,
+description, parent, children, labels, resolution, update time, and counts of
+the indexed Jira sections available for that issue. Explicit comment, history,
+attachment, relationship, requirement, and worklog requests still use their
+dedicated paged operations. Project-level “whole Jira” summaries use the
+complete authorized current-state scan rather than an LLM prompt.
+
+The capability boundary is intentional: deterministic structured operations
+handle complete inventories and exact facts; other Jira questions remain
+scoped to Jira evidence in the established semantic RAG path. This provides a
+generic fallback for natural-language questions without allowing another
+provider to fill missing Jira evidence.
 
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the

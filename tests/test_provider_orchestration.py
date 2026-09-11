@@ -119,7 +119,7 @@ def test_jira_aggregate_uses_current_chunks_explicit_labels_and_stable_dedup() -
 
 class _HierarchySnapshotRetriever:
     async def authorized_source_snapshot(self, source_types):
-        assert source_types == ("ISSUE",)
+        assert source_types == ("ISSUE", "ATTACHMENT")
         parent = _issue("jira:c:T0-7:CURRENT", "T0-7", "Merchandise", "BOT", "In Progress")
         child_85 = _issue("jira:c:T0-85:CURRENT", "T0-85", "Column widths", "BOT", "In Review")
         child_93 = _issue("jira:c:T0-93:CURRENT", "T0-93", "Shrinkage capture", "BOT", "In Review")
@@ -188,6 +188,21 @@ def test_exact_jira_overview_renders_child_work_items() -> None:
     assert "Child work items (2)" in answer
     assert "T0-85" in answer
     assert "T0-93" in answer
+
+
+def test_complete_jira_overview_summarizes_current_metadata_and_hierarchy() -> None:
+    selection = select_providers("Summarize the whole Jira", ENABLED)
+    adapter = IndexedProviderAdapter(
+        ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever()
+    )
+
+    result = asyncio.run(adapter.aggregate(selection.structured_query))
+
+    assert selection.structured_query.operation == StructuredOperation.OVERVIEW
+    assert result.total == 3
+    assert result.rows[0]["child_work_items"] == 2
+    assert result.rows[0]["top_level_work_items"] == 1
+    assert result.rows[0]["statuses"] == {"In Review": 2, "In Progress": 1}
 
 
 def test_ticket_count_uses_structured_jira_route_without_repeating_provider_name() -> None:

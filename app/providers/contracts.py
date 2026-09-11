@@ -24,6 +24,7 @@ class ExecutionMode(StrEnum):
 
 
 class StructuredOperation(StrEnum):
+    OVERVIEW = "OVERVIEW"
     COUNT = "COUNT"
     LIST = "LIST"
     DISTRIBUTION = "DISTRIBUTION"
