@@ -256,7 +256,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
                 outcome="ANSWERED" if provider_response.status == "ANSWERED" else "NO_ANSWER",
                 confidence=provider_response.confidence,
                 model_profile=self._request.model_profile,
-                language="es" if provider_response.answer.startswith("Jira tiene") else "en",
+                language=resolve_response_language(self._request.question, default=self._settings.default_response_language),
                 reason_code=provider_response.failure_reason or provider_response.resolved_intent,
             )
             return provider_response

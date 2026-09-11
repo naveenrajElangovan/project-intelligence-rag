@@ -13,6 +13,7 @@ from app.providers.contracts import (
 
 
 _JIRA = re.compile(r"\b(?:jira|tickets?|issues?|incidencias?|historias?)\b", re.I)
+_JIRA_EXPLICIT = re.compile(r"\b(?:jira|issues?|incidencias?|sprints?|backlog)\b", re.I)
 _GITHUB = re.compile(
     r"\b(?:github|pull requests?|prs?|commits?|repositor(?:y|ies)|c[oó]digo)\b", re.I
 )
@@ -39,6 +40,49 @@ _MORE = re.compile(
     re.I,
 )
 _FIXED = re.compile(r"\b(?:fixed|resolved|corregid[oa]s?|resuelt[oa]s?)\b", re.I)
+_ISSUE_KEY = re.compile(r"\b[A-Z][A-Z0-9_]*-\d+\b", re.I)
+_REPORT = re.compile(
+    r"\b(?:status report|project report|jira report|summary report|"
+    r"reporte de estado|informe de estado|reporte del proyecto|informe de jira)\b",
+    re.I,
+)
+_DETAIL = re.compile(
+    r"\b(?:detail|details|information|summary|status|priority|assignee|assigned|owner|reporter|"
+    r"due date|created|updated|detalle|detalles|informaci[oó]n|resumen|estado|"
+    r"prioridad|asignad[oa]|responsable|reportad[oa]|fecha l[ií]mite|cread[oa]|actualizad[oa])\b",
+    re.I,
+)
+_SECTION_PATTERNS = (
+    ("COMMENT", re.compile(r"\b(?:comments?|commented|comentarios?|coment[oó])\b", re.I)),
+    (
+        "CHANGELOG",
+        re.compile(
+            r"\b(?:history|changelog|changes?|changed|historial|cambios?|cambi[oó])\b", re.I
+        ),
+    ),
+    ("WORKLOG", re.compile(r"\b(?:worklogs?|work logs?|registros? de trabajo)\b", re.I)),
+    (
+        "ATTACHMENT",
+        re.compile(r"\b(?:attachments?|attached files?|adjuntos?|archivos? adjuntos?)\b", re.I),
+    ),
+    (
+        "RELATIONSHIP",
+        re.compile(
+            r"\b(?:dependencies|dependency|related issues?|parent|subtasks?|blocks?|blocked by|dependencias?|relacionad[oa]s?|padre|subtareas?|bloquea)\b",
+            re.I,
+        ),
+    ),
+    ("ACCEPTANCE", re.compile(r"\b(?:acceptance criteria|criterios? de aceptaci[oó]n)\b", re.I)),
+    ("REQUIREMENTS", re.compile(r"\b(?:requirements?|requisitos?)\b", re.I)),
+    ("DESCRIPTION", re.compile(r"\b(?:description|descripci[oó]n)\b", re.I)),
+    ("CUSTOM_FIELD", re.compile(r"\b(?:custom fields?|campos? personalizados?)\b", re.I)),
+    (
+        "REMOTE_LINK",
+        re.compile(
+            r"\b(?:remote links?|external links?|enlaces? remotos?|enlaces? externos?)\b", re.I
+        ),
+    ),
+)
 
 
 def select_providers(
@@ -46,15 +90,18 @@ def select_providers(
     enabled: tuple[ProviderName, ...],
     structured_scope: StructuredConversationScope | None = None,
 ) -> ProviderSelection:
-    requested = tuple(
+    requested_list = [
         provider
         for provider, pattern in (
-            (ProviderName.JIRA, _JIRA),
+            (ProviderName.JIRA, _JIRA_EXPLICIT),
             (ProviderName.GITHUB, _GITHUB),
             (ProviderName.CONFLUENCE, _CONFLUENCE),
         )
         if pattern.search(question)
-    )
+    ]
+    if _ISSUE_KEY.search(question) and ProviderName.JIRA not in requested_list:
+        requested_list.insert(0, ProviderName.JIRA)
+    requested = tuple(requested_list)
     disabled = tuple(provider for provider in requested if provider not in enabled)
     if disabled:
         return ProviderSelection(
@@ -64,7 +111,11 @@ def select_providers(
             reason="REQUESTED_PROVIDER_DISABLED",
         )
     named = requested
-    structured = _jira_structured_query(question) if ProviderName.JIRA in enabled else None
+    structured = (
+        _jira_structured_query(question, assume_jira=len(enabled) == 1)
+        if ProviderName.JIRA in enabled
+        else None
+    )
     inherited = False
     if (
         structured is None
@@ -125,40 +176,55 @@ def select_providers(
     )
 
 
-def _jira_structured_query(question: str) -> StructuredQuery | None:
-    if not _JIRA.search(question):
+def _jira_structured_query(question: str, *, assume_jira: bool = False) -> StructuredQuery | None:
+    keys = tuple(dict.fromkeys(value.upper() for value in _ISSUE_KEY.findall(question)))
+    if not (_JIRA.search(question) or assume_jira or keys):
         return None
+    if keys and (_GITHUB.search(question) or _CONFLUENCE.search(question)):
+        return None
+    section_kind = next(
+        (kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question)), None
+    )
+    if section_kind and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
+        section_filters: dict[str, tuple[str, ...]] = {"section_kind": (section_kind,)}
+        if keys:
+            section_filters["issue_key"] = keys
+        return StructuredQuery(
+            operation=(
+                StructuredOperation.SECTION_COUNT
+                if _COUNT.search(question)
+                else StructuredOperation.SECTION
+            ),
+            provider=ProviderName.JIRA,
+            filters=section_filters,
+            section_kind=section_kind,
+            limit=20,
+        )
+    if (
+        keys
+        and not _CROSS.search(question)
+        and (_DETAIL.search(question) or len(question.split()) <= 5)
+    ):
+        return StructuredQuery(
+            operation=StructuredOperation.DETAIL,
+            provider=ProviderName.JIRA,
+            filters={"issue_key": keys},
+        )
+    filters = _jira_filters(question)
     operation = (
         StructuredOperation.DISTRIBUTION
-        if _DISTRIBUTION.search(question)
+        if _DISTRIBUTION.search(question) or _REPORT.search(question)
         else StructuredOperation.COUNT
         if _COUNT.search(question)
         else StructuredOperation.LIST
-        if _LIST.search(question) and re.search(r"\b(?:all|todos?|todas?)\b", question, re.I)
+        if _LIST.search(question)
+        and (re.search(r"\b(?:all|todos?|todas?)\b", question, re.I) or bool(filters))
         else None
     )
     if operation is None:
         return None
-    filters: dict[str, tuple[str, ...]] = {}
-    labels = tuple(
-        dict.fromkeys(
-            value for value in _LABEL_TOKEN.findall(question) if value not in _RESERVED_LABEL_TOKENS
-        )
-    )
-    if labels:
-        filters["labels"] = labels
-    if _FIXED.search(question):
-        filters["fixed"] = ("AUTO",)
-    for field, values in {
-        "status": ("To Do", "In Progress", "In Review", "Done"),
-        "issue_type": ("Story", "Task", "Bug", "Epic"),
-        "priority": ("Highest", "High", "Medium", "Low", "Lowest"),
-    }.items():
-        matched = tuple(
-            value for value in values if re.search(rf"\b{re.escape(value)}\b", question, re.I)
-        )
-        if matched:
-            filters[field] = matched
+    if keys:
+        filters["issue_key"] = keys
     group_by = None
     if operation == StructuredOperation.DISTRIBUTION:
         group_by = (
@@ -176,6 +242,71 @@ def _jira_structured_query(question: str) -> StructuredQuery | None:
     )
 
 
+def _jira_filters(question: str) -> dict[str, tuple[str, ...]]:
+    filters: dict[str, tuple[str, ...]] = {}
+    labels = tuple(
+        dict.fromkeys(
+            value for value in _LABEL_TOKEN.findall(question) if value not in _RESERVED_LABEL_TOKENS
+        )
+    )
+    if labels:
+        filters["labels"] = labels
+    if _FIXED.search(question):
+        filters["fixed"] = ("AUTO",)
+    status_category = next(
+        (
+            value
+            for value, pattern in (
+                ("indeterminate", r"\b(?:in progress|active|en progreso|en curso|activ[oa]s?)\b"),
+                (
+                    "done",
+                    r"\b(?:done|closed|completed|terminad[oa]s?|cerrad[oa]s?|completad[oa]s?)\b",
+                ),
+                ("new", r"\b(?:to do|pending|open|por hacer|pendientes?|abiert[oa]s?)\b"),
+            )
+            if re.search(pattern, question, re.I)
+        ),
+        None,
+    )
+    if status_category and "fixed" not in filters:
+        filters["status_category_key"] = (status_category,)
+    exact_statuses = {
+        "In Review": r"\b(?:in review|review|en revisi[oó]n)\b",
+        "Blocked": r"\b(?:blocked|bloquead[oa]s?)\b",
+        "QA": r"\b(?:qa|quality assurance|control de calidad)\b",
+    }
+    matched_statuses = tuple(
+        value for value, pattern in exact_statuses.items() if re.search(pattern, question, re.I)
+    )
+    if matched_statuses:
+        filters.pop("status_category_key", None)
+        filters["status"] = matched_statuses
+    issue_types = {
+        "Story": r"\b(?:stories|story|historias?)\b",
+        "Task": r"\b(?:tasks?|tareas?)\b",
+        "Bug": r"\b(?:bugs?|defects?|errores?|defectos?)\b",
+        "Epic": r"\b(?:epics?|[eé]picas?)\b",
+    }
+    matched_types = tuple(
+        value for value, pattern in issue_types.items() if re.search(pattern, question, re.I)
+    )
+    if matched_types:
+        filters["issue_type"] = matched_types
+    priorities = {
+        "Highest": r"\b(?:highest|m[aá]xima)\b",
+        "High": r"\b(?:high priority|priority high|prioridad alta)\b",
+        "Medium": r"\b(?:medium priority|priority medium|prioridad media)\b",
+        "Low": r"\b(?:low priority|priority low|prioridad baja)\b",
+        "Lowest": r"\b(?:lowest|m[ií]nima)\b",
+    }
+    matched_priorities = tuple(
+        value for value, pattern in priorities.items() if re.search(pattern, question, re.I)
+    )
+    if matched_priorities:
+        filters["priority"] = matched_priorities
+    return filters
+
+
 def _jira_structured_followup(
     question: str, scope: StructuredConversationScope
 ) -> StructuredQuery | None:
@@ -184,6 +315,7 @@ def _jira_structured_followup(
     filters = {key: tuple(values) for key, values in scope.filters.items()}
     operation = StructuredOperation(scope.operation)
     group_by = scope.group_by
+    section_kind = None
     offset = 0
     labels = tuple(
         dict.fromkeys(
@@ -191,56 +323,48 @@ def _jira_structured_followup(
         )
     )
     if _MORE.fullmatch(question):
-        operation = StructuredOperation.LIST
+        operation = (
+            StructuredOperation.LIST
+            if scope.operation in {"COUNT", "LIST", "DISTRIBUTION"}
+            else StructuredOperation.SECTION
+            if scope.operation == "SECTION_COUNT"
+            else StructuredOperation(scope.operation)
+        )
         offset = scope.next_offset
-    elif _FIXED.search(question):
-        operation = StructuredOperation.LIST if _LIST.search(question) else operation
-        for key in (
-            "status",
-            "status_category",
-            "status_category_key",
-            "resolution",
-            "resolution_id",
-        ):
-            filters.pop(key, None)
-        filters["fixed"] = ("AUTO",)
+        section_kind = filters.get("section_kind", (None,))[0]
+    elif candidate := _jira_structured_query(question, assume_jira=True):
+        operation = candidate.operation
+        group_by = candidate.group_by
+        section_kind = candidate.section_kind
+        incoming = candidate.filters
+        if "issue_key" in incoming:
+            filters = dict(incoming)
+        else:
+            if any(
+                key in incoming
+                for key in (
+                    "status",
+                    "status_category",
+                    "status_category_key",
+                    "resolution",
+                    "resolution_id",
+                    "fixed",
+                )
+            ):
+                for key in (
+                    "status",
+                    "status_category",
+                    "status_category_key",
+                    "resolution",
+                    "resolution_id",
+                    "fixed",
+                ):
+                    filters.pop(key, None)
+            filters.update(incoming)
     elif labels and re.search(
         r"\b(?:what about|and|instead|y|qu[eé] (?:hay )?de)\b", question, re.I
     ):
         filters["labels"] = labels
-    elif (
-        _COUNT.search(question)
-        or _DISTRIBUTION.search(question)
-        or (_LIST.search(question) and re.search(r"\b(?:all|todos?|todas?)\b", question, re.I))
-    ):
-        operation = (
-            StructuredOperation.DISTRIBUTION
-            if _DISTRIBUTION.search(question)
-            else StructuredOperation.COUNT
-            if _COUNT.search(question)
-            else StructuredOperation.LIST
-        )
-        if labels:
-            filters["labels"] = labels
-        for field, values in {
-            "status": ("To Do", "In Progress", "In Review", "Done"),
-            "issue_type": ("Story", "Task", "Bug", "Epic"),
-            "priority": ("Highest", "High", "Medium", "Low", "Lowest"),
-        }.items():
-            matched = tuple(
-                value for value in values if re.search(rf"\b{re.escape(value)}\b", question, re.I)
-            )
-            if matched:
-                if field == "status":
-                    filters.pop("fixed", None)
-                    for key in (
-                        "status_category",
-                        "status_category_key",
-                        "resolution",
-                        "resolution_id",
-                    ):
-                        filters.pop(key, None)
-                filters[field] = matched
     else:
         return None
     if operation == StructuredOperation.DISTRIBUTION:
@@ -256,6 +380,7 @@ def _jira_structured_followup(
         provider=ProviderName.JIRA,
         filters=filters,
         group_by=group_by,
+        section_kind=section_kind,
         offset=offset,
         limit=scope.page_size,
     )

@@ -11,6 +11,7 @@ from app.providers.contracts import (
     ProviderAdapter,
     ProviderCapabilities,
     ProviderName,
+    StructuredOperation,
     StructuredQuery,
     StructuredResult,
 )
@@ -111,6 +112,8 @@ class IndexedProviderAdapter(ProviderAdapter):
                 complete=False,
                 degradation=("COMPLETE_SNAPSHOT_UNAVAILABLE",),
             )
+        if query.operation in {StructuredOperation.SECTION, StructuredOperation.SECTION_COUNT}:
+            return await self._jira_sections(query, loader)
         documents, complete = await loader(("ISSUE",))
         current = [
             document
@@ -164,6 +167,69 @@ class IndexedProviderAdapter(ProviderAdapter):
             applied_filter_rule=fixed_rule,
         )
 
+    async def _jira_sections(self, query: StructuredQuery, loader: object) -> StructuredResult:
+        section_kind = str(
+            query.section_kind or next(iter(query.filters.get("section_kind", ())), "")
+        ).upper()
+        source_types = ("ATTACHMENT",) if section_kind == "ATTACHMENT" else ("ISSUE",)
+        documents, complete = await loader(source_types)
+        filters = {key: values for key, values in query.filters.items() if key != "section_kind"}
+        matched = [
+            document
+            for document in documents
+            if (
+                (
+                    section_kind == "ATTACHMENT"
+                    and str(document.metadata.get("source_type") or "").upper() == "ATTACHMENT"
+                )
+                or str(document.metadata.get("jira_chunk_kind") or "").upper() == section_kind
+            )
+            and _matches(document, filters)
+        ]
+        records: dict[str, list[Document]] = {}
+        for document in matched:
+            metadata = document.metadata
+            identity = ":".join(
+                (
+                    str(metadata.get("cloud_id") or ""),
+                    str(metadata.get("issue_key") or ""),
+                    section_kind,
+                    str(
+                        metadata.get("event_id")
+                        or metadata.get("attachment_id")
+                        or metadata.get("locator")
+                        or metadata.get("source_id")
+                        or metadata.get("chunk_id")
+                        or ""
+                    ),
+                )
+            )
+            records.setdefault(identity, []).append(document)
+        ordered = sorted(
+            records.values(),
+            key=lambda group: (
+                str(group[0].metadata.get("issue_key") or ""),
+                str(group[0].metadata.get("event_date") or ""),
+                str(group[0].metadata.get("event_id") or ""),
+            ),
+        )
+        page = ordered[query.offset : query.offset + query.limit]
+        rows = tuple(_section_row(group, section_kind) for group in page)
+        evidence_groups = ordered if query.operation == StructuredOperation.SECTION_COUNT else page
+        evidence = tuple(
+            _envelope(self.name, self._project_id, group[0]) for group in evidence_groups
+        )
+        return StructuredResult(
+            operation=query.operation,
+            provider=self.name,
+            complete=complete,
+            snapshot_at=_snapshot_at(documents),
+            total=len(ordered),
+            rows=rows,
+            evidence=evidence,
+            degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
+        )
+
     async def health(self) -> bool:
         try:
             loader = getattr(self._retriever, "authorized_source_snapshot")
@@ -191,6 +257,19 @@ def _matches(document: Document, filters: dict[str, tuple[str, ...]]) -> bool:
     metadata = document.metadata
     for field, expected in filters.items():
         actual = _values(metadata.get(field))
+        if field == "status_category_key" and not actual:
+            normalized_status = _normalized(str(metadata.get("status") or ""))
+            legacy_category = {
+                "to do": "new",
+                "open": "new",
+                "in progress": "indeterminate",
+                "in review": "indeterminate",
+                "qa": "indeterminate",
+                "done": "done",
+                "closed": "done",
+                "resolved": "done",
+            }.get(normalized_status)
+            actual = (legacy_category,) if legacy_category else ()
         if not actual:
             scalar = str(metadata.get(field) or "").strip()
             actual = (scalar,) if scalar else ()
@@ -267,5 +346,29 @@ def _row(document: Document) -> dict[str, object]:
         "issue_type": str(metadata.get("issue_type") or ""),
         "priority": str(metadata.get("priority") or ""),
         "labels": _values(metadata.get("labels")),
+        "assignee": str(metadata.get("assignee") or ""),
+        "reporter": str(metadata.get("reporter") or ""),
+        "due_date": str(metadata.get("due_date") or ""),
+        "updated": str(metadata.get("issue_updated") or ""),
+        "url": str(metadata.get("source_url") or ""),
+    }
+
+
+def _section_row(documents: list[Document], section_kind: str) -> dict[str, object]:
+    ordered = sorted(documents, key=lambda item: int(item.metadata.get("chunk_ordinal") or 0))
+    metadata = ordered[0].metadata
+    parts = list(
+        dict.fromkeys(
+            document.page_content.strip() for document in ordered if document.page_content.strip()
+        )
+    )
+    return {
+        "key": str(metadata.get("issue_key") or ""),
+        "kind": section_kind,
+        "event_id": str(metadata.get("event_id") or metadata.get("attachment_id") or ""),
+        "event_date": str(metadata.get("event_date") or metadata.get("attachment_created") or ""),
+        "author": str(metadata.get("event_author") or metadata.get("attachment_author") or ""),
+        "title": str(metadata.get("title") or metadata.get("file_name") or ""),
+        "text": "\n".join(parts)[:4000],
         "url": str(metadata.get("source_url") or ""),
     }

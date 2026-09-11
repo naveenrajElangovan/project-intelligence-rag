@@ -78,12 +78,31 @@ The structured route supports:
 - exact counts;
 - complete lists;
 - distributions by status, issue type, or priority;
+- project-lead status reports backed by complete distributions;
+- exact issue details for a Jira key;
+- paged comments, changelog events, worklogs, attachments, relationships,
+  acceptance criteria, requirements, descriptions, custom fields, and remote
+  links;
+- exact section counts over a complete authorized snapshot;
 - exact filters for label, status, status category, resolution, issue type, and
   priority.
 
 The router recognizes English and Spanish aggregate language. Uppercase label
 tokens are treated generically, so the implementation is not tied to a Jira
 project key or to the POS and BOT examples.
+
+Common workflow phrases map to Jira's stable status categories. “In progress”
+and “en progreso” use `indeterminate`; “done,” “closed,” and their Spanish
+equivalents use `done`; “to do,” “pending,” “open,” and their Spanish
+equivalents use `new`. Explicit workflow states such as In Review, QA, and
+Blocked remain exact status filters. Legacy records without category metadata
+fall back to their exact status only for known category equivalents.
+
+Queries naming one Jira key and a section type bypass semantic top-K retrieval.
+The adapter groups split comment, changelog, and worklog chunks by stable event
+identity before counting or presenting them. This prevents a long comment split
+into two embedding windows from appearing as two comments. Section lists use a
+20-record page and preserve source links, authors, event dates, and identifiers.
 
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the
@@ -132,6 +151,14 @@ List results are numerically ordered by Jira key and returned in pages of 50.
 `resultPage` reports `start`, `end`, `returned`, `total`, and `hasMore`; sources
 contain only the displayed page. A complete scan can therefore remain exact
 without producing an unbounded chat response.
+
+The project-lead regression matrix lives in
+`tests/test_jira_project_lead_matrix.py`. It contains positive, negative,
+English, Spanish, single-provider, federated, disabled-provider, and
+conversation-follow-up cases. Run it together with
+`tests/test_provider_orchestration.py`, `tests/test_jira_conversation_suite.py`,
+and `tests/test_overloaded_record_clarification.py` before promoting routing
+changes.
 
 ## Authorization and collection safety
 

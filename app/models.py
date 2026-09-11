@@ -60,7 +60,9 @@ class StructuredConversationScope(BaseModel):
     provider: Literal["JIRA", "GITHUB", "CONFLUENCE"]
     resource_type: str = Field(default="ISSUE", alias="resourceType", max_length=40)
     filters: dict[str, tuple[str, ...]] = Field(default_factory=dict)
-    operation: Literal["COUNT", "LIST", "DISTRIBUTION"] = "COUNT"
+    operation: Literal["COUNT", "LIST", "DISTRIBUTION", "DETAIL", "SECTION", "SECTION_COUNT"] = (
+        "COUNT"
+    )
     group_by: str | None = Field(default=None, alias="groupBy", max_length=40)
     snapshot_at: str | None = Field(default=None, alias="snapshotAt", max_length=100)
     complete: bool = False
@@ -80,6 +82,8 @@ class StructuredConversationScope(BaseModel):
             "issue_type",
             "priority",
             "fixed",
+            "issue_key",
+            "section_kind",
         }
         if len(self.filters) > 8 or any(key not in allowed for key in self.filters):
             raise ValueError("structured Jira scope contains unsupported filters")

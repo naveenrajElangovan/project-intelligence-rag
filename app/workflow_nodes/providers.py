@@ -41,6 +41,24 @@ def _ticket_noun(total: int, language: str) -> str:
     return "Jira ticket" if total == 1 else "Jira tickets"
 
 
+def _section_label(kind: str | None, language: str) -> str:
+    normalized = str(kind or "section").upper()
+    if language == "es":
+        return {
+            "COMMENT": "comentarios",
+            "CHANGELOG": "eventos del historial",
+            "WORKLOG": "registros de trabajo",
+            "ATTACHMENT": "adjuntos",
+            "RELATIONSHIP": "relaciones",
+            "ACCEPTANCE": "criterios de aceptación",
+            "REQUIREMENTS": "requisitos",
+            "DESCRIPTION": "descripciones",
+            "CUSTOM_FIELD": "campos personalizados",
+            "REMOTE_LINK": "enlaces externos",
+        }.get(normalized, "secciones")
+    return normalized.replace("_", " ").lower() + " records"
+
+
 def _fixed_rule_text(rule: str | None, language: str) -> str:
     if not rule:
         return ""
@@ -292,6 +310,78 @@ class ProviderNodesMixin:
                 if language == "en"
                 else f"**{result.total} tickets de Jira**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\nDesglose por {query.group_by}:\n{buckets}{snapshot}"
             )
+        elif query.operation == StructuredOperation.DETAIL:
+            rows = result.rows
+            if not rows:
+                answer = (
+                    f"No matching Jira issue was found in **{self._request.project_id}**.{snapshot}"
+                    if language == "en"
+                    else f"No se encontró un issue de Jira coincidente en **{self._request.project_id}**.{snapshot}"
+                )
+            else:
+                rendered_details = []
+                for row in rows:
+                    labels = (
+                        ("Estado", "Tipo", "Prioridad", "Responsable", "Reportó", "Fecha límite")
+                        if language == "es"
+                        else ("Status", "Type", "Priority", "Assignee", "Reporter", "Due date")
+                    )
+                    fields = [
+                        f"**{labels[0]}:** {row['status']}",
+                        f"**{labels[1]}:** {row['issue_type']}",
+                        f"**{labels[2]}:** {row['priority']}",
+                    ]
+                    if row.get("assignee"):
+                        fields.append(f"**{labels[3]}:** {row['assignee']}")
+                    if row.get("reporter"):
+                        fields.append(f"**{labels[4]}:** {row['reporter']}")
+                    if row.get("due_date"):
+                        fields.append(f"**{labels[5]}:** {row['due_date']}")
+                    rendered_details.append(
+                        f"### {row['key']} — {row['summary']}\n"
+                        + "\n".join(f"- {field}" for field in fields)
+                    )
+                answer = "\n\n".join(rendered_details) + snapshot
+        elif query.operation == StructuredOperation.SECTION_COUNT:
+            section_kind = _section_label(query.section_kind, language)
+            answer = (
+                f"**{result.total} indexed Jira {section_kind}** match this authorized scope.{snapshot}"
+                if language == "en"
+                else f"**{result.total} {section_kind} indexados de Jira** coinciden con este alcance autorizado.{snapshot}"
+            )
+        elif query.operation == StructuredOperation.SECTION:
+            rows = result.rows
+            section_kind = _section_label(query.section_kind, language)
+            if not rows:
+                answer = (
+                    f"No indexed Jira {section_kind} match this authorized scope.{snapshot}"
+                    if language == "en"
+                    else f"No hay registros indexados de {section_kind} de Jira que coincidan con este alcance autorizado.{snapshot}"
+                )
+            else:
+                rendered_sections = []
+                for row in rows:
+                    heading_bits = [str(row["key"])]
+                    if row.get("event_id"):
+                        heading_bits.append(f"#{row['event_id']}")
+                    if row.get("author"):
+                        heading_bits.append(str(row["author"]))
+                    if row.get("event_date"):
+                        heading_bits.append(str(row["event_date"]))
+                    body = str(row.get("text") or "").strip()
+                    rendered_sections.append(
+                        f"- **{' · '.join(heading_bits)}**\n  {body}"
+                        if body
+                        else f"- **{' · '.join(heading_bits)}**"
+                    )
+                start = query.offset + 1
+                end = query.offset + len(rows)
+                page_text = (
+                    f"Showing **{start}–{end} of {result.total}** indexed {section_kind}."
+                    if language == "en"
+                    else f"Mostrando **{start}–{end} de {result.total}** registros indexados de {section_kind}."
+                )
+                answer = "\n".join(rendered_sections) + f"\n\n{page_text}{snapshot}"
         else:
             rows = result.rows[: self._settings.provider_max_list_items]
             rendered = "\n".join(
@@ -329,7 +419,11 @@ class ProviderNodesMixin:
             )
             for item in result.evidence
         ]
-        returned = len(result.rows) if query.operation == StructuredOperation.LIST else 0
+        returned = (
+            len(result.rows)
+            if query.operation in {StructuredOperation.LIST, StructuredOperation.SECTION}
+            else 0
+        )
         end = query.offset + returned
         subject = _active_subject(query.filters, result.applied_filter_rule)
         context_update = ConversationContextUpdate(
@@ -354,7 +448,7 @@ class ProviderNodesMixin:
             ),
         )
         result_page = None
-        if query.operation == StructuredOperation.LIST:
+        if query.operation in {StructuredOperation.LIST, StructuredOperation.SECTION}:
             result_page = ResultPage(
                 start=query.offset + 1 if returned else min(query.offset, result.total),
                 end=end,
