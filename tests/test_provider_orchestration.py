@@ -206,20 +206,28 @@ def test_complete_jira_overview_summarizes_current_metadata_and_hierarchy() -> N
 
 
 def test_pending_topic_query_uses_complete_current_inventory() -> None:
-    todo = _issue("jira:c:T0-1:CURRENT", "T0-1", "Print receipt QA", "printing", "To Do")
-    review = _issue(
-        "jira:c:T0-2:CURRENT", "T0-2", "Printing workflow", "printing", "In Review"
+    todo = _issue(
+        "jira:c:T0-1:CURRENT", "T0-1", "Print receipt QA / Impresión QA", "printing", "To Do"
     )
-    done = _issue("jira:c:T0-3:CURRENT", "T0-3", "Print complete", "printing", "Done")
+    review = _issue(
+        "jira:c:T0-2:CURRENT", "T0-2", "Printing workflow / Flujo de impresión", "printing", "In Review"
+    )
+    done = _issue(
+        "jira:c:T0-3:CURRENT", "T0-3", "Print complete / Impresión completa", "printing", "Done"
+    )
     unrelated = _issue("jira:c:T0-4:CURRENT", "T0-4", "Payments", "payments", "To Do")
+    alias_only = _issue(
+        "jira:c:T0-5:CURRENT", "T0-5", "Receipt layout", "printing", "In Review"
+    )
     todo.metadata["status_category_key"] = "new"
     review.metadata["status_category_key"] = "indeterminate"
     done.metadata["status_category_key"] = "done"
     unrelated.metadata["status_category_key"] = "new"
+    alias_only.metadata["status_category_key"] = "indeterminate"
 
     class Retriever:
         async def authorized_source_snapshot(self, source_types):
-            return (todo, review, done, unrelated), True
+            return (todo, review, done, unrelated, alias_only), True
 
     selection = select_providers(
         "Do we have anything pending to implement for printing the tickets?",
@@ -235,7 +243,18 @@ def test_pending_topic_query_uses_complete_current_inventory() -> None:
         "status_category_key": ("new", "indeterminate"),
         "topic": ("printing",),
     }
-    assert [row["key"] for row in result.rows] == ["T0-1", "T0-2"]
+    assert [row["key"] for row in result.rows] == ["T0-1", "T0-2", "T0-5"]
+
+    spanish = select_providers(
+        "¿Hay algo pendiente por implementar para impresión de tickets?",
+        (ProviderName.JIRA,),
+    )
+    spanish_result = asyncio.run(
+        IndexedProviderAdapter(ProviderName.JIRA, "T2.0", Retriever()).aggregate(
+            spanish.structured_query
+        )
+    )
+    assert [row["key"] for row in spanish_result.rows] == ["T0-1", "T0-2", "T0-5"]
 
 
 def test_ticket_count_uses_structured_jira_route_without_repeating_provider_name() -> None:

@@ -142,6 +142,13 @@ category. The same operation works for other observed topics and Spanish
 wording. It does not infer completion from semantic similarity or from a
 previous descriptive answer.
 
+When a bilingual summary term matches only part of a labeled topic population,
+the adapter can expand it to an observed label using corpus co-occurrence. The
+expansion requires repeated title evidence, excludes near-global labels, and
+requires one label to score clearly above alternatives. This lets terms such as
+a Spanish summary word reach the same label-backed population as its English
+counterpart without a model-generated translation or a hardcoded project term.
+
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the
 cloud-qualified stable Jira source identity. Changelog and comment chunks can

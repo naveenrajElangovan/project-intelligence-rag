@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections import Counter
 
 from langchain_core.documents import Document
 
@@ -133,6 +134,7 @@ class IndexedProviderAdapter(ProviderAdapter):
         effective_filters, fixed_rule, clarification_options = _resolve_fixed_filter(
             current, query.filters
         )
+        effective_filters = _resolve_topic_filter(current, effective_filters)
         if clarification_options:
             return StructuredResult(
                 operation=query.operation,
@@ -378,6 +380,11 @@ def _matches(document: Document, filters: dict[str, tuple[str, ...]]) -> bool:
             if not all(_normalized(value) in haystack for value in expected):
                 return False
             continue
+        if field == "topic_alias_label":
+            labels = {value.casefold() for value in _values(metadata.get("labels"))}
+            if not any(value.casefold() in labels for value in expected):
+                return False
+            continue
         actual = _values(metadata.get(field))
         if field == "status_category_key" and not actual:
             normalized_status = _normalized(str(metadata.get("status") or ""))
@@ -407,6 +414,60 @@ def _normalized(value: str) -> str:
         for character in unicodedata.normalize("NFKD", value).casefold()
         if not unicodedata.combining(character)
     )
+
+
+def _resolve_topic_filter(
+    documents: list[Document], filters: dict[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    topics = tuple(filters.get("topic", ()))
+    if not topics or not documents:
+        return filters
+    normalized_topics = tuple(_normalized(value) for value in topics)
+    direct_count = sum(
+        all(
+            topic
+            in _normalized(
+                " ".join(
+                    (
+                        str(document.metadata.get("title") or ""),
+                        " ".join(_values(document.metadata.get("labels"))),
+                        " ".join(_values(document.metadata.get("components"))),
+                    )
+                )
+            )
+            for topic in normalized_topics
+        )
+        for document in documents
+    )
+    label_frequency = Counter(
+        label
+        for document in documents
+        for label in _values(document.metadata.get("labels"))
+    )
+    cooccurrence = Counter(
+        label
+        for document in documents
+        if all(topic in _normalized(str(document.metadata.get("title") or "")) for topic in normalized_topics)
+        for label in _values(document.metadata.get("labels"))
+    )
+    candidates = sorted(
+        (
+            (count / (label_frequency[label] ** 0.5), count, label_frequency[label], label)
+            for label, count in cooccurrence.items()
+            if count >= 2 and label_frequency[label] <= max(3, int(len(documents) * 0.8))
+        ),
+        reverse=True,
+    )
+    if not candidates:
+        return filters
+    best_score, _mentions, population, label = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    if population <= direct_count or (second_score and best_score < second_score * 1.5):
+        return filters
+    resolved = dict(filters)
+    resolved.pop("topic", None)
+    resolved["topic_alias_label"] = (label,)
+    return resolved
 
 
 def _resolve_fixed_filter(
