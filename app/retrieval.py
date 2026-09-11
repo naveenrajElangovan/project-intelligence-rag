@@ -690,6 +690,18 @@ class ChromaAccessRetriever(BaseRetriever):
 
         return await asyncio.to_thread(self._rare_query_terms, query, source_types)
 
+    async def authorized_source_snapshot(
+        self, source_types: tuple[str, ...]
+    ) -> tuple[tuple[Document, ...], bool]:
+        """Return the complete cached corpus boundary used for exact aggregates.
+
+        The boolean is authoritative. Callers must not represent totals as exact
+        when the configured corpus ceiling truncated the scan.
+        """
+
+        cached = await asyncio.to_thread(self._cached_authorized_corpus, source_types)
+        return tuple(_clone_document(document) for document in cached.documents), not cached.truncated
+
     async def ainvoke_source_siblings(
         self, source_ids: tuple[str, ...], source_types: tuple[str, ...] = ()
     ) -> list[Document]:
@@ -1072,6 +1084,11 @@ class ChromaAccessRetriever(BaseRetriever):
             self.project_id,
             visible_policies,
             tuple(sorted(source_types)),
+            # Schema and embedding requirements are part of the authorized
+            # corpus view. Without them, an incompatible request can cache an
+            # empty corpus that is later reused by a compatible request.
+            self.required_schema_version,
+            self.required_embedding_model,
         )
         now = time.monotonic()
         cached: _FallbackCorpus | None = None

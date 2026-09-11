@@ -6,6 +6,8 @@ from langchain_core.documents import Document
 
 from app.llm import GroundedAnswer
 from app.models import RagRequest, ResolvedRequest
+from app.providers.contracts import ProviderSelection
+from app.models import RagResponse
 
 class RagState(TypedDict, total=False):
     _workflow: object
@@ -70,3 +72,5 @@ class RagState(TypedDict, total=False):
     entity_mismatch_requested: str
     entity_mismatch_suggested: str
     uncertain_entity_token: str
+    provider_selection: ProviderSelection
+    provider_response: RagResponse

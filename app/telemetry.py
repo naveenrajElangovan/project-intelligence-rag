@@ -118,6 +118,25 @@ _LEXICAL_CACHE_ENTRIES = Gauge(
     "pi_rag_lexical_cache_entries",
     "Bounded authorized lexical corpus cache entries.",
 )
+_PROVIDER_OPERATIONS = Counter(
+    "pi_rag_provider_operations_total",
+    "Provider operations by completion outcome.",
+    ("provider", "operation", "outcome"),
+)
+_PROVIDER_ITEMS = Histogram(
+    "pi_rag_provider_items",
+    "Items returned by complete provider operations.",
+    ("provider", "operation"),
+    buckets=(0, 1, 5, 10, 25, 50, 100, 200, 500, 1000),
+)
+
+
+def provider_operation(
+    provider: str, operation: str, outcome: str, items: int, complete: bool
+) -> None:
+    _PROVIDER_OPERATIONS.labels(provider, operation, outcome).inc()
+    if complete:
+        _PROVIDER_ITEMS.labels(provider, operation).observe(max(0, items))
 
 
 def configure_telemetry_logging(level: str = "INFO") -> None:

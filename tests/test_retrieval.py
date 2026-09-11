@@ -4,6 +4,7 @@ from langchain_core.documents import Document
 from app.retrieval import (
     ChromaAccessRetriever,
     _FallbackCorpus,
+    _FALLBACK_CORPUS_CACHE,
     _lexical_index,
     _rank_cached_corpus,
     document_visible_policies,
@@ -91,6 +92,39 @@ class FakeIndex:
     def query(self, **kwargs):
         self.query_args = kwargs
         return _query_result()
+
+
+class SchemaThreeIndex(FakeIndex):
+    def get(self, **kwargs):
+        if kwargs.get("offset", 0):
+            return {"ids": [], "documents": [], "metadatas": []}
+        return {
+            "ids": ["jira-current"],
+            "documents": ["Current Jira issue"],
+            "metadatas": [{
+                "project_id": "DEMO",
+                "access_policy_id": "project:DEMO",
+                "schema_version": "3",
+                "embedding_model": "multilingual-e5-large",
+                "source_type": "ISSUE",
+                "jira_chunk_kind": "CURRENT",
+            }],
+        }
+
+
+def test_authorized_corpus_cache_isolated_by_schema_and_embedding() -> None:
+    _FALLBACK_CORPUS_CACHE.clear()
+    common = dict(
+        index=SchemaThreeIndex(), collection_name="collection", embedder=FakeEmbedder(),
+        project_id="DEMO", access_policy_ids=("project:DEMO",),
+        required_embedding_model="multilingual-e5-large",
+    )
+    incompatible = ChromaAccessRetriever(**common, required_schema_version="4")
+    compatible = ChromaAccessRetriever(**common, required_schema_version="3")
+
+    assert incompatible._cached_authorized_corpus(("ISSUE",)).documents == ()
+    assert len(compatible._cached_authorized_corpus(("ISSUE",)).documents) == 1
+    _FALLBACK_CORPUS_CACHE.clear()
 
 
 class VocabularyIndex(FakeIndex):

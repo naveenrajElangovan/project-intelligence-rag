@@ -25,13 +25,24 @@ def compiled_workflow_graph() -> Any:
 
     graph = StateGraph(RagState)
     for name in (
+        "provider_plan", "provider_execute", "provider_unavailable",
         "plan_queries", "retrieve", "feature_affinity", "rerank",
         "validate_evidence_completeness", "recover_query", "generate",
         "validate_citations", "validate_completeness", "repair_completeness",
         "verify_grounding",
     ):
         graph.add_node(name, _node(f"_{name}"))
-    graph.add_edge(START, "plan_queries")
+    graph.add_edge(START, "provider_plan")
+    graph.add_conditional_edges(
+        "provider_plan", _route("_route_after_provider_plan"),
+        {
+            "structured": "provider_execute",
+            "unavailable": "provider_unavailable",
+            "legacy": "plan_queries",
+        },
+    )
+    graph.add_edge("provider_execute", END)
+    graph.add_edge("provider_unavailable", END)
     graph.add_edge("plan_queries", "retrieve")
     graph.add_edge("retrieve", "feature_affinity")
     graph.add_edge("feature_affinity", "rerank")

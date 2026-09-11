@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     supported_embedding_models: tuple[str, ...] = ("multilingual-e5-large",)
     supported_schema_versions: tuple[str, ...] = ("4", "3")
     llm_provider: str = "ollama"
+    model_gateway: Literal["native", "litellm"] = "litellm"
+    litellm_fallbacks_enabled: bool = True
+    litellm_routing_strategy: Literal[
+        "simple-shuffle", "least-busy", "latency-based-routing"
+    ] = "latency-based-routing"
     ollama_base_url: str = "http://host.docker.internal:11434"
     ollama_model: str = "qwen3.5:latest"
     # Defaults to the generator on purpose. Ollama holds one model resident per
@@ -77,6 +82,14 @@ class Settings(BaseSettings):
     local_max_concurrency: int = 1
     generated_refusals_enabled: bool = False
     max_inflight_requests: int = 4
+    provider_router_enabled: bool = True
+    provider_federation_enabled: bool = True
+    structured_jira_enabled: bool = True
+    enabled_providers: tuple[Literal["JIRA", "GITHUB", "CONFLUENCE"], ...] = (
+        "JIRA", "GITHUB", "CONFLUENCE"
+    )
+    provider_timeout_seconds: float = 20.0
+    provider_max_list_items: int = 200
     admission_capacity_override: int | None = None
     load_shed_wait_seconds: float = 0.05
     openai_api_key: str = ""
@@ -331,6 +344,12 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_LOCAL_ACCELERATOR_RETRY_ATTEMPTS must be between 1 and 3")
         if not 1 <= self.accelerator_max_concurrency <= 8:
             raise ValueError("PI_RAG_ACCELERATOR_MAX_CONCURRENCY must be between 1 and 8")
+        if not self.enabled_providers or len(set(self.enabled_providers)) != len(self.enabled_providers):
+            raise ValueError("PI_RAG_ENABLED_PROVIDERS must contain unique provider names")
+        if not 0.1 <= self.provider_timeout_seconds <= 120:
+            raise ValueError("PI_RAG_PROVIDER_TIMEOUT_SECONDS must be between 0.1 and 120")
+        if not 1 <= self.provider_max_list_items <= 500:
+            raise ValueError("PI_RAG_PROVIDER_MAX_LIST_ITEMS must be between 1 and 500")
         if not 0 <= self.max_answer_repairs <= 3:
             raise ValueError("PI_RAG_MAX_ANSWER_REPAIRS must be between 0 and 3")
         if self.request_timeout_seconds <= self.llm_stream_total_timeout_seconds:

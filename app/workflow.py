@@ -110,6 +110,7 @@ from app.workflow_support.presentation import (
 )
 from app.workflow_nodes.answering import AnswerNodesMixin
 from app.workflow_nodes.planning import PlanningNodesMixin
+from app.workflow_nodes.providers import ProviderNodesMixin
 from app.workflow_nodes.retrieval import RetrievalNodesMixin
 from app.workflow_nodes.state import RagState
 from app.workflow_support.conversation import (
@@ -122,8 +123,7 @@ from app.workflow_support.conversation import (
 )
 from app.workflow_support.fail_closed import apply_output_gate, clarification_response, resolved_request_for_state
 from app.workflow_evaluation import EvaluationWorkflowMixin
-
-class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
+class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
     """Bounded graph whose authorization inputs are immutable and never LLM-generated."""
     def __init__(self, settings: Settings, request: RagRequest) -> None:
         if request.retrieval_profile is not None:
@@ -163,6 +163,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
             vocabulary_cache_ttl_seconds=settings.vocabulary_cache_ttl_seconds,
             embedder=build_embedder(settings),
         )
+        self._provider_registry = self._create_provider_registry()
         vocabulary_loader = getattr(self._retriever, "corpus_vocabulary", None)
         self._vocabulary = (
             vocabulary_loader() if vocabulary_loader is not None else CorpusVocabulary()
@@ -248,6 +249,17 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, PlanningNodesMixin, Retriev
 
     async def _response_from_state(self, state: RagState, began: float) -> RagResponse:
         """Convert final graph state into an audited public response."""
+        provider_response = state.get("provider_response")
+        if provider_response is not None:
+            request_complete(
+                began=began,
+                outcome="ANSWERED" if provider_response.status == "ANSWERED" else "NO_ANSWER",
+                confidence=provider_response.confidence,
+                model_profile=self._request.model_profile,
+                language="es" if provider_response.answer.startswith("Jira tiene") else "en",
+                reason_code=provider_response.failure_reason or provider_response.resolved_intent,
+            )
+            return provider_response
         documents = state.get("documents", [])
         from app.quality_tracing import record_selected_evidence
 

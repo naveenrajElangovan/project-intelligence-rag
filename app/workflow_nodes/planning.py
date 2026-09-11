@@ -206,6 +206,35 @@ class PlanningNodesMixin:
     async def _plan_queries(self, state: RagState) -> RagState:
         planned = await self._plan_queries_core(state)
         source_types = planned.get("source_types", ())
+        selection = state.get("provider_selection")
+        if selection and selection.mode in {"SINGLE_PROVIDER", "FEDERATED"}:
+            provider_types = {
+                "JIRA": ("ISSUE", "ATTACHMENT"),
+                "GITHUB": ("CODE",),
+                "CONFLUENCE": ("PAGE", "ATTACHMENT"),
+            }
+            selected_types = tuple(dict.fromkeys(
+                source_type
+                for provider in selection.providers
+                for source_type in provider_types[provider.value]
+            ))
+            source_types = tuple(
+                value for value in source_types if value in selected_types
+            ) or selected_types
+            planned["source_types"] = source_types
+        elif selection and {provider.value for provider in selection.available_providers} != {
+            "JIRA", "GITHUB", "CONFLUENCE"
+        }:
+            provider_types = {
+                "JIRA": ("ISSUE",), "GITHUB": ("CODE",), "CONFLUENCE": ("PAGE",)
+            }
+            enabled_types = tuple(dict.fromkeys(
+                source_type
+                for provider in selection.available_providers
+                for source_type in provider_types[provider.value]
+            ))
+            source_types = tuple(value for value in source_types if value in enabled_types) or enabled_types
+            planned["source_types"] = source_types
         if planned.get("query_intent") == "DELIVERY" and re.search(
             r"\b(?:attachments?|attached|adjuntos?|adjuntad[oa]s?|anexos?)\b",
             planned.get("resolved_question", self._request.question), re.I,

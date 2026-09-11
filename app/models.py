@@ -135,6 +135,9 @@ class RagRequest(BaseModel):
     )
     retrieval_profile: RetrievalProfile | None = Field(default=None, alias="retrievalProfile")
     catalog_releases_enabled: bool = Field(default=False, alias="catalogReleasesEnabled")
+    enabled_providers: list[Literal["JIRA", "GITHUB", "CONFLUENCE"]] | None = Field(
+        default=None, alias="enabledProviders", max_length=3
+    )
     conversation_history: list[ConversationMessage] = Field(
         default_factory=list, alias="conversationHistory", max_length=12
     )

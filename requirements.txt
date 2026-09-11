@@ -4,6 +4,8 @@ langchain-core==1.5.5
 langchain-ollama==1.1.0
 langchain-openai==1.5.1
 langgraph==1.2.11
+langchain-litellm==0.6.6
+litellm==1.100.0
 chromadb-client==1.5.2
 openinference-instrumentation-langchain==0.1.73
 opentelemetry-exporter-otlp-proto-http==1.44.0

@@ -1357,6 +1357,19 @@ def _chat_model(
     selected_temperature = (
         settings.factual_temperature if temperature is None else temperature
     )
+    if settings.model_gateway == "litellm" and not (
+        settings.llm_provider == "azure-openai"
+        and settings.azure_openai_use_managed_identity
+        and not settings.azure_openai_api_key
+    ):
+        from app.model_gateway import build_litellm_chat_model
+
+        return build_litellm_chat_model(
+            settings,
+            model_profile,
+            task=task,
+            temperature=selected_temperature,
+        )
     if settings.llm_provider == "ollama":
         if not settings.local_inference_enabled:
             raise ValueError("Local inference is disabled by PI_RAG_LOCAL_INFERENCE_ENABLED.")
