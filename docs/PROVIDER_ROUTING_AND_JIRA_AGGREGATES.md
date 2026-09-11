@@ -91,12 +91,14 @@ The router recognizes English and Spanish aggregate language. Uppercase label
 tokens are treated generically, so the implementation is not tied to a Jira
 project key or to the POS and BOT examples.
 
-Common workflow phrases map to Jira's stable status categories. “In progress”
-and “en progreso” use `indeterminate`; “done,” “closed,” and their Spanish
-equivalents use `done`; “to do,” “pending,” “open,” and their Spanish
-equivalents use `new`. Explicit workflow states such as In Review, QA, and
-Blocked remain exact status filters. Legacy records without category metadata
-fall back to their exact status only for known category equivalents.
+“In progress” and “en progreso” select the exact `In Progress` workflow status,
+so review and QA records are not mixed into a project lead's active-work list.
+Broader “active” language uses Jira's stable `indeterminate` status category.
+“Done,” “closed,” and their Spanish equivalents use `done`; “to do,” “pending,”
+“open,” and their Spanish equivalents use `new`. Explicit workflow states such
+as In Review, QA, and Blocked remain exact status filters. Legacy records
+without category metadata fall back to their exact status only for known
+category equivalents.
 
 Queries naming one Jira key and a section type bypass semantic top-K retrieval.
 The adapter groups split comment, changelog, and worklog chunks by stable event
