@@ -149,6 +149,13 @@ requires one label to score clearly above alternatives. This lets terms such as
 a Spanish summary word reach the same label-backed population as its English
 counterpart without a model-generated translation or a hardcoded project term.
 
+After an exact-ticket section request, a completion follow-up such as “is it
+completed?” or “¿está completado?” retains the issue key, discards the
+historical section filter, and reads the current Jira record. Completion is
+determined from Jira's stable `done` status category, with a legacy status-name
+fallback only for snapshots that predate status-category metadata. The answer
+cites the current issue record rather than changelog text.
+
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the
 cloud-qualified stable Jira source identity. Changelog and comment chunks can

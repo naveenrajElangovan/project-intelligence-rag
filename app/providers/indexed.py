@@ -118,6 +118,7 @@ class IndexedProviderAdapter(ProviderAdapter):
         source_types = (
             ("ISSUE", "ATTACHMENT")
             if query.operation in {StructuredOperation.OVERVIEW, StructuredOperation.DETAIL}
+            and query.requested_fact != "COMPLETION"
             else ("ISSUE",)
         )
         documents, complete = await loader(source_types)
@@ -186,6 +187,20 @@ class IndexedProviderAdapter(ProviderAdapter):
                 degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
             )
         if query.operation == StructuredOperation.DETAIL:
+            if query.requested_fact == "COMPLETION":
+                return StructuredResult(
+                    operation=query.operation,
+                    provider=self.name,
+                    complete=complete,
+                    snapshot_at=_snapshot_at(current),
+                    total=len(ordered),
+                    rows=tuple(_row(document) for document in ordered),
+                    evidence=tuple(
+                        _envelope(self.name, self._project_id, document)
+                        for document in ordered
+                    ),
+                    degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
+                )
             requested_keys = {
                 value.upper() for value in effective_filters.get("issue_key", ())
             }

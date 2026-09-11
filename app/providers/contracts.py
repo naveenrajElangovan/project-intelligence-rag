@@ -56,6 +56,7 @@ class StructuredQuery(BaseModel):
     filters: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     group_by: str | None = None
     section_kind: str | None = None
+    requested_fact: str | None = Field(default=None, max_length=40)
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=50, ge=1, le=500)
 

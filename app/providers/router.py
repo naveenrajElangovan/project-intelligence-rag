@@ -68,6 +68,13 @@ _PENDING_WORK = re.compile(
     r"outstanding work|hay algo pendiente|trabajo pendiente|falta por implementar|qu[eé] falta)\b",
     re.I,
 )
+_COMPLETION_CHECK = re.compile(
+    r"\b(?:is|was)\s+(?:it|this|that|the\s+(?:ticket|issue|work\s+item))\s+"
+    r"(?:done|complete|completed|closed|resolved)\b|"
+    r"\b(?:est[aá]|qued[oó])\s+(?:completad[oa]|terminad[oa]|cerrad[oa]|resuelt[oa])\b|"
+    r"\b(?:ya\s+)?(?:se\s+)?(?:complet[oó]|termin[oó]|cerr[oó]|resolvi[oó])\b",
+    re.I,
+)
 _TOPIC_STOP_WORDS = {
     "all", "and", "anything", "are", "do", "does", "for", "from", "have", "has", "in",
     "implement", "implementation", "is", "issue", "issues", "jira", "left", "of", "outstanding",
@@ -234,6 +241,7 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
             filters={"issue_key": keys},
+            requested_fact="COMPLETION" if _COMPLETION_CHECK.search(question) else None,
         )
     filters = _jira_filters(question)
     pending_work = bool(_PENDING_WORK.search(question))
@@ -359,6 +367,7 @@ def _jira_structured_followup(
     operation = StructuredOperation(scope.operation)
     group_by = scope.group_by
     section_kind = None
+    requested_fact = None
     offset = 0
     labels = tuple(
         dict.fromkeys(
@@ -375,6 +384,13 @@ def _jira_structured_followup(
         )
         offset = scope.next_offset
         section_kind = filters.get("section_kind", (None,))[0]
+    elif _COMPLETION_CHECK.search(question):
+        issue_keys = filters.get("issue_key", ())
+        if len(issue_keys) != 1:
+            return None
+        filters = {"issue_key": issue_keys}
+        operation = StructuredOperation.DETAIL
+        requested_fact = "COMPLETION"
     elif candidate := _jira_structured_query(question, assume_jira=True):
         operation = candidate.operation
         group_by = candidate.group_by
@@ -424,6 +440,7 @@ def _jira_structured_followup(
         filters=filters,
         group_by=group_by,
         section_kind=section_kind,
+        requested_fact=requested_fact,
         offset=offset,
         limit=scope.page_size,
     )

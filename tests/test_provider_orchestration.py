@@ -275,6 +275,36 @@ def test_status_followup_keeps_jira_scope_and_uses_stable_status_category() -> N
     assert selection.structured_query.filters == {"status": ("In Progress",)}
 
 
+def test_completion_followup_after_issue_history_reads_current_issue_state() -> None:
+    scope = _scope(
+        filters={"issue_key": ("T0-122",), "section_kind": ("CHANGELOG",)},
+        operation="SECTION",
+    )
+
+    selection = select_providers("is it completed?", ENABLED, scope)
+
+    assert selection.mode == ExecutionMode.STRUCTURED
+    assert selection.reason == "JIRA_STRUCTURED_CONTEXT_INHERITED"
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.DETAIL
+    assert selection.structured_query.filters == {"issue_key": ("T0-122",)}
+    assert selection.structured_query.requested_fact == "COMPLETION"
+
+
+def test_spanish_completion_followup_after_issue_history_is_structured() -> None:
+    scope = _scope(
+        filters={"issue_key": ("T0-122",), "section_kind": ("CHANGELOG",)},
+        operation="SECTION",
+    )
+
+    selection = select_providers("¿está completado?", ENABLED, scope)
+
+    assert selection.mode == ExecutionMode.STRUCTURED
+    assert selection.structured_query is not None
+    assert selection.structured_query.filters == {"issue_key": ("T0-122",)}
+    assert selection.structured_query.requested_fact == "COMPLETION"
+
+
 def test_spanish_status_followup_is_structured() -> None:
     selection = select_providers("¿cuáles están en progreso?", ENABLED, _scope())
 

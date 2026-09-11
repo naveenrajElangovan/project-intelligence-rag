@@ -378,6 +378,25 @@ class ProviderNodesMixin:
                     if language == "en"
                     else f"No se encontró un issue de Jira coincidente en **{self._request.project_id}**.{snapshot}"
                 )
+            elif query.requested_fact == "COMPLETION":
+                row = parent_rows[0]
+                category = str(row.get("status_category_key") or "").casefold()
+                status = str(row.get("status") or "")
+                legacy_done = status.casefold() in {"done", "closed", "resolved"}
+                completed = category == "done" or (not category and legacy_done)
+                key = str(row.get("key") or "")
+                if language == "es":
+                    answer = (
+                        f"**Sí. {key} está completado.** Su estado actual en Jira es **{status}**."
+                        if completed
+                        else f"**No. {key} no está completado.** Su estado actual en Jira es **{status}**."
+                    ) + snapshot
+                else:
+                    answer = (
+                        f"**Yes. {key} is complete.** Its current Jira status is **{status}**."
+                        if completed
+                        else f"**No. {key} is not complete.** Its current Jira status is **{status}**."
+                    ) + snapshot
             else:
                 rendered_details = []
                 for row in parent_rows:
