@@ -365,6 +365,19 @@ class IndexedProviderAdapter(ProviderAdapter):
 def _matches(document: Document, filters: dict[str, tuple[str, ...]]) -> bool:
     metadata = document.metadata
     for field, expected in filters.items():
+        if field == "topic":
+            haystack = _normalized(
+                " ".join(
+                    (
+                        str(metadata.get("title") or ""),
+                        " ".join(_values(metadata.get("labels"))),
+                        " ".join(_values(metadata.get("components"))),
+                    )
+                )
+            )
+            if not all(_normalized(value) in haystack for value in expected):
+                return False
+            continue
         actual = _values(metadata.get(field))
         if field == "status_category_key" and not actual:
             normalized_status = _normalized(str(metadata.get("status") or ""))

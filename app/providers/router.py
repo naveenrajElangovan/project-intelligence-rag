@@ -63,6 +63,18 @@ _CHILDREN = re.compile(
     r"elementos? de trabajo secundarios?|issues? hijos?|hijos?|subtareas?)\b",
     re.I,
 )
+_PENDING_WORK = re.compile(
+    r"\b(?:anything pending|pending (?:work|implementation)|remaining work|left to implement|"
+    r"outstanding work|hay algo pendiente|trabajo pendiente|falta por implementar|qu[eé] falta)\b",
+    re.I,
+)
+_TOPIC_STOP_WORDS = {
+    "all", "and", "anything", "are", "do", "does", "for", "from", "have", "has", "in",
+    "implement", "implementation", "is", "issue", "issues", "jira", "left", "of", "outstanding",
+    "pending", "remaining", "the", "ticket", "tickets", "to", "what", "which", "work",
+    "algo", "de", "del", "el", "en", "esta", "estan", "falta", "hay", "implementar", "jira",
+    "la", "las", "los", "para", "pendiente", "pendientes", "por", "que", "qué", "se", "trabajo",
+}
 _SECTION_PATTERNS = (
     ("COMMENT", re.compile(r"\b(?:comments?|commented|comentarios?|coment[oó])\b", re.I)),
     (
@@ -224,6 +236,12 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             filters={"issue_key": keys},
         )
     filters = _jira_filters(question)
+    pending_work = bool(_PENDING_WORK.search(question))
+    if pending_work:
+        filters["status_category_key"] = ("new", "indeterminate")
+        topic = _topic_terms(question)
+        if topic:
+            filters["topic"] = topic
     operation = (
         StructuredOperation.OVERVIEW
         if _OVERVIEW.search(question)
@@ -231,6 +249,8 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
         if _DISTRIBUTION.search(question) or _REPORT.search(question)
         else StructuredOperation.COUNT
         if _COUNT.search(question)
+        else StructuredOperation.LIST
+        if pending_work
         else StructuredOperation.LIST
         if _LIST.search(question)
         and (re.search(r"\b(?:all|todos?|todas?)\b", question, re.I) or bool(filters))
@@ -255,6 +275,13 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
         filters=filters,
         group_by=group_by,
     )
+
+
+def _topic_terms(question: str) -> tuple[str, ...]:
+    words = re.findall(r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9_-]*", question.casefold())
+    return tuple(
+        dict.fromkeys(word for word in words if len(word) >= 3 and word not in _TOPIC_STOP_WORDS)
+    )[:5]
 
 
 def _jira_filters(question: str) -> dict[str, tuple[str, ...]]:

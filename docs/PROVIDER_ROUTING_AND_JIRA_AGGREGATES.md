@@ -90,6 +90,9 @@ The structured route supports:
 - exact section counts over a complete authorized snapshot;
 - exact filters for label, status, status category, resolution, issue type, and
   priority.
+- pending-work queries for an observed topic, matched against current summaries,
+  labels, and components and restricted to Jira's `new` and `indeterminate`
+  status categories.
 
 The router recognizes English and Spanish aggregate language. Uppercase label
 tokens are treated generically, so the implementation is not tied to a Jira
@@ -131,6 +134,13 @@ handle complete inventories and exact facts; other Jira questions remain
 scoped to Jira evidence in the established semantic RAG path. This provides a
 generic fallback for natural-language questions without allowing another
 provider to fill missing Jira evidence.
+
+For questions such as “Is anything pending to implement for printing?” the
+router extracts the topic generically, scans the complete authorized current
+issue inventory, and returns matching work that is not yet in Jira's Done
+category. The same operation works for other observed topics and Spanish
+wording. It does not infer completion from semantic similarity or from a
+previous descriptive answer.
 
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the

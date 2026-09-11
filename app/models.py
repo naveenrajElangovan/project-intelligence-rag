@@ -84,6 +84,7 @@ class StructuredConversationScope(BaseModel):
             "fixed",
             "issue_key",
             "section_kind",
+            "topic",
         }
         if len(self.filters) > 8 or any(key not in allowed for key in self.filters):
             raise ValueError("structured Jira scope contains unsupported filters")

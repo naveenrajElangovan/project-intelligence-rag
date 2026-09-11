@@ -28,11 +28,27 @@ def _language(question: str) -> str:
 
 
 def _filter_summary(filters: dict[str, tuple[str, ...]], language: str) -> str:
-    values = [value for key, group in filters.items() if key != "fixed" for value in group]
-    if not values:
+    remaining = {key: values for key, values in filters.items() if key != "fixed"}
+    clauses: list[str] = []
+    topics = remaining.pop("topic", ())
+    if topics:
+        joined_topics = ", ".join(f"**{value}**" for value in topics)
+        clauses.append(f"sobre {joined_topics}" if language == "es" else f"about {joined_topics}")
+    categories = remaining.get("status_category_key", ())
+    if set(categories) == {"new", "indeterminate"}:
+        remaining.pop("status_category_key")
+        clauses.append(
+            "que aún no están en la categoría Done de Jira"
+            if language == "es"
+            else "that are not yet in Jira's Done status category"
+        )
+    values = [value for group in remaining.values() for value in group]
+    if values:
+        joined = ", ".join(f"**{value}**" for value in values)
+        clauses.append(f"que coinciden con {joined}" if language == "es" else f"matching {joined}")
+    if not clauses:
         return ""
-    joined = ", ".join(f"**{value}**" for value in values)
-    return f" matching {joined}" if language == "en" else f" que coinciden con {joined}"
+    return " " + " ".join(clauses)
 
 
 def _ticket_noun(total: int, language: str) -> str:

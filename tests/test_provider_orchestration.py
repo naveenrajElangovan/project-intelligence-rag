@@ -205,6 +205,39 @@ def test_complete_jira_overview_summarizes_current_metadata_and_hierarchy() -> N
     assert result.rows[0]["statuses"] == {"In Review": 2, "In Progress": 1}
 
 
+def test_pending_topic_query_uses_complete_current_inventory() -> None:
+    todo = _issue("jira:c:T0-1:CURRENT", "T0-1", "Print receipt QA", "printing", "To Do")
+    review = _issue(
+        "jira:c:T0-2:CURRENT", "T0-2", "Printing workflow", "printing", "In Review"
+    )
+    done = _issue("jira:c:T0-3:CURRENT", "T0-3", "Print complete", "printing", "Done")
+    unrelated = _issue("jira:c:T0-4:CURRENT", "T0-4", "Payments", "payments", "To Do")
+    todo.metadata["status_category_key"] = "new"
+    review.metadata["status_category_key"] = "indeterminate"
+    done.metadata["status_category_key"] = "done"
+    unrelated.metadata["status_category_key"] = "new"
+
+    class Retriever:
+        async def authorized_source_snapshot(self, source_types):
+            return (todo, review, done, unrelated), True
+
+    selection = select_providers(
+        "Do we have anything pending to implement for printing the tickets?",
+        (ProviderName.JIRA,),
+    )
+    result = asyncio.run(
+        IndexedProviderAdapter(ProviderName.JIRA, "T2.0", Retriever()).aggregate(
+            selection.structured_query
+        )
+    )
+
+    assert selection.structured_query.filters == {
+        "status_category_key": ("new", "indeterminate"),
+        "topic": ("printing",),
+    }
+    assert [row["key"] for row in result.rows] == ["T0-1", "T0-2"]
+
+
 def test_ticket_count_uses_structured_jira_route_without_repeating_provider_name() -> None:
     selection = select_providers("all tickets count?", (ProviderName.JIRA,))
 
