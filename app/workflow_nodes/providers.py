@@ -27,11 +27,11 @@ def _language(question: str) -> str:
     return resolve_response_language(question, default="en")
 
 
-def _filter_text(filters: dict[str, tuple[str, ...]], language: str) -> str:
+def _filter_summary(filters: dict[str, tuple[str, ...]], language: str) -> str:
     values = [value for key, group in filters.items() if key != "fixed" for value in group]
     if not values:
         return ""
-    joined = ", ".join(values)
+    joined = ", ".join(f"**{value}**" for value in values)
     return f" matching {joined}" if language == "en" else f" que coinciden con {joined}"
 
 
@@ -259,41 +259,57 @@ class ProviderNodesMixin:
                 resolved_intent="JIRA_STRUCTURED_CLARIFICATION",
             )
             return {"provider_response": response}
-        filter_text = _filter_text(query.filters, language)
+        filter_summary = _filter_summary(query.filters, language)
         rule_text = _fixed_rule_text(result.applied_filter_rule, language)
-        snapshot = f" Snapshot: {result.snapshot_at}." if result.snapshot_at else ""
+        snapshot = (
+            (
+                f"\n\n_Data snapshot: {result.snapshot_at}._"
+                if language == "en"
+                else f"\n\n_Instantánea de datos: {result.snapshot_at}._"
+            )
+            if result.snapshot_at
+            else ""
+        )
         if query.operation == StructuredOperation.COUNT:
             answer = (
-                f"Jira has {result.total} tickets{filter_text}{rule_text} in {self._request.project_id}.{snapshot}"
+                f"**{result.total} Jira tickets**{filter_summary}{rule_text} in **{self._request.project_id}**.{snapshot}"
                 if language == "en"
-                else f"Jira tiene {result.total} tickets{filter_text}{rule_text} en {self._request.project_id}.{snapshot}"
+                else f"**{result.total} tickets de Jira**{filter_summary}{rule_text} en **{self._request.project_id}**.{snapshot}"
             )
         elif query.operation == StructuredOperation.DISTRIBUTION:
-            buckets = ", ".join(f"{key}: {value}" for key, value in result.groups.items()) or "none"
+            buckets = "\n".join(f"- **{key}:** {value}" for key, value in result.groups.items())
+            if not buckets:
+                buckets = "- None" if language == "en" else "- Ninguno"
             answer = (
-                f"Jira has {result.total} tickets{filter_text}{rule_text} in {self._request.project_id}. Breakdown by {query.group_by}: {buckets}.{snapshot}"
+                f"**{result.total} Jira tickets**{filter_summary}{rule_text} in **{self._request.project_id}**.\n\nBreakdown by {query.group_by}:\n{buckets}{snapshot}"
                 if language == "en"
-                else f"Jira tiene {result.total} tickets{filter_text}{rule_text} en {self._request.project_id}. Desglose por {query.group_by}: {buckets}.{snapshot}"
+                else f"**{result.total} tickets de Jira**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\nDesglose por {query.group_by}:\n{buckets}{snapshot}"
             )
         else:
             rows = result.rows[: self._settings.provider_max_list_items]
-            rendered = "; ".join(
-                f"{row['key']} — {row['summary']} [{row['status']}]" for row in rows
+            rendered = "\n".join(
+                f"- **{row['key']}** — {row['summary']} · {row['status']}" for row in rows
             )
             returned = len(rows)
             start = query.offset + 1 if returned else min(query.offset, result.total)
             end = query.offset + returned
-            page_text = (
-                f" Showing {start}-{end} of {result.total}."
-                if language == "en"
-                else f" Mostrando {start}-{end} de {result.total}."
-            )
-            items = f": {rendered}" if rendered else ""
-            answer = (
-                f"Jira has {result.total} matching tickets{rule_text} in {self._request.project_id}{items}.{page_text}{snapshot}"
-                if language == "en"
-                else f"Jira tiene {result.total} tickets coincidentes{rule_text} en {self._request.project_id}{items}.{page_text}{snapshot}"
-            )
+            if returned:
+                page_text = (
+                    f"Showing **{start}–{end} of {result.total}**."
+                    if language == "en"
+                    else f"Mostrando **{start}–{end} de {result.total}**."
+                )
+                answer = (
+                    f"Found **{result.total} matching Jira tickets**{filter_summary}{rule_text} in **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
+                    if language == "en"
+                    else f"Se encontraron **{result.total} tickets de Jira coincidentes**{filter_summary}{rule_text} en **{self._request.project_id}**.\n\n{rendered}\n\n{page_text}{snapshot}"
+                )
+            else:
+                answer = (
+                    f"There are no more matching Jira tickets. All **{result.total}** results have already been shown.{snapshot}"
+                    if language == "en"
+                    else f"No hay más tickets de Jira coincidentes. Ya se mostraron los **{result.total}** resultados.{snapshot}"
+                )
         sources = [
             SourceReference(
                 type="ISSUE",

@@ -1,8 +1,8 @@
 # Provider routing, Jira aggregates, and LiteLLM
 
-This document describes the provider-routing work added in revision `1d911f7`.
-It explains the behavior that is currently implemented, how it preserves the
-existing RAG path, and how to operate and test it.
+This document describes the currently implemented provider routing, structured
+Jira conversation state, and client source selection. It explains how the new
+behavior preserves the existing RAG path and how to operate and test it.
 
 ## Why this change was needed
 
@@ -296,10 +296,17 @@ collection to be on the configured allowlist.
 
 ### User-selectable source scope
 
-The client renders `All`, `Jira`, `Confluence`, and `Github` filter chips from
-the current project's authenticated integration-status response. Only providers
-whose integration is available are displayed. `All` selects every displayed
-provider; a provider chip selects only that provider for the next request.
+The authenticated client renders `All`, `Jira`, `Confluence`, and `GitHub`
+filter chips from the current project's server-provided integration catalog.
+Only providers configured for that authorized project are displayed. This
+allows a valid indexed snapshot to remain selectable while a live OAuth session
+is disconnected; the backend still validates every request.
+
+Selected chips use the Tiendas 3B red. `All` is exclusive in the UI: when it is
+active, the individual provider chips are not shown as selected. Choosing an
+individual provider leaves All mode and selects only that provider. Additional
+individual providers can then be combined. The client prevents an empty
+selection.
 
 The public chat request carries the selection as optional `enabledProviders`.
 The backend checks every requested value against its server-owned Jira,
