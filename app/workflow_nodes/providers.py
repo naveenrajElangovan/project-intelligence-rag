@@ -297,13 +297,23 @@ class ProviderNodesMixin:
         if query.operation == StructuredOperation.OVERVIEW:
             overview = result.rows[0] if result.rows else {}
 
-            def breakdown(values: object) -> str:
+            def breakdown(values: object, *, limit: int | None = None) -> str:
                 if not isinstance(values, dict) or not values:
                     return "- None" if language == "en" else "- Ninguno"
-                return "\n".join(f"- **{key}:** {value}" for key, value in values.items())
+                items = list(values.items())
+                shown = items[:limit] if limit else items
+                lines = [f"- **{key}:** {value}" for key, value in shown]
+                if limit and len(items) > limit:
+                    remaining = len(items) - limit
+                    lines.append(
+                        f"- _{remaining} additional values; ask for the complete distribution._"
+                        if language == "en"
+                        else f"- _{remaining} valores adicionales; solicita la distribución completa._"
+                    )
+                return "\n".join(lines)
 
-            labels = breakdown(overview.get("labels"))
-            components = breakdown(overview.get("components"))
+            labels = breakdown(overview.get("labels"), limit=15)
+            components = breakdown(overview.get("components"), limit=15)
             answer = (
                 (
                     f"## Jira project overview — {self._request.project_id}\n\n"
