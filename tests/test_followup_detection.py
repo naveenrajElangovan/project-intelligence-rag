@@ -78,6 +78,33 @@ def test_an_elliptical_follow_up_still_resolves_against_the_conversation() -> No
 @pytest.mark.parametrize(
     "question",
     (
+        "what is memory here?",
+        "what is memoy here",
+        "¿qué es memoria aquí?",
+    ),
+)
+def test_locative_definition_with_its_own_subject_is_standalone(question: str) -> None:
+    needed, reason = _conversation_resolution_decision(question)
+
+    assert needed is False
+    assert reason == "EXPLICIT_LOCATIVE_SUBJECT"
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
+        "what is it here?",
+        "what happened here?",
+        "¿qué pasó aquí?",
+    ),
+)
+def test_locative_reference_without_a_subject_still_requires_context(question: str) -> None:
+    assert _conversation_resolution_decision(question)[0] is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    (
         "price checking flow for products",
         "flujo de consulta de precios para productos",
         "is there a flow for reprints",
@@ -85,9 +112,7 @@ def test_an_elliptical_follow_up_still_resolves_against_the_conversation() -> No
     ),
 )
 def test_non_vocabulary_multiword_topics_are_standalone(question: str) -> None:
-    needed, reason = _conversation_resolution_decision(
-        question, ("checkout", "inventory")
-    )
+    needed, reason = _conversation_resolution_decision(question, ("checkout", "inventory"))
 
     assert needed is False
     assert reason == "EXPLICIT_SUBJECT"
@@ -95,9 +120,7 @@ def test_non_vocabulary_multiword_topics_are_standalone(question: str) -> None:
 
 @pytest.mark.parametrize("question", ("reprints", "reimpresiones"))
 def test_one_word_non_vocabulary_fragments_still_inherit_context(question: str) -> None:
-    needed, reason = _conversation_resolution_decision(
-        question, ("checkout", "inventory")
-    )
+    needed, reason = _conversation_resolution_decision(question, ("checkout", "inventory"))
 
     assert needed is True
     assert reason == "NON_VOCABULARY_SUBJECT"

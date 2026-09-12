@@ -19,7 +19,12 @@ from app.retrieval_errors import classify_retrieval_failure
 from app.lexical_tokens import tokens as lexical_tokens
 from app.retrieval_pipeline import BM25Retriever
 from app.table_evidence import normalize_table_dialect
-from app.telemetry import lexical_cache_entries, retrieval_discarded, retrieval_failure, retrieval_fallback
+from app.telemetry import (
+    lexical_cache_entries,
+    retrieval_discarded,
+    retrieval_failure,
+    retrieval_fallback,
+)
 from app.vocabulary import CorpusVocabulary, VOCABULARY_RECORD_KIND
 
 
@@ -59,9 +64,7 @@ def _authorized_policy_filter(
         raise PermissionError("At least one authorized access policy is required.")
     return {
         "access_policy_id": (
-            {"$eq": policies[0]}
-            if len(policies) == 1
-            else {"$in": list(policies)}
+            {"$eq": policies[0]} if len(policies) == 1 else {"$in": list(policies)}
         )
     }
 
@@ -122,10 +125,7 @@ async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
     for collection in await asyncio.to_thread(client.list_collections):
         metadata = getattr(collection, "metadata", None) or {}
         project_id = str(metadata.get("project_id") or "").strip()
-        if (
-            not project_id
-            or metadata.get("logical_collection") != settings.chroma_collection
-        ):
+        if not project_id or metadata.get("logical_collection") != settings.chroma_collection:
             continue
         retriever = ChromaAccessRetriever.create(
             chroma_host=settings.chroma_host,
@@ -151,9 +151,7 @@ async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
         # and CROSS_SOURCE split PAGE/CODE into independent calls, while delivery
         # uses ISSUE and the remaining intents use the mixed corpus.
         for source_scope in ((), ("PAGE",), ("CODE",), ("ISSUE",)):
-            await asyncio.to_thread(
-                retriever._cached_authorized_corpus, source_scope
-            )
+            await asyncio.to_thread(retriever._cached_authorized_corpus, source_scope)
         warmed += 1
     return warmed
 
@@ -264,7 +262,10 @@ class ChromaAccessRetriever(BaseRetriever):
         return self._search_with_vector(vector, source_types)
 
     def _search_with_vector(
-        self, vector: list[float], source_types: tuple[str, ...]
+        self,
+        vector: list[float],
+        source_types: tuple[str, ...],
+        providers: tuple[str, ...] = (),
     ) -> list[Document]:
         filters: list[dict[str, dict[str, str | list[str]]]] = [
             {"project_id": {"$eq": self.project_id}},
@@ -283,6 +284,15 @@ class ChromaAccessRetriever(BaseRetriever):
                 {"source_type": {"$eq": normalized_types[0]}}
                 if len(normalized_types) == 1
                 else {"source_type": {"$in": list(normalized_types)}}
+            )
+        normalized_providers = tuple(
+            dict.fromkeys(value.strip().upper() for value in providers if value.strip())
+        )
+        if normalized_providers:
+            filters.append(
+                {"provider": {"$eq": normalized_providers[0]}}
+                if len(normalized_providers) == 1
+                else {"provider": {"$in": list(normalized_providers)}}
             )
         metadata_filter = {"$and": filters}
         hits = self._search_local_vector(vector, metadata_filter)
@@ -311,10 +321,21 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[tuple[str, float, dict[str, object]]]:
         """Query Chroma with a precomputed local vector."""
 
-        response = self.index.query(query_embeddings=[vector], n_results=self.top_k, where=metadata_filter, include=["documents", "metadatas", "distances"])
+        response = self.index.query(
+            query_embeddings=[vector],
+            n_results=self.top_k,
+            where=metadata_filter,
+            include=["documents", "metadatas", "distances"],
+        )
         self._record_usage(None, embedded_locally=True)
         hits: list[tuple[str, float, dict[str, object]]] = []
-        for chunk_id, text, metadata, distance in zip(response.get("ids", [[]])[0], response.get("documents", [[]])[0], response.get("metadatas", [[]])[0], response.get("distances", [[]])[0], strict=True):
+        for chunk_id, text, metadata, distance in zip(
+            response.get("ids", [[]])[0],
+            response.get("documents", [[]])[0],
+            response.get("metadatas", [[]])[0],
+            response.get("distances", [[]])[0],
+            strict=True,
+        ):
             fields = dict(metadata or {})
             fields[self.text_field] = text or ""
             hits.append((str(chunk_id), max(0.0, 1.0 - float(distance or 0.0)), fields))
@@ -334,7 +355,10 @@ class ChromaAccessRetriever(BaseRetriever):
             )
 
     def _document_from_fields(
-        self, fields: dict[str, object], chunk_id: str, score: float,
+        self,
+        fields: dict[str, object],
+        chunk_id: str,
+        score: float,
         drops: dict[str, int] | None = None,
     ) -> Document | None:
         def drop(reason: str) -> None:
@@ -361,8 +385,7 @@ class ChromaAccessRetriever(BaseRetriever):
         project_value = fields.get("project_id")
         policy_value = fields.get("access_policy_id")
         if strict and (
-            project_value != self.project_id
-            or policy_value not in self.access_policy_ids
+            project_value != self.project_id or policy_value not in self.access_policy_ids
         ):
             drop("project_or_policy_mismatch")
             return None
@@ -374,11 +397,15 @@ class ChromaAccessRetriever(BaseRetriever):
             return None
         found_schema = str(fields.get("schema_version") or "")
         if self.required_schema_version and found_schema != self.required_schema_version:
-            drop(f"schema_version:expected={self.required_schema_version},found={found_schema or 'absent'}")
+            drop(
+                f"schema_version:expected={self.required_schema_version},found={found_schema or 'absent'}"
+            )
             return None
         found_model = str(fields.get("embedding_model") or "")
         if self.required_embedding_model and found_model != self.required_embedding_model:
-            drop(f"embedding_model:expected={self.required_embedding_model},found={found_model or 'absent'}")
+            drop(
+                f"embedding_model:expected={self.required_embedding_model},found={found_model or 'absent'}"
+            )
             return None
         return Document(
             page_content=text,
@@ -431,11 +458,23 @@ class ChromaAccessRetriever(BaseRetriever):
                 "chunk_char_count": int(fields.get("chunk_char_count") or 0),
                 "chunk_token_count": int(fields.get("chunk_token_count") or 0),
                 "issue_key": str(fields.get("issue_key") or ""),
-                **{name: str(fields.get(name) or "") for name in (
-                    "jira_chunk_kind", "event_id", "event_date", "event_author",
-                    "event_author_id", "parent_issue_key", "parent_issue_source_id",
-                    "cloud_id", "issue_updated", "glossary_term", "link_url", "link_kind",
-                )},
+                **{
+                    name: str(fields.get(name) or "")
+                    for name in (
+                        "jira_chunk_kind",
+                        "event_id",
+                        "event_date",
+                        "event_author",
+                        "event_author_id",
+                        "parent_issue_key",
+                        "parent_issue_source_id",
+                        "cloud_id",
+                        "issue_updated",
+                        "glossary_term",
+                        "link_url",
+                        "link_kind",
+                    )
+                },
                 "issue_type": str(fields.get("issue_type") or ""),
                 "status": str(fields.get("status") or ""),
                 "status_category": str(fields.get("status_category") or ""),
@@ -495,9 +534,7 @@ class ChromaAccessRetriever(BaseRetriever):
             documents = response.get("documents", [])
             metadatas = response.get("metadatas", [])
             vocabulary = CorpusVocabulary.merge(
-                CorpusVocabulary.from_record(
-                    dict(metadata or {}), str(document or "")
-                )
+                CorpusVocabulary.from_record(dict(metadata or {}), str(document or ""))
                 for document, metadata in zip(documents, metadatas, strict=True)
             )
         except Exception:
@@ -510,9 +547,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 _VOCABULARY_CACHE.popitem(last=False)
         return vocabulary
 
-    async def _aget_relevant_documents(
-        self, query: str, *, run_manager=None
-    ) -> list[Document]:
+    async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> list[Document]:
         return await self.ainvoke_scoped(query)
 
     async def ainvoke_scoped(
@@ -533,9 +568,7 @@ class ChromaAccessRetriever(BaseRetriever):
             # accepts: no bound that leaves an orphan burning the GPU.
             vector = await asyncio.to_thread(self.embedder.embed_query, query)
             documents, retry_count = await with_transient_retry(
-                lambda: asyncio.to_thread(
-                    self._search_with_vector, vector, source_types
-                ),
+                lambda: asyncio.to_thread(self._search_with_vector, vector, source_types),
                 attempts=self.retry_attempts,
                 timeout_seconds=self.timeout_seconds,
             )
@@ -551,9 +584,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 model_name=self.required_embedding_model or "unknown",
                 source_scope=",".join(source_types) or "MIXED",
             )
-            if (
-                self.lexical_fallback_enabled
-            ):
+            if self.lexical_fallback_enabled:
                 documents = await asyncio.to_thread(
                     self._lexical_fallback, query, source_types, failure.code
                 )
@@ -566,12 +597,74 @@ class ChromaAccessRetriever(BaseRetriever):
             document.metadata["retrieval_retry_count"] = retry_count
         return documents
 
+    async def ainvoke_federated(
+        self,
+        query: str,
+        provider_scopes: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> list[list[Document]]:
+        """Search each selected provider concurrently with one query embedding.
+
+        Provider-specific Chroma filters reserve a candidate window for each
+        selected source. This prevents the largest corpus from consuming every
+        dense result while avoiding repeated local/accelerator embedding calls.
+        """
+
+        vector = await asyncio.to_thread(self.embedder.embed_query, query)
+
+        async def retrieve(provider: str, source_types: tuple[str, ...]) -> list[Document]:
+            try:
+                documents, retry_count = await with_transient_retry(
+                    lambda: asyncio.to_thread(
+                        self._search_with_vector,
+                        vector,
+                        source_types,
+                        (provider,),
+                    ),
+                    attempts=self.retry_attempts,
+                    timeout_seconds=self.timeout_seconds,
+                )
+            except Exception as error:
+                failure = classify_retrieval_failure(error)
+                retrieval_failure(
+                    project_id=self.project_id,
+                    provider="chroma",
+                    failure_code=failure.code,
+                    status_code=failure.status_code,
+                    retryable=failure.retryable,
+                    configured_attempts=self.retry_attempts,
+                    model_name=self.required_embedding_model or "unknown",
+                    source_scope=f"{provider}:" + ",".join(source_types),
+                )
+                if not self.lexical_fallback_enabled:
+                    raise
+                fallback = await asyncio.to_thread(
+                    self._lexical_fallback,
+                    query,
+                    source_types,
+                    failure.code,
+                )
+                documents = [
+                    document
+                    for document in fallback
+                    if str(document.metadata.get("provider") or "").upper() == provider
+                ]
+                retry_count = 0
+            with self._usage_lock:
+                self._retry_total += retry_count
+            for document in documents:
+                document.metadata["retrieval_retry_count"] = retry_count
+            return documents
+
+        return list(
+            await asyncio.gather(
+                *(retrieve(provider, source_types) for provider, source_types in provider_scopes)
+            )
+        )
+
     async def ainvoke_exact_identifiers(
         self, identifiers: tuple[str, ...], source_types: tuple[str, ...] = ()
     ) -> list[Document]:
-        return await asyncio.to_thread(
-            self._exact_identifier_documents, identifiers, source_types
-        )
+        return await asyncio.to_thread(self._exact_identifier_documents, identifiers, source_types)
 
     async def ainvoke_jira_sections(self, question: str) -> list[Document]:
         return await asyncio.to_thread(self._jira_section_documents, question)
@@ -586,18 +679,24 @@ class ChromaAccessRetriever(BaseRetriever):
         filters = [
             {"project_id": {"$eq": self.project_id}},
             _authorized_policy_filter(self.access_policy_ids),
-            {"provider": "JIRA"}, {"issue_key": key},
+            {"provider": "JIRA"},
+            {"issue_key": key},
             {"source_type": "ATTACHMENT" if kind == "ATTACHMENT" else "ISSUE"},
         ]
         if kind and kind != "ATTACHMENT":
             filters.append({"jira_chunk_kind": kind})
         if event:
             filters.append({"event_id": event})
-        response = self.index.get(where={"$and": filters}, limit=64,
-            include=["documents", "metadatas"])
+        response = self.index.get(
+            where={"$and": filters}, limit=64, include=["documents", "metadatas"]
+        )
         documents, drops = [], {}
-        for identity, text, metadata in zip(response.get("ids", []),
-            response.get("documents", []), response.get("metadatas", []), strict=True):
+        for identity, text, metadata in zip(
+            response.get("ids", []),
+            response.get("documents", []),
+            response.get("metadatas", []),
+            strict=True,
+        ):
             fields = {**(metadata or {}), self.text_field: text or ""}
             document = self._document_from_fields(fields, str(identity), 1.0, drops)
             if document is not None:
@@ -619,9 +718,7 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         """Load authorized canonical-index chunks containing an exact question."""
 
-        return await asyncio.to_thread(
-            self._canonical_question_documents, question, source_types
-        )
+        return await asyncio.to_thread(self._canonical_question_documents, question, source_types)
 
     async def ainvoke_lexical(
         self, query: str, source_types: tuple[str, ...] = ()
@@ -645,7 +742,9 @@ class ChromaAccessRetriever(BaseRetriever):
         """
 
         cached = await asyncio.to_thread(self._cached_authorized_corpus, source_types)
-        return tuple(_clone_document(document) for document in cached.documents), not cached.truncated
+        return tuple(
+            _clone_document(document) for document in cached.documents
+        ), not cached.truncated
 
     async def ainvoke_source_siblings(
         self, source_ids: tuple[str, ...], source_types: tuple[str, ...] = ()
@@ -657,9 +756,7 @@ class ChromaAccessRetriever(BaseRetriever):
         )
         if not normalized_ids:
             return []
-        return await asyncio.to_thread(
-            self._source_sibling_documents, normalized_ids, source_types
-        )
+        return await asyncio.to_thread(self._source_sibling_documents, normalized_ids, source_types)
 
     async def ainvoke_population(
         self,
@@ -669,9 +766,7 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         """Load the authorized registry population for an exhaustive question."""
 
-        return await asyncio.to_thread(
-            self._population_documents, entity, labels, source_types
-        )
+        return await asyncio.to_thread(self._population_documents, entity, labels, source_types)
 
     def _source_sibling_documents(
         self, source_ids: tuple[str, ...], source_types: tuple[str, ...]
@@ -778,8 +873,10 @@ class ChromaAccessRetriever(BaseRetriever):
         drops: dict[str, int] = {}
         for response in responses:
             for chunk_id, text, metadata in zip(
-                response.get("ids", []), response.get("documents", []),
-                response.get("metadatas", []), strict=True,
+                response.get("ids", []),
+                response.get("documents", []),
+                response.get("metadatas", []),
+                strict=True,
             ):
                 fields = dict(metadata or {})
                 fields[self.text_field] = text or ""
@@ -788,14 +885,14 @@ class ChromaAccessRetriever(BaseRetriever):
                     continue
                 document.metadata["identifier_anchor"] = True
                 document.metadata["identifier_anchor_score"] = max(
-                    _identifier_anchor_score(identifier, document)
-                    for identifier in identifiers
+                    _identifier_anchor_score(identifier, document) for identifier in identifiers
                 )
                 found[str(document.metadata.get("chunk_id") or chunk_id)] = document
         return sorted(
             found.values(),
             key=lambda item: (
-                str(item.metadata.get("issue_key") or "").upper() in {value.upper() for value in identifiers},
+                str(item.metadata.get("issue_key") or "").upper()
+                in {value.upper() for value in identifiers},
                 item.metadata.get("jira_chunk_kind") == "CURRENT",
                 float(item.metadata.get("identifier_anchor_score") or 0),
             ),
@@ -863,8 +960,7 @@ class ChromaAccessRetriever(BaseRetriever):
             document.metadata["identifier_anchor"] = True
             document.metadata["canonical_route_anchor"] = True
             document.metadata["identifier_anchor_score"] = max(
-                _identifier_anchor_score(identifier, document)
-                for identifier in matched
+                _identifier_anchor_score(identifier, document) for identifier in matched
             )
             found.append(document)
         return sorted(
@@ -887,9 +983,7 @@ class ChromaAccessRetriever(BaseRetriever):
         value = question.strip()
         if not value:
             return []
-        normalized_question = " ".join(
-            re.findall(r"[a-z0-9à-ÿ]+", value.casefold())
-        )
+        normalized_question = " ".join(re.findall(r"[a-z0-9à-ÿ]+", value.casefold()))
         found: list[Document] = []
         for cached in self._cached_authorized_corpus(source_types).documents:
             document = _clone_document(cached)
@@ -903,9 +997,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 continue
             quoted_questions = {
                 " ".join(re.findall(r"[a-z0-9à-ÿ]+", match.casefold()))
-                for match in re.findall(
-                    r'["“]([^"”]{3,200})["”]', document.page_content
-                )
+                for match in re.findall(r'["“]([^"”]{3,200})["”]', document.page_content)
             }
             if normalized_question not in quoted_questions:
                 continue
@@ -933,49 +1025,34 @@ class ChromaAccessRetriever(BaseRetriever):
         )
         return ranked[: self.top_k]
 
-    def _lexical_candidates(
-        self, query: str, source_types: tuple[str, ...]
-    ) -> list[Document]:
+    def _lexical_candidates(self, query: str, source_types: tuple[str, ...]) -> list[Document]:
         cached = self._cached_authorized_corpus(source_types)
         ranked = _rank_cached_corpus(query, cached)
         for document in ranked:
             document.metadata["retrieval_channel"] = "lexical"
         return ranked[: self.top_k]
 
-    def _rare_query_terms(
-        self, query: str, source_types: tuple[str, ...]
-    ) -> tuple[str, ...]:
+    def _rare_query_terms(self, query: str, source_types: tuple[str, ...]) -> tuple[str, ...]:
         cached = self._cached_authorized_corpus(source_types)
         corpus = cached.documents
         if not corpus:
             return ()
         query_terms = tuple(
             dict.fromkeys(
-                term
-                for term in lexical_tokens(query)
-                if len(term) >= 2 and not term.isdigit()
+                term for term in lexical_tokens(query) if len(term) >= 2 and not term.isdigit()
             )
         )
-        frequencies = {
-            term: int(cached.document_frequency.get(term, 0))
-            for term in query_terms
-        }
+        frequencies = {term: int(cached.document_frequency.get(term, 0)) for term in query_terms}
         # "Bottom decile" is a corpus property, not the least-common word in
         # each individual question. Computing the percentile over query terms
         # caused an ordinary word to be labelled rare on nearly every request,
         # triggering broad `$contains` scans and noisy identifier anchors.
-        observed = sorted(
-            value for value in cached.document_frequency.values() if value > 0
-        )
+        observed = sorted(value for value in cached.document_frequency.values() if value > 0)
         if not observed:
             return ()
         decile_index = min(len(observed) - 1, max(0, (len(observed) - 1) // 10))
         threshold = observed[decile_index]
-        return tuple(
-            term
-            for term in query_terms
-            if 0 < frequencies[term] <= threshold
-        )[:5]
+        return tuple(term for term in query_terms if 0 < frequencies[term] <= threshold)[:5]
 
     def _population_documents(
         self,
@@ -984,9 +1061,7 @@ class ChromaAccessRetriever(BaseRetriever):
         source_types: tuple[str, ...],
     ) -> list[Document]:
         normalized_entity = entity.strip().casefold()
-        normalized_labels = tuple(
-            value.strip().casefold() for value in labels if value.strip()
-        )
+        normalized_labels = tuple(value.strip().casefold() for value in labels if value.strip())
         population: dict[str, Document] = {}
         for cached in self._cached_authorized_corpus(source_types).documents:
             document = _clone_document(cached)
@@ -1005,23 +1080,17 @@ class ChromaAccessRetriever(BaseRetriever):
                 (
                     document.page_content,
                     str(metadata.get("title") or ""),
-                    " ".join(
-                        str(value) for value in metadata.get("structure_path", [])
-                    ),
+                    " ".join(str(value) for value in metadata.get("structure_path", [])),
                 )
             ).casefold()
-            if normalized_labels and not any(
-                label in searchable for label in normalized_labels
-            ):
+            if normalized_labels and not any(label in searchable for label in normalized_labels):
                 continue
             entity_key = str(metadata.get("entity_key") or "").strip()
             if entity_key:
                 population.setdefault(entity_key, document)
         return [population[key] for key in sorted(population)]
 
-    def _cached_authorized_corpus(
-        self, source_types: tuple[str, ...]
-    ) -> _FallbackCorpus:
+    def _cached_authorized_corpus(self, source_types: tuple[str, ...]) -> _FallbackCorpus:
         visible_policies = document_visible_policies(self.project_id, self.access_policy_ids)
         key = (
             self.chroma_host,
@@ -1046,9 +1115,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 cached = None
         if cached is None:
             documents, truncated = self._fetch_fallback_corpus(source_types)
-            document_frequency, term_frequencies, document_lengths = _lexical_index(
-                documents
-            )
+            document_frequency, term_frequencies, document_lengths = _lexical_index(documents)
             cached = _FallbackCorpus(
                 expires_at=now + self.lexical_fallback_cache_ttl_seconds,
                 documents=tuple(documents),
@@ -1056,9 +1123,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 document_frequency=document_frequency,
                 term_frequencies=term_frequencies,
                 document_lengths=document_lengths,
-                average_document_length=(
-                    sum(document_lengths) / max(1, len(document_lengths))
-                ),
+                average_document_length=(sum(document_lengths) / max(1, len(document_lengths))),
             )
             if self.lexical_fallback_cache_ttl_seconds:
                 with _FALLBACK_CORPUS_LOCK:
@@ -1069,18 +1134,14 @@ class ChromaAccessRetriever(BaseRetriever):
                     lexical_cache_entries(len(_FALLBACK_CORPUS_CACHE))
         return cached
 
-    def _fetch_fallback_corpus(
-        self, source_types: tuple[str, ...]
-    ) -> tuple[list[Document], bool]:
+    def _fetch_fallback_corpus(self, source_types: tuple[str, ...]) -> tuple[list[Document], bool]:
         base_filters: list[dict[str, object]] = [
             {"project_id": {"$eq": self.project_id}},
             _authorized_policy_filter(self.access_policy_ids),
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
         ]
         normalized_types = tuple(
-            dict.fromkeys(
-                value.strip().upper() for value in source_types if value.strip()
-            )
+            dict.fromkeys(value.strip().upper() for value in source_types if value.strip())
         )
         # Chroma returns records in insertion order. A single bounded mixed-source
         # scan therefore sampled only CODE in the measured corpus (10,449 CODE
@@ -1107,9 +1168,7 @@ class ChromaAccessRetriever(BaseRetriever):
             while len(records) < self.lexical_fallback_max_records:
                 response = self._read_cache_page(
                     where={"$and": filters},
-                    limit=min(
-                        page_size, self.lexical_fallback_max_records - len(records)
-                    ),
+                    limit=min(page_size, self.lexical_fallback_max_records - len(records)),
                     offset=offset,
                     include=["documents", "metadatas"],
                 )
@@ -1122,9 +1181,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 ):
                     fields = dict(metadata or {})
                     fields[self.text_field] = text or ""
-                    document = self._document_from_fields(
-                        fields, str(chunk_id), 0.0
-                    )
+                    document = self._document_from_fields(fields, str(chunk_id), 0.0)
                     if document is not None:
                         records.append(document)
                 offset += len(ids)
@@ -1146,7 +1203,8 @@ class ChromaAccessRetriever(BaseRetriever):
             except Exception as failure:
                 if attempt + 1 >= self.retry_attempts or not is_transient_error(failure):
                     raise
-                time.sleep(min(2.0, 0.1 * (2 ** attempt)))
+                time.sleep(min(2.0, 0.1 * (2**attempt)))
+
     def drain_usage(self) -> dict[str, int]:
         with self._usage_lock:
             events = self._usage_events
@@ -1206,9 +1264,7 @@ def _rank_cached_corpus(query: str, cached: _FallbackCorpus) -> list[Document]:
             df = cached.document_frequency.get(term, 0)
             idf = math.log(1 + (document_count - df + 0.5) / (df + 0.5))
             length_norm = 1 - b + b * length / max(cached.average_document_length, 1)
-            score += idf * (frequency * (k1 + 1)) / (
-                frequency + k1 * length_norm
-            )
+            score += idf * (frequency * (k1 + 1)) / (frequency + k1 * length_norm)
         clone = _clone_document(document)
         clone.metadata["lexical_score"] = score
         scored.append((score, -index, clone))
@@ -1234,9 +1290,7 @@ def _identifier_anchor_score(identifier: str, document: Document) -> float:
     body = document.page_content
     title = str(document.metadata.get("title") or "")
     score = float(body.upper().count(identifier.upper()))
-    structure_path = " ".join(
-        str(value) for value in document.metadata.get("structure_path") or ()
-    )
+    structure_path = " ".join(str(value) for value in document.metadata.get("structure_path") or ())
     if re.search(
         rf"(?<![A-Z0-9_-]){re.escape(identifier.upper())}(?![A-Z0-9_-])",
         structure_path.upper(),

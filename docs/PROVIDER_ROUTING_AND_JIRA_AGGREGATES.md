@@ -408,8 +408,34 @@ selected set is enforced again on retrieval, so this disambiguation never
 widens the authorized provider scope.
 
 Changing the source selection can reset an inherited Jira structured scope when
-Jira is no longer selected. Selecting multiple sources allows the deterministic
-planner to federate only when the question requires cross-provider evidence.
+Jira is no longer selected. An explicitly selected set is an evidence boundary:
+one selected source uses its single-provider route, while two or more selected
+sources use the federated route even when the wording does not name a provider.
+An explicit provider named in the question still narrows the route to that
+provider unless the question asks for a relationship across sources. When the
+client omits `enabledProviders`, the legacy routing behavior remains unchanged.
+
+Federated indexed retrieval embeds each query once and searches provider-scoped
+Chroma windows concurrently. Jira is limited to issue and attachment records,
+GitHub to code records, and Confluence to page and attachment records. The
+existing fusion and reranking stages then combine those candidate windows. This
+prevents a large Jira collection from consuming all candidates while avoiding
+one embedding call per provider. Provider selection remains constrained by the
+backend-authorized catalog and every Chroma search reapplies the project and
+access-policy filters.
+
+Each provider window retains an aligned request identity through reciprocal-rank
+fusion. The number of selected providers can differ from the number of source
+types because attachments can belong to both Jira and Confluence; fusion must
+therefore align results by provider window instead of zipping them to the
+planner's source-type list.
+
+A fresh definition question with one explicit concept and a trailing locative,
+such as `what is memory here?` or `¿qué es memoria aquí?`, is treated as a
+self-contained project query. This grammatical rule also permits an unknown or
+misspelled concept to reach retrieval. Referential questions without a subject,
+such as `what is it here?` or `what happened here?`, continue to require stored
+conversation context and return a clarification when none exists.
 
 ### Jira refresh exclusions
 

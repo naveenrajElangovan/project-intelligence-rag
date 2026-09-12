@@ -488,16 +488,21 @@ def _same_rerank_inputs(state: RagState, query: str, candidates: list[Document])
 def _exact_jira_documents(question: str, documents: list[Document]) -> bool:
     """An exact issue match outranks a guessed vocabulary entity, not access policy."""
     from app.jira_query import jira_section_query, jira_current_status_question
+
     route = jira_section_query(question)
     keys = {key.upper() for key in re.findall(r"\b[A-Z][A-Z0-9_]*-\d+\b", question, re.I)}
     multiple_current = len(keys) > 1 and jira_current_status_question(question)
-    return bool(((route and route[1]) or multiple_current) and documents and all(
-        str(document.metadata.get("provider", "")).upper() == "JIRA"
-        and str(document.metadata.get("issue_key", "")).upper() in keys
-        and str(document.metadata.get("source_id", "")).startswith("jira:")
-        and (not multiple_current or document.metadata.get("jira_chunk_kind") == "CURRENT")
-        for document in documents
-    ))
+    return bool(
+        ((route and route[1]) or multiple_current)
+        and documents
+        and all(
+            str(document.metadata.get("provider", "")).upper() == "JIRA"
+            and str(document.metadata.get("issue_key", "")).upper() in keys
+            and str(document.metadata.get("source_id", "")).startswith("jira:")
+            and (not multiple_current or document.metadata.get("jira_chunk_kind") == "CURRENT")
+            for document in documents
+        )
+    )
 
 
 class RetrievalNodesMixin:
@@ -516,7 +521,8 @@ class RetrievalNodesMixin:
         source_types = state.get("source_types", ())
         if state.get("query_intent") == "DELIVERY" and re.search(
             r"\b(?:attachments?|attached|adjuntos?|adjuntad[oa]s?|anexos?)\b",
-            state.get("resolved_question", self._request.question), re.I,
+            state.get("resolved_question", self._request.question),
+            re.I,
         ):
             source_types = ("ISSUE", "ATTACHMENT")
         queries = list(state["queries"])
@@ -530,43 +536,71 @@ class RetrievalNodesMixin:
         section_route = jira_section_query(resolved_question)
         section_loader = getattr(self._retriever, "ainvoke_jira_sections", None)
         from app.jira_query import jira_current_status_question
-        requested_keys = tuple(dict.fromkeys(key.upper() for key in re.findall(
-            r"\b[A-Z][A-Z0-9_]*-\d+\b", resolved_question, re.I
-        )))
-        if (state.get("query_intent") == "DELIVERY" and section_loader is not None
-                and 1 < len(requested_keys) <= 10
-                and jira_current_status_question(resolved_question)):
+
+        requested_keys = tuple(
+            dict.fromkeys(
+                key.upper()
+                for key in re.findall(r"\b[A-Z][A-Z0-9_]*-\d+\b", resolved_question, re.I)
+            )
+        )
+        if (
+            state.get("query_intent") == "DELIVERY"
+            and section_loader is not None
+            and 1 < len(requested_keys) <= 10
+            and jira_current_status_question(resolved_question)
+        ):
             sections = []
             for key in requested_keys:
                 sections.extend(await section_loader(f"What is the current status of {key}?"))
             record_candidate_scores(sections)
             return {
-                "candidates": sections, "jira_exact_section_loaded": True,
-                "queries": tuple(queries), "source_types": source_types,
-                "rerank_queries": (resolved_question,), "translation_slot": None,
-                "preserve_candidates": False, "dense_candidate_count": 0,
-                "lexical_candidate_count": 0, "fallback_candidate_count": 0,
-                "fused_candidate_count": len(sections), "prefiltered_count": 0,
+                "candidates": sections,
+                "jira_exact_section_loaded": True,
+                "queries": tuple(queries),
+                "source_types": source_types,
+                "rerank_queries": (resolved_question,),
+                "translation_slot": None,
+                "preserve_candidates": False,
+                "dense_candidate_count": 0,
+                "lexical_candidate_count": 0,
+                "fallback_candidate_count": 0,
+                "fused_candidate_count": len(sections),
+                "prefiltered_count": 0,
                 "canonical_route_refusal_reason": "",
             }
-        if (state.get("query_intent") == "DELIVERY" and section_route
-                and section_route[1] is not None and section_loader is not None):
+        if (
+            state.get("query_intent") == "DELIVERY"
+            and section_route
+            and section_route[1] is not None
+            and section_loader is not None
+        ):
             sections = await section_loader(resolved_question)
             if sections or section_route[1] == "CURRENT":
                 record_candidate_scores(sections)
                 stage_complete(
-                    "retrieve", self._request.project_id, began,
-                    input_count=len(queries), output_count=len(sections),
-                    reason_code="EXACT_JIRA_SECTION" if sections else "EXACT_JIRA_CURRENT_NOT_FOUND",
+                    "retrieve",
+                    self._request.project_id,
+                    began,
+                    input_count=len(queries),
+                    output_count=len(sections),
+                    reason_code="EXACT_JIRA_SECTION"
+                    if sections
+                    else "EXACT_JIRA_CURRENT_NOT_FOUND",
                     language=state.get("language", "und"),
                 )
                 return {
-                    "candidates": sections, "jira_exact_section_loaded": True,
-                    "queries": tuple(queries), "source_types": source_types,
-                    "rerank_queries": (resolved_question,), "translation_slot": None,
-                    "preserve_candidates": False, "dense_candidate_count": 0,
-                    "lexical_candidate_count": 0, "fallback_candidate_count": 0,
-                    "fused_candidate_count": len(sections), "prefiltered_count": 0,
+                    "candidates": sections,
+                    "jira_exact_section_loaded": True,
+                    "queries": tuple(queries),
+                    "source_types": source_types,
+                    "rerank_queries": (resolved_question,),
+                    "translation_slot": None,
+                    "preserve_candidates": False,
+                    "dense_candidate_count": 0,
+                    "lexical_candidate_count": 0,
+                    "fallback_candidate_count": 0,
+                    "fused_candidate_count": len(sections),
+                    "prefiltered_count": 0,
                     "canonical_route_refusal_reason": "",
                 }
         translation_slot = state.get("translation_slot")
@@ -587,10 +621,16 @@ class RetrievalNodesMixin:
         # then ran on the lexical fallback alone, which reads as a healthy
         # `reason_code: OK` while the primary arm never executed. An unrestricted
         # scope is one request over every source type, never no request.
-        per_source_fan_out = state.get("query_intent") in {
-            "CROSS_SOURCE",
-            "CODE_ASSISTED",
-        } and bool(source_types)
+        selection = state.get("provider_selection")
+        federated = bool(selection and selection.mode.value == "FEDERATED")
+        per_source_fan_out = (
+            federated
+            or state.get("query_intent")
+            in {
+                "CROSS_SOURCE",
+                "CODE_ASSISTED",
+            }
+        ) and bool(source_types)
         scopes = (
             tuple((source_type,) for source_type in source_types)
             if per_source_fan_out
@@ -609,9 +649,42 @@ class RetrievalNodesMixin:
                 for scope in scopes
             )
         )
-        base_results_task = asyncio.gather(
-            *(self._retrieve_scope(query, scope) for query, scope in requests)
+        provider_types = {
+            "JIRA": ("ISSUE", "ATTACHMENT"),
+            "GITHUB": ("CODE",),
+            "CONFLUENCE": ("PAGE", "ATTACHMENT"),
+        }
+        provider_scopes = (
+            tuple(
+                (provider.value, provider_types[provider.value]) for provider in selection.providers
+            )
+            if federated
+            else ()
         )
+        federated_loader = getattr(self._retriever, "ainvoke_federated", None)
+        initial_queries = tuple(dict.fromkeys(query for query, _scope in requests))
+
+        async def retrieve_initial() -> tuple[
+            list[tuple[str, tuple[str, ...]]], list[list[Document]]
+        ]:
+            if provider_scopes and federated_loader is not None:
+                grouped = await asyncio.gather(
+                    *(federated_loader(query, provider_scopes) for query in initial_queries)
+                )
+                aligned = [
+                    (query, (provider,))
+                    for query in initial_queries
+                    for provider, _source_types in provider_scopes
+                ]
+                flattened = [documents for query_groups in grouped for documents in query_groups]
+                return aligned, flattened
+            return requests, list(
+                await asyncio.gather(
+                    *(self._retrieve_scope(query, scope) for query, scope in requests)
+                )
+            )
+
+        base_results_task = asyncio.create_task(retrieve_initial())
         resolved_question = state.get("resolved_question", self._request.question)
         exact_identifiers = _exact_identifier_tokens(resolved_question, self._vocabulary.entities)
         # Execute deterministic structured/lexical channels before semantic
@@ -623,18 +696,28 @@ class RetrievalNodesMixin:
             if exact_loader is not None and exact_identifiers
             else []
         )
-        stage_complete("retrieve_exact", self._request.project_id, began,
-            output_count=len(anchored), reason_code="COMPLETE",
-            language=state.get("language", "und"))
+        stage_complete(
+            "retrieve_exact",
+            self._request.project_id,
+            began,
+            output_count=len(anchored),
+            reason_code="COMPLETE",
+            language=state.get("language", "und"),
+        )
         lexical_loader = getattr(self._retriever, "ainvoke_lexical", None)
         lexical_candidates = (
             await lexical_loader(resolved_question, source_types)
             if lexical_loader is not None
             else None
         )
-        stage_complete("retrieve_lexical", self._request.project_id, began,
-            output_count=len(lexical_candidates or []), reason_code="COMPLETE",
-            language=state.get("language", "und"))
+        stage_complete(
+            "retrieve_lexical",
+            self._request.project_id,
+            began,
+            output_count=len(lexical_candidates or []),
+            reason_code="COMPLETE",
+            language=state.get("language", "und"),
+        )
         rare_loader = getattr(self._retriever, "ainvoke_rare_terms", None)
         rare_terms = (
             await rare_loader(resolved_question, source_types) if rare_loader is not None else ()
@@ -642,13 +725,23 @@ class RetrievalNodesMixin:
         rare_lookups = tuple(value for value in rare_terms if value not in exact_identifiers)
         if exact_loader is not None and rare_lookups:
             anchored.extend(await exact_loader(rare_lookups, source_types))
-        stage_complete("retrieve_rare_terms", self._request.project_id, began,
-            output_count=len(anchored), reason_code="COMPLETE",
-            language=state.get("language", "und"))
-        results = list(await base_results_task)
-        stage_complete("retrieve_dense", self._request.project_id, began,
-            output_count=sum(len(group) for group in results), reason_code="COMPLETE",
-            language=state.get("language", "und"))
+        stage_complete(
+            "retrieve_rare_terms",
+            self._request.project_id,
+            began,
+            output_count=len(anchored),
+            reason_code="COMPLETE",
+            language=state.get("language", "und"),
+        )
+        requests, results = await base_results_task
+        stage_complete(
+            "retrieve_dense",
+            self._request.project_id,
+            began,
+            output_count=sum(len(group) for group in results),
+            reason_code="COMPLETE",
+            language=state.get("language", "und"),
+        )
         if translation_task is not None and translation_slot is not None:
             try:
                 translated = await translation_task
@@ -673,12 +766,26 @@ class RetrievalNodesMixin:
                         (query, scope) for query in queries[translation_slot:] for scope in scopes
                     )
                 )
-                requests.extend(additional)
-                results.extend(
-                    await asyncio.gather(
-                        *(self._retrieve_scope(query, scope) for query, scope in additional)
+                if provider_scopes and federated_loader is not None:
+                    additional_queries = tuple(dict.fromkeys(query for query, _scope in additional))
+                    grouped = await asyncio.gather(
+                        *(federated_loader(query, provider_scopes) for query in additional_queries)
                     )
-                )
+                    requests.extend(
+                        (query, (provider,))
+                        for query in additional_queries
+                        for provider, _source_types in provider_scopes
+                    )
+                    results.extend(
+                        documents for query_groups in grouped for documents in query_groups
+                    )
+                else:
+                    requests.extend(additional)
+                    results.extend(
+                        await asyncio.gather(
+                            *(self._retrieve_scope(query, scope) for query, scope in additional)
+                        )
+                    )
             else:
                 queries.pop(translation_slot)
         (
@@ -993,38 +1100,58 @@ class RetrievalNodesMixin:
         overview_entity = state.get("overview_entity", "")
         project_overview = state.get("query_intent") == "PROJECT_OVERVIEW"
         from app.jira_query import current_jira_status_evidence
+
         current_candidates = current_jira_status_evidence(
-            state.get("resolved_question", self._request.question), candidates,
+            state.get("resolved_question", self._request.question),
+            candidates,
             state.get("query_intent"),
         )
         if len(current_candidates) != len(candidates):
             from app.quality_tracing import record_candidate_scores
+
             record_candidate_scores(current_candidates)
-            stage_complete("feature_affinity", self._request.project_id, began,
-                input_count=len(candidates), output_count=len(current_candidates),
-                reason_code="CURRENT_JIRA_STATE_ONLY", language=state.get("language", "und"))
+            stage_complete(
+                "feature_affinity",
+                self._request.project_id,
+                began,
+                input_count=len(candidates),
+                output_count=len(current_candidates),
+                reason_code="CURRENT_JIRA_STATE_ONLY",
+                language=state.get("language", "und"),
+            )
             return {"candidates": current_candidates, "feature_affinity_applied": True}
         section_loader = getattr(self._retriever, "ainvoke_jira_sections", None)
-        exact_sections = (candidates if state.get("jira_exact_section_loaded") else
-            await section_loader(self._request.question) if section_loader else [])
+        exact_sections = (
+            candidates
+            if state.get("jira_exact_section_loaded")
+            else await section_loader(self._request.question)
+            if section_loader
+            else []
+        )
         if exact_sections:
             from app.quality_tracing import record_candidate_scores
 
             record_candidate_scores(exact_sections)
             stage_complete(
-                "feature_affinity", self._request.project_id, began,
-                input_count=len(candidates), output_count=len(exact_sections),
-                reason_code="EXACT_JIRA_SECTION", language=state.get("language", "und"),
+                "feature_affinity",
+                self._request.project_id,
+                began,
+                input_count=len(candidates),
+                output_count=len(exact_sections),
+                reason_code="EXACT_JIRA_SECTION",
+                language=state.get("language", "und"),
             )
             return {"candidates": exact_sections, "feature_affinity_applied": True}
-        current_issue = exact_current_issue_evidence(
-            self._request.question, candidates
-        )
+        current_issue = exact_current_issue_evidence(self._request.question, candidates)
         if current_issue:
             stage_complete(
-                "feature_affinity", self._request.project_id, began,
-                input_count=len(candidates), output_count=len(current_issue),
-                reason_code="EXACT_CURRENT_ISSUE", language=state.get("language", "und"),
+                "feature_affinity",
+                self._request.project_id,
+                began,
+                input_count=len(candidates),
+                output_count=len(current_issue),
+                reason_code="EXACT_CURRENT_ISSUE",
+                language=state.get("language", "und"),
             )
             return {"candidates": current_issue, "feature_affinity_applied": True}
         if project_overview:
@@ -1498,10 +1625,17 @@ class RetrievalNodesMixin:
         if state.get("jira_exact_section_loaded") and _exact_jira_documents(
             state.get("resolved_question", self._request.question), documents
         ):
-            issue_prefixes = {key.split("-")[0].casefold() for key in re.findall(
-                r"\b[A-Z][A-Z0-9_]*-\d+\b", state.get("resolved_question", self._request.question), re.I
-            )}
-            if requested_entities <= issue_prefixes and (not uncertain_entity or uncertain_entity.casefold() in issue_prefixes):
+            issue_prefixes = {
+                key.split("-")[0].casefold()
+                for key in re.findall(
+                    r"\b[A-Z][A-Z0-9_]*-\d+\b",
+                    state.get("resolved_question", self._request.question),
+                    re.I,
+                )
+            }
+            if requested_entities <= issue_prefixes and (
+                not uncertain_entity or uncertain_entity.casefold() in issue_prefixes
+            ):
                 entity_mismatch = False
                 uncertain_mismatch = False
         entity_mismatch = entity_mismatch or uncertain_mismatch

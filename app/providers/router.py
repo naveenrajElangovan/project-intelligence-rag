@@ -80,11 +80,57 @@ _COMPLETION_CHECK = re.compile(
     re.I,
 )
 _TOPIC_STOP_WORDS = {
-    "all", "and", "anything", "are", "do", "does", "for", "from", "have", "has", "in",
-    "implement", "implementation", "is", "issue", "issues", "jira", "left", "of", "outstanding",
-    "pending", "remaining", "the", "ticket", "tickets", "to", "what", "which", "work",
-    "algo", "de", "del", "el", "en", "esta", "estan", "falta", "hay", "implementar", "jira",
-    "la", "las", "los", "para", "pendiente", "pendientes", "por", "que", "qué", "se", "trabajo",
+    "all",
+    "and",
+    "anything",
+    "are",
+    "do",
+    "does",
+    "for",
+    "from",
+    "have",
+    "has",
+    "in",
+    "implement",
+    "implementation",
+    "is",
+    "issue",
+    "issues",
+    "jira",
+    "left",
+    "of",
+    "outstanding",
+    "pending",
+    "remaining",
+    "the",
+    "ticket",
+    "tickets",
+    "to",
+    "what",
+    "which",
+    "work",
+    "algo",
+    "de",
+    "del",
+    "el",
+    "en",
+    "esta",
+    "estan",
+    "falta",
+    "hay",
+    "implementar",
+    "jira",
+    "la",
+    "las",
+    "los",
+    "para",
+    "pendiente",
+    "pendientes",
+    "por",
+    "que",
+    "qué",
+    "se",
+    "trabajo",
 }
 _SECTION_PATTERNS = (
     ("COMMENT", re.compile(r"\b(?:comments?|commented|comentarios?|coment[oó])\b", re.I)),
@@ -123,6 +169,8 @@ def select_providers(
     question: str,
     enabled: tuple[ProviderName, ...],
     structured_scope: StructuredConversationScope | None = None,
+    *,
+    explicit_selection: bool = False,
 ) -> ProviderSelection:
     requested_list = [
         provider
@@ -191,6 +239,25 @@ def select_providers(
             available_providers=enabled,
             reason="EXPLICIT_PROVIDER",
         )
+    # A client-selected provider set is an evidence boundary, not merely an
+    # availability hint. In particular, the UI's exclusive All chip sends all
+    # authorized providers. Treating that request like an omitted selection
+    # allowed the legacy planner to narrow an ambiguous question to one source
+    # family and made a large Jira corpus crowd out GitHub and Confluence.
+    if explicit_selection and len(enabled) > 1:
+        return ProviderSelection(
+            mode=ExecutionMode.FEDERATED,
+            providers=enabled,
+            available_providers=enabled,
+            reason="USER_SELECTED_PROVIDERS",
+        )
+    if explicit_selection and len(enabled) == 1:
+        return ProviderSelection(
+            mode=ExecutionMode.SINGLE_PROVIDER,
+            providers=enabled,
+            available_providers=enabled,
+            reason="USER_SELECTED_PROVIDER",
+        )
     if structured_scope is None and (
         _MORE.fullmatch(question) or (_FIXED.search(question) and _LIST.search(question))
     ):
@@ -225,9 +292,7 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             provider=ProviderName.JIRA,
             filters=_jira_filters(question),
         )
-    section_kinds = tuple(
-        kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question)
-    )
+    section_kinds = tuple(kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question))
     section_kind = section_kinds[0] if len(section_kinds) == 1 else None
     if keys and _CHILDREN.search(question):
         return StructuredQuery(

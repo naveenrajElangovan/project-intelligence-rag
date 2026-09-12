@@ -127,7 +127,12 @@ class ProviderNodesMixin:
             if self._settings.structured_conversation_enabled
             else None
         )
-        selection = select_providers(self._request.question, enabled, scope)
+        selection = select_providers(
+            self._request.question,
+            enabled,
+            scope,
+            explicit_selection=self._request.enabled_providers is not None,
+        )
         if scope is not None:
             if selection.reason == "JIRA_STRUCTURED_CONTEXT_INHERITED":
                 structured_context_decision("inherited_prevented_legacy_fallback")
@@ -462,11 +467,15 @@ class ProviderNodesMixin:
                     if child_rows
                     else ("- Ninguno" if language == "es" else "- None")
                 )
-                answer = "\n\n".join(rendered_details) + f"\n\n{children_heading}\n{children}" + snapshot
+                answer = (
+                    "\n\n".join(rendered_details) + f"\n\n{children_heading}\n{children}" + snapshot
+                )
         elif query.operation == StructuredOperation.SECTION_COUNT:
             section_kind = ", ".join(
                 _section_label(kind, language)
-                for kind in (query.section_kinds or ((query.section_kind,) if query.section_kind else ()))
+                for kind in (
+                    query.section_kinds or ((query.section_kind,) if query.section_kind else ())
+                )
             ) or _section_label(None, language)
             answer = (
                 f"**{result.total} indexed Jira {section_kind}** match this authorized scope.{snapshot}"
@@ -477,7 +486,9 @@ class ProviderNodesMixin:
             rows = result.rows
             section_kind = ", ".join(
                 _section_label(kind, language)
-                for kind in (query.section_kinds or ((query.section_kind,) if query.section_kind else ()))
+                for kind in (
+                    query.section_kinds or ((query.section_kind,) if query.section_kind else ())
+                )
             ) or _section_label(None, language)
             if not rows:
                 answer = (

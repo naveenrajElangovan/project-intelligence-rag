@@ -52,6 +52,37 @@ def test_non_jira_question_is_legacy_passthrough() -> None:
     assert selection.reason == "LEGACY_PASSTHROUGH"
 
 
+def test_explicit_all_selection_routes_unqualified_question_to_federation() -> None:
+    selection = select_providers(
+        "what is memoy here",
+        ENABLED,
+        explicit_selection=True,
+    )
+
+    assert selection.mode == ExecutionMode.FEDERATED
+    assert selection.providers == ENABLED
+    assert selection.reason == "USER_SELECTED_PROVIDERS"
+
+
+def test_omitted_selection_preserves_legacy_behavior_for_same_question() -> None:
+    selection = select_providers("what is memoy here", ENABLED)
+
+    assert selection.mode == ExecutionMode.LEGACY
+    assert selection.reason == "LEGACY_PASSTHROUGH"
+
+
+def test_explicit_single_source_selection_stays_inside_that_provider() -> None:
+    selection = select_providers(
+        "explain the memory behavior",
+        (ProviderName.GITHUB,),
+        explicit_selection=True,
+    )
+
+    assert selection.mode == ExecutionMode.SINGLE_PROVIDER
+    assert selection.providers == (ProviderName.GITHUB,)
+    assert selection.reason == "USER_SELECTED_PROVIDER"
+
+
 def test_disabled_provider_fails_closed_without_querying_another_provider() -> None:
     selection = select_providers(
         "What is the status of Jira ticket T0-120?", (ProviderName.GITHUB,)
@@ -146,9 +177,7 @@ def test_exact_jira_overview_includes_children_found_by_parent_issue_key() -> No
     selection = select_providers(
         "T0-7 what is this about, can you give an all detailed list for this?", ENABLED
     )
-    adapter = IndexedProviderAdapter(
-        ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever()
-    )
+    adapter = IndexedProviderAdapter(ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever())
 
     result = asyncio.run(adapter.aggregate(selection.structured_query))
 
@@ -164,9 +193,7 @@ def test_exact_jira_overview_renders_child_work_items() -> None:
 
     class Registry:
         def get(self, provider):
-            return IndexedProviderAdapter(
-                ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever()
-            )
+            return IndexedProviderAdapter(ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever())
 
     workflow = Workflow()
     workflow._request = RagRequest(
@@ -192,9 +219,7 @@ def test_exact_jira_overview_renders_child_work_items() -> None:
 
 def test_complete_jira_overview_summarizes_current_metadata_and_hierarchy() -> None:
     selection = select_providers("Summarize the whole Jira", ENABLED)
-    adapter = IndexedProviderAdapter(
-        ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever()
-    )
+    adapter = IndexedProviderAdapter(ProviderName.JIRA, "T2.0", _HierarchySnapshotRetriever())
 
     result = asyncio.run(adapter.aggregate(selection.structured_query))
 
@@ -210,15 +235,17 @@ def test_pending_topic_query_uses_complete_current_inventory() -> None:
         "jira:c:T0-1:CURRENT", "T0-1", "Print receipt QA / Impresión QA", "printing", "To Do"
     )
     review = _issue(
-        "jira:c:T0-2:CURRENT", "T0-2", "Printing workflow / Flujo de impresión", "printing", "In Review"
+        "jira:c:T0-2:CURRENT",
+        "T0-2",
+        "Printing workflow / Flujo de impresión",
+        "printing",
+        "In Review",
     )
     done = _issue(
         "jira:c:T0-3:CURRENT", "T0-3", "Print complete / Impresión completa", "printing", "Done"
     )
     unrelated = _issue("jira:c:T0-4:CURRENT", "T0-4", "Payments", "payments", "To Do")
-    alias_only = _issue(
-        "jira:c:T0-5:CURRENT", "T0-5", "Receipt layout", "printing", "In Review"
-    )
+    alias_only = _issue("jira:c:T0-5:CURRENT", "T0-5", "Receipt layout", "printing", "In Review")
     todo.metadata["status_category_key"] = "new"
     review.metadata["status_category_key"] = "indeterminate"
     done.metadata["status_category_key"] = "done"

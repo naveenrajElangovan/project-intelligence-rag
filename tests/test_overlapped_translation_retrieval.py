@@ -8,6 +8,7 @@ from langchain_core.documents import Document
 from app.config import Settings
 from app.llm import TokenUsage
 from app.models import RagRequest
+from app.providers.contracts import ExecutionMode, ProviderName, ProviderSelection
 from app.retrieval_pipeline import BM25Retriever, ReciprocalRankFusion
 from app.vocabulary import CorpusVocabulary
 from app.workflow_nodes.retrieval import RetrievalNodesMixin
@@ -125,9 +126,7 @@ async def _serial_and_overlapped():
 
 
 def test_overlapped_and_serial_retrieval_are_byte_identical() -> None:
-    serial, _serial_retriever, overlapped, overlap_retriever = asyncio.run(
-        _serial_and_overlapped()
-    )
+    serial, _serial_retriever, overlapped, overlap_retriever = asyncio.run(_serial_and_overlapped())
 
     assert _snapshot(overlapped) == _snapshot(serial)
     assert overlapped["queries"] == (ORIGINAL, TRANSLATED)
@@ -165,3 +164,48 @@ def test_unsafe_translation_never_reaches_retrieval() -> None:
 
     assert retriever.queries == [ORIGINAL]
     assert result["queries"] == (ORIGINAL,)
+
+
+def test_federated_provider_windows_remain_aligned_for_rank_fusion() -> None:
+    class FederatedRetriever(FixedRetriever):
+        def __init__(self) -> None:
+            super().__init__(asyncio.Event())
+            self.scopes = ()
+
+        async def ainvoke_federated(self, query, provider_scopes):
+            self.queries.append(query)
+            self.scopes = provider_scopes
+            return [
+                [_document("jira", 0.93)],
+                [_document("confluence", 0.92)],
+                [_document("github", 0.91)],
+            ]
+
+    retriever = FederatedRetriever()
+    result = asyncio.run(
+        RetrievalHarness(retriever)._retrieve(
+            {
+                "queries": (ORIGINAL,),
+                "resolved_question": ORIGINAL,
+                "rerank_queries": (ORIGINAL,),
+                "query_intent": "DIRECT",
+                "source_types": ("ISSUE", "PAGE", "CODE"),
+                "provider_selection": ProviderSelection(
+                    mode=ExecutionMode.FEDERATED,
+                    providers=(
+                        ProviderName.JIRA,
+                        ProviderName.CONFLUENCE,
+                        ProviderName.GITHUB,
+                    ),
+                ),
+            }
+        )
+    )
+
+    assert retriever.queries == [ORIGINAL]
+    assert [provider for provider, _types in retriever.scopes] == [
+        "JIRA",
+        "CONFLUENCE",
+        "GITHUB",
+    ]
+    assert result["dense_candidate_count"] == 3

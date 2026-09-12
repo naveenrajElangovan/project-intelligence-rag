@@ -34,23 +34,24 @@ class QuotaFallbackIndex:
                 "Unrelated printer configuration.",
             ],
             "metadatas": [
-                    {
-                        "project_id": "DEMO",
-                        "access_policy_id": "project:DEMO",
-                        "schema_version": "3",
-                        "embedding_model": "multilingual-e5-large",
-                        "source_type": "CODE",
-                        "title": "HomeScreen.kt",
-                        "path": "src/HomeScreen.kt",
-                        "file_name": "HomeScreen.kt",
-                    }, {
-                        "project_id": "DEMO",
-                        "access_policy_id": "project:DEMO",
-                        "schema_version": "3",
-                        "embedding_model": "multilingual-e5-large",
-                        "source_type": "CODE",
-                        "title": "Printer.kt",
-                    },
+                {
+                    "project_id": "DEMO",
+                    "access_policy_id": "project:DEMO",
+                    "schema_version": "3",
+                    "embedding_model": "multilingual-e5-large",
+                    "source_type": "CODE",
+                    "title": "HomeScreen.kt",
+                    "path": "src/HomeScreen.kt",
+                    "file_name": "HomeScreen.kt",
+                },
+                {
+                    "project_id": "DEMO",
+                    "access_policy_id": "project:DEMO",
+                    "schema_version": "3",
+                    "embedding_model": "multilingual-e5-large",
+                    "source_type": "CODE",
+                    "title": "Printer.kt",
+                },
             ],
         }
 
@@ -58,6 +59,15 @@ class QuotaFallbackIndex:
 class FakeEmbedder:
     def embed_query(self, query):
         return [0.1, 0.2]
+
+
+class CountingEmbedder(FakeEmbedder):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def embed_query(self, query):
+        self.calls += 1
+        return super().embed_query(query)
 
 
 class FailingEmbedder:
@@ -72,16 +82,20 @@ def _query_result(chunk_id="chunk-1", text="Only authorized project evidence."):
         "ids": [[chunk_id]],
         "documents": [[text]],
         "distances": [[0.09]],
-        "metadatas": [[{
-            "project_id": "DEMO",
-            "access_policy_id": "project:DEMO",
-            "schema_version": "3",
-            "embedding_model": "multilingual-e5-large",
-            "source_type": "CODE",
-            "title": "Payment.kt",
-            "reference": "repo:Payment.kt:1-4",
-            "source_url": "https://github.example/Payment.kt",
-        }]],
+        "metadatas": [
+            [
+                {
+                    "project_id": "DEMO",
+                    "access_policy_id": "project:DEMO",
+                    "schema_version": "3",
+                    "embedding_model": "multilingual-e5-large",
+                    "source_type": "CODE",
+                    "title": "Payment.kt",
+                    "reference": "repo:Payment.kt:1-4",
+                    "source_url": "https://github.example/Payment.kt",
+                }
+            ]
+        ],
     }
 
 
@@ -94,6 +108,26 @@ class FakeIndex:
         return _query_result()
 
 
+class FederatedIndex(FakeIndex):
+    def __init__(self) -> None:
+        super().__init__()
+        self.query_args = []
+
+    def query(self, **kwargs):
+        self.query_args.append(kwargs)
+        filters = kwargs["where"]["$and"]
+        provider = next(item["provider"]["$eq"] for item in filters if "provider" in item)
+        source_filter = next(item["source_type"] for item in filters if "source_type" in item)
+        source_type = source_filter.get("$eq") or source_filter["$in"][0]
+        result = _query_result(
+            f"{provider.lower()}-1",
+            f"{provider} evidence",
+        )
+        result["metadatas"][0][0]["provider"] = provider
+        result["metadatas"][0][0]["source_type"] = source_type
+        return result
+
+
 class SchemaThreeIndex(FakeIndex):
     def get(self, **kwargs):
         if kwargs.get("offset", 0):
@@ -101,22 +135,27 @@ class SchemaThreeIndex(FakeIndex):
         return {
             "ids": ["jira-current"],
             "documents": ["Current Jira issue"],
-            "metadatas": [{
-                "project_id": "DEMO",
-                "access_policy_id": "project:DEMO",
-                "schema_version": "3",
-                "embedding_model": "multilingual-e5-large",
-                "source_type": "ISSUE",
-                "jira_chunk_kind": "CURRENT",
-            }],
+            "metadatas": [
+                {
+                    "project_id": "DEMO",
+                    "access_policy_id": "project:DEMO",
+                    "schema_version": "3",
+                    "embedding_model": "multilingual-e5-large",
+                    "source_type": "ISSUE",
+                    "jira_chunk_kind": "CURRENT",
+                }
+            ],
         }
 
 
 def test_authorized_corpus_cache_isolated_by_schema_and_embedding() -> None:
     _FALLBACK_CORPUS_CACHE.clear()
     common = dict(
-        index=SchemaThreeIndex(), collection_name="collection", embedder=FakeEmbedder(),
-        project_id="DEMO", access_policy_ids=("project:DEMO",),
+        index=SchemaThreeIndex(),
+        collection_name="collection",
+        embedder=FakeEmbedder(),
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
         required_embedding_model="multilingual-e5-large",
     )
     incompatible = ChromaAccessRetriever(**common, required_schema_version="4")
@@ -214,14 +253,48 @@ def test_langchain_retriever_always_applies_project_and_access_filters() -> None
     assert index.query_args["where"] == {
         "$and": [
             {"project_id": {"$eq": "DEMO"}},
-            {
-                "access_policy_id": {
-                    "$in": ["project:DEMO", "user:user-id"]
-                }
-            },
+            {"access_policy_id": {"$in": ["project:DEMO", "user:user-id"]}},
             {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
         ]
     }
+
+
+def test_federated_retrieval_embeds_once_and_reserves_each_provider_window() -> None:
+    index = FederatedIndex()
+    embedder = CountingEmbedder()
+    retriever = ChromaAccessRetriever(
+        index=index,
+        collection_name="project-intelligence",
+        embedder=embedder,
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
+        top_k=8,
+        score_threshold=0.0,
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+    )
+
+    groups = asyncio.run(
+        retriever.ainvoke_federated(
+            "explain project memory",
+            (
+                ("JIRA", ("ISSUE", "ATTACHMENT")),
+                ("GITHUB", ("CODE",)),
+                ("CONFLUENCE", ("PAGE", "ATTACHMENT")),
+            ),
+        )
+    )
+
+    assert embedder.calls == 1
+    assert [group[0].metadata["provider"] for group in groups] == [
+        "JIRA",
+        "GITHUB",
+        "CONFLUENCE",
+    ]
+    assert {
+        next(item["provider"]["$eq"] for item in call["where"]["$and"] if "provider" in item)
+        for call in index.query_args
+    } == {"JIRA", "GITHUB", "CONFLUENCE"}
 
 
 def test_scoped_retrieval_adds_source_filter_without_weakening_authorization() -> None:
@@ -268,9 +341,7 @@ def test_structure_route_lookup_keeps_project_and_source_boundaries() -> None:
 
     assert [document.metadata["chunk_id"] for document in documents] == ["target"]
     assert documents[0].metadata["canonical_route_anchor"] is True
-    assert index.get_args["where"]["$and"][-1] == {
-        "source_type": {"$eq": "PAGE"}
-    }
+    assert index.get_args["where"]["$and"][-1] == {"source_type": {"$eq": "PAGE"}}
 
 
 def test_department_policy_is_accepted_and_other_department_is_rejected() -> None:
@@ -337,9 +408,7 @@ def test_retrieval_boundary_canonicalizes_separatorless_page_tables() -> None:
 
     assert document is not None
     assert document.page_content == (
-        "| Key | Action | Condition |\n"
-        "| --- | --- | --- |\n"
-        "| F1 | Close sale | main screen |"
+        "| Key | Action | Condition |\n| --- | --- | --- |\n| F1 | Close sale | main screen |"
     )
     assert contains_table(document.page_content) is True
 
@@ -452,9 +521,7 @@ def test_dense_retrieval_is_retried_on_the_next_request_after_fallback() -> None
         def embed_query(self, query):
             self.calls += 1
             if self.calls == 1:
-                error = RuntimeError(
-                    "local embedding process temporarily unavailable"
-                )
+                error = RuntimeError("local embedding process temporarily unavailable")
                 error.status_code = 503  # type: ignore[attr-defined]
                 raise error
             return super().embed_query(query)
@@ -597,12 +664,8 @@ def test_mixed_lexical_corpus_reserves_space_for_page_evidence() -> None:
     documents, truncated = retriever._fetch_fallback_corpus(("CODE", "PAGE"))
 
     assert truncated is True
-    assert [document.metadata["source_type"] for document in documents[:60]] == [
-        "PAGE"
-    ] * 60
-    assert [document.metadata["source_type"] for document in documents[60:]] == [
-        "CODE"
-    ] * 40
+    assert [document.metadata["source_type"] for document in documents[:60]] == ["PAGE"] * 60
+    assert [document.metadata["source_type"] for document in documents[60:]] == ["CODE"] * 40
     assert index.source_calls[0] == "PAGE"
 
 
@@ -626,9 +689,7 @@ def test_rare_terms_use_corpus_percentile_not_query_percentile(monkeypatch) -> N
         lambda _self, _source_types: cached,
     )
 
-    assert _retriever_for_rare_terms()._rare_query_terms(
-        "common unicorn", ()
-    ) == ("unicorn",)
+    assert _retriever_for_rare_terms()._rare_query_terms("common unicorn", ()) == ("unicorn",)
 
 
 def _retriever_for_rare_terms() -> ChromaAccessRetriever:
@@ -658,7 +719,6 @@ def test_startup_warms_each_project_scoped_lexical_corpus(monkeypatch) -> None:
         def _cached_authorized_corpus(self, scope):
             warmed_scopes.append(scope)
 
-    import chromadb
     from app.config import Settings
 
     monkeypatch.setattr("app.retrieval.shared_chroma_client", lambda *_args: Client())
