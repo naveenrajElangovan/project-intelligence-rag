@@ -294,10 +294,24 @@ class IndexedProviderAdapter(ProviderAdapter):
         )
 
     async def _jira_sections(self, query: StructuredQuery, loader: object) -> StructuredResult:
-        section_kind = str(
-            query.section_kind or next(iter(query.filters.get("section_kind", ())), "")
-        ).upper()
-        source_types = ("ATTACHMENT",) if section_kind == "ATTACHMENT" else ("ISSUE",)
+        section_kinds = tuple(
+            dict.fromkeys(
+                value.upper()
+                for value in (
+                    query.section_kinds
+                    or query.filters.get("section_kind", ())
+                    or ((query.section_kind,) if query.section_kind else ())
+                )
+                if value
+            )
+        )
+        source_types = (
+            ("ISSUE", "ATTACHMENT")
+            if "ATTACHMENT" in section_kinds and len(section_kinds) > 1
+            else ("ATTACHMENT",)
+            if section_kinds == ("ATTACHMENT",)
+            else ("ISSUE",)
+        )
         documents, complete = await loader(source_types)
         filters = {key: values for key, values in query.filters.items() if key != "section_kind"}
         matched = [
@@ -305,21 +319,25 @@ class IndexedProviderAdapter(ProviderAdapter):
             for document in documents
             if (
                 (
-                    section_kind == "ATTACHMENT"
+                    "ATTACHMENT" in section_kinds
                     and str(document.metadata.get("source_type") or "").upper() == "ATTACHMENT"
                 )
-                or str(document.metadata.get("jira_chunk_kind") or "").upper() == section_kind
+                or str(document.metadata.get("jira_chunk_kind") or "").upper() in section_kinds
             )
             and _matches(document, filters)
         ]
         records: dict[str, list[Document]] = {}
         for document in matched:
             metadata = document.metadata
+            actual_kind = str(
+                metadata.get("jira_chunk_kind")
+                or ("ATTACHMENT" if metadata.get("source_type") == "ATTACHMENT" else "")
+            ).upper()
             identity = ":".join(
                 (
                     str(metadata.get("cloud_id") or ""),
                     str(metadata.get("issue_key") or ""),
-                    section_kind,
+                    actual_kind,
                     str(
                         metadata.get("event_id")
                         or metadata.get("attachment_id")
@@ -340,7 +358,30 @@ class IndexedProviderAdapter(ProviderAdapter):
             ),
         )
         page = ordered[query.offset : query.offset + query.limit]
-        rows = tuple(_section_row(group, section_kind) for group in page)
+        rows = tuple(
+            {
+                **_section_row(
+                    group,
+                    str(
+                        group[0].metadata.get("jira_chunk_kind")
+                        or (
+                            "ATTACHMENT"
+                            if group[0].metadata.get("source_type") == "ATTACHMENT"
+                            else ""
+                        )
+                    ).upper(),
+                ),
+                "section_kind": str(
+                    group[0].metadata.get("jira_chunk_kind")
+                    or (
+                        "ATTACHMENT"
+                        if group[0].metadata.get("source_type") == "ATTACHMENT"
+                        else ""
+                    )
+                ).upper(),
+            }
+            for group in page
+        )
         evidence_groups = ordered if query.operation == StructuredOperation.SECTION_COUNT else page
         evidence = tuple(
             _envelope(self.name, self._project_id, group[0]) for group in evidence_groups

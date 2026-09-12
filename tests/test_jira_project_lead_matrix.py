@@ -38,6 +38,13 @@ JIRA_ONLY = (ProviderName.JIRA,)
         ("Give me a Jira status report", ALL, "DISTRIBUTION", None, None),
         ("Dame un informe de estado de Jira", ALL, "DISTRIBUTION", None, None),
         ("Summarize the whole Jira", ALL, "OVERVIEW", None, None),
+        (
+            "Summarize the Jira project status, including totals, statuses, issue types, labels, parent and child work items.",
+            JIRA_ONLY,
+            "OVERVIEW",
+            None,
+            None,
+        ),
         ("Dame un resumen general de Jira", ALL, "OVERVIEW", None, None),
         ("Summarize project status", JIRA_ONLY, "OVERVIEW", None, None),
         ("Resume el estado del proyecto", JIRA_ONLY, "OVERVIEW", None, None),
@@ -110,6 +117,14 @@ def test_project_lead_jira_intents_are_deterministic(question, enabled, operatio
     assert selection.structured_query.operation == StructuredOperation(operation)
     if field:
         assert value in selection.structured_query.filters[field]
+
+
+def test_multiple_jira_sections_are_kept_in_one_typed_query() -> None:
+    selection = select_providers("Give me all comments and history for T0-122", ALL)
+
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.SECTION
+    assert selection.structured_query.section_kinds == ("COMMENT", "CHANGELOG")
 
 
 @pytest.mark.parametrize(

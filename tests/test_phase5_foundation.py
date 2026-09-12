@@ -220,8 +220,8 @@ def test_code_assisted_ranks_both_source_families_without_reserved_slots() -> No
     limit = workflow._settings.max_chunks_per_source
 
     code_first = [
-        _document(f"code-{index}", 1 - index / 100, "CODE") for index in range(10)
-    ] + [_document(f"page-{index}", 0.5 - index / 100, "PAGE") for index in range(10)]
+        _document(f"code-{index}", 1 - index / 100, "CODE") for index in range(window)
+    ] + [_document(f"page-{index}", 0.5 - index / 100, "PAGE") for index in range(window)]
     selected = asyncio.run(
         workflow._rerank_code_assisted("events", code_first, limit)
     )
@@ -230,8 +230,8 @@ def test_code_assisted_ranks_both_source_families_without_reserved_slots() -> No
     assert sum(item.metadata["source_type"] == "CODE" for item in selected) == window
 
     page_first = [
-        _document(f"page-{index}", 1 - index / 100, "PAGE") for index in range(10)
-    ] + [_document(f"code-{index}", 0.5 - index / 100, "CODE") for index in range(10)]
+        _document(f"page-{index}", 1 - index / 100, "PAGE") for index in range(window)
+    ] + [_document(f"code-{index}", 0.5 - index / 100, "CODE") for index in range(window)]
     selected = asyncio.run(
         workflow._rerank_code_assisted("events", page_first, limit)
     )

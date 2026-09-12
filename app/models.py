@@ -155,6 +155,7 @@ class RagRequest(BaseModel):
     evaluation: bool = False
 
     project_id: str = Field(alias="projectId", min_length=1, max_length=100)
+    user_id: str | None = Field(default=None, alias="userId", min_length=1, max_length=128)
     collection_name: str = Field(
         alias="collectionName", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{2,62}$"
     )

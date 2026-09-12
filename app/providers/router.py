@@ -50,7 +50,7 @@ _OVERVIEW = re.compile(
     r"\b(?:jira overview|overview of jira|summari[sz]e jira|summari[sz]e (?:the )?(?:whole|entire) jira|"
     r"whole jira|entire jira|complete jira report|resumen (?:general )?de jira|"
     r"resume (?:todo )?jira|informe completo de jira|"
-    r"summari[sz]e (?:the )?project status|project status (?:summary|overview)|"
+    r"summari[sz]e (?:the )?(?:jira )?project status|project status (?:summary|overview)|"
     r"(?:give|show) me (?:the )?project status|overall project status|how is the project doing|"
     r"resumen del estado del proyecto|resume (?:el )?estado del proyecto|"
     r"muestra (?:el )?estado del proyecto|c[oó]mo va el proyecto)\b",
@@ -216,17 +216,27 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
         return None
     if keys and (_GITHUB.search(question) or _CONFLUENCE.search(question)):
         return None
-    section_kind = next(
-        (kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question)), None
+    # A project overview may explicitly request hierarchy, comments, or
+    # attachment totals. Those nouns describe requested breakdowns; without a
+    # specific issue key they must not narrow the whole request to one section.
+    if not keys and _OVERVIEW.search(question):
+        return StructuredQuery(
+            operation=StructuredOperation.OVERVIEW,
+            provider=ProviderName.JIRA,
+            filters=_jira_filters(question),
+        )
+    section_kinds = tuple(
+        kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question)
     )
+    section_kind = section_kinds[0] if len(section_kinds) == 1 else None
     if keys and _CHILDREN.search(question):
         return StructuredQuery(
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
             filters={"issue_key": keys},
         )
-    if section_kind and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
-        section_filters: dict[str, tuple[str, ...]] = {"section_kind": (section_kind,)}
+    if section_kinds and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
+        section_filters: dict[str, tuple[str, ...]] = {"section_kind": section_kinds}
         if keys:
             section_filters["issue_key"] = keys
         return StructuredQuery(
@@ -238,6 +248,7 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             provider=ProviderName.JIRA,
             filters=section_filters,
             section_kind=section_kind,
+            section_kinds=section_kinds,
             limit=20,
         )
     if keys and not _CROSS.search(question):
@@ -371,6 +382,7 @@ def _jira_structured_followup(
     operation = StructuredOperation(scope.operation)
     group_by = scope.group_by
     section_kind = None
+    section_kinds: tuple[str, ...] = ()
     requested_fact = None
     offset = 0
     labels = tuple(
@@ -388,6 +400,7 @@ def _jira_structured_followup(
         )
         offset = scope.next_offset
         section_kind = filters.get("section_kind", (None,))[0]
+        section_kinds = tuple(filters.get("section_kind", ()))
     elif _COMPLETION_CHECK.search(question):
         issue_keys = filters.get("issue_key", ())
         if len(issue_keys) != 1:
@@ -399,6 +412,7 @@ def _jira_structured_followup(
         operation = candidate.operation
         group_by = candidate.group_by
         section_kind = candidate.section_kind
+        section_kinds = candidate.section_kinds
         incoming = candidate.filters
         if "issue_key" in incoming:
             filters = dict(incoming)
@@ -444,6 +458,7 @@ def _jira_structured_followup(
         filters=filters,
         group_by=group_by,
         section_kind=section_kind,
+        section_kinds=section_kinds,
         requested_fact=requested_fact,
         offset=offset,
         limit=scope.page_size,

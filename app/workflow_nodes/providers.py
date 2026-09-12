@@ -464,7 +464,10 @@ class ProviderNodesMixin:
                 )
                 answer = "\n\n".join(rendered_details) + f"\n\n{children_heading}\n{children}" + snapshot
         elif query.operation == StructuredOperation.SECTION_COUNT:
-            section_kind = _section_label(query.section_kind, language)
+            section_kind = ", ".join(
+                _section_label(kind, language)
+                for kind in (query.section_kinds or ((query.section_kind,) if query.section_kind else ()))
+            ) or _section_label(None, language)
             answer = (
                 f"**{result.total} indexed Jira {section_kind}** match this authorized scope.{snapshot}"
                 if language == "en"
@@ -472,7 +475,10 @@ class ProviderNodesMixin:
             )
         elif query.operation == StructuredOperation.SECTION:
             rows = result.rows
-            section_kind = _section_label(query.section_kind, language)
+            section_kind = ", ".join(
+                _section_label(kind, language)
+                for kind in (query.section_kinds or ((query.section_kind,) if query.section_kind else ()))
+            ) or _section_label(None, language)
             if not rows:
                 answer = (
                     f"No indexed Jira {section_kind} match this authorized scope.{snapshot}"
@@ -483,6 +489,8 @@ class ProviderNodesMixin:
                 rendered_sections = []
                 for row in rows:
                     heading_bits = [str(row["key"])]
+                    if len(query.section_kinds) > 1 and row.get("section_kind"):
+                        heading_bits.append(_section_label(str(row["section_kind"]), language))
                     if row.get("event_id"):
                         heading_bits.append(f"#{row['event_id']}")
                     if row.get("author"):

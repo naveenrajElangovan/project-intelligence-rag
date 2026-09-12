@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     )
     provider_timeout_seconds: float = 20.0
     provider_max_list_items: int = 50
+    atlassian_service_url: str = "http://atlassian:8000"
+    atlassian_service_internal_api_key: str = ""
+    atlassian_live_verification_enabled: bool = False
     admission_capacity_override: int | None = None
     load_shed_wait_seconds: float = 0.05
     openai_api_key: str = ""
