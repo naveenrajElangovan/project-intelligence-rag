@@ -518,3 +518,5 @@ not import the composition root. Architecture tests enforce these boundaries.
     authorization, provider-scope, and legacy-provider regressions.
 13. Authorization and explicit source selection constrain evidence before ranking. Retrieval scores
     order authorized evidence; generation explains it; grounding decides whether claims are released.
+14. Optional cache warm-up never marks the whole RAG service unavailable. Required dependencies stay
+    in readiness checks, while cold caches populate in the background or on the authorized query path.

@@ -7,8 +7,8 @@ with Chroma unavailable the client retried in there indefinitely. The launcher's
 health poll then failed and the service looked crashed while the process was
 alive and stuck.
 
-Liveness must not depend on a downstream. Readiness may, and /ready already
-distinguishes the two.
+Liveness must not depend on a downstream. Readiness checks required serving
+dependencies, while the optional lexical cache warms independently.
 """
 
 from __future__ import annotations

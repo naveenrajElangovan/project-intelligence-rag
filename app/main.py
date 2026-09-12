@@ -124,8 +124,8 @@ async def _warm_or_report(name: str, awaitable) -> None:
         raise
     except Exception as failure:
         logging.getLogger("app.startup").warning(
-            "The %s warm-up failed (%s: %s); serving cold. /ready stays 503 "
-            "while its dependency is unavailable.",
+            "The %s warm-up failed (%s: %s); serving cold while its dependency "
+            "is unavailable.",
             name,
             type(failure).__name__,
             failure,
@@ -331,11 +331,10 @@ async def metrics() -> Response:
 
 @app.get("/ready")
 async def ready(settings: Settings = Depends(get_settings)) -> dict[str, str]:
-    if not app.state.lexical_corpus_ready:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "The lexical retrieval corpus is still warming.",
-        )
+    # The authorized lexical corpus is an optimization and continues warming in
+    # the background. Exact structured operations and dense retrieval remain
+    # correct while it is cold, so cache temperature must not take the whole
+    # application out of service.
     if not settings.llm_configured:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
