@@ -63,6 +63,12 @@ On the validated Apple Silicon laptop, use `./scripts/start_local_macos.sh` and
 
 The implemented design, diagrams, security boundaries, code map, deployment topology, and failure
 behavior are documented in the single [current RAG architecture](docs/CURRENT_ARCHITECTURE.md).
+
+The complete service boundaries are documented in the
+[backend architecture](../project-intelligence-backend/docs/CURRENT_ARCHITECTURE.md),
+[ingestion architecture](../project-intelligence-ingestion/docs/CURRENT_ARCHITECTURE.md),
+[Atlassian integration architecture](../project-intelligence-atlassian/docs/ARCHITECTURE.md), and
+[observability architecture](../project-intelligence-observability/docs/ARCHITECTURE.md).
 Provider selection, exact Jira aggregates, LiteLLM model routing, operational controls, and live
 verification are documented in [provider routing and Jira aggregates](docs/PROVIDER_ROUTING_AND_JIRA_AGGREGATES.md).
 The company-facing privacy, LLM data-use, threat-model, and production approval guidance is in the

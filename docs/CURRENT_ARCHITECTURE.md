@@ -1,6 +1,6 @@
 # Project Intelligence RAG — current architecture
 
-Last verified against the repository code: 2026-08-31.
+Last verified against the repository code and active development topology: 2026-09-12.
 
 This is the single architecture reference for the RAG project. It describes the implemented
 service, its trust boundaries, its retrieval and answer pipeline, its dependencies, and its
@@ -42,6 +42,7 @@ flowchart LR
     R -->|"Local query embeddings"| E["multilingual-e5-large"]
     R -->|"Candidate reranking and grounding"| X["bge-reranker-v2-m3"]
     R -->|"Grounded prompt"| L["Configured answer LLM"]
+    R -->|"fresh authorized Jira/Confluence verification"| A["Atlassian integration service"]
     R -->|"Metrics and content-free events"| O["Observability stack"]
     R -->|"Validated answer + sources"| B
 
@@ -51,7 +52,7 @@ flowchart LR
     classDef private fill:#e8f1ff,stroke:#175cd3,color:#111;
     classDef data fill:#eaf7ea,stroke:#2e7d32,color:#111;
     class U,B public;
-    class R,E,X,L,O,I private;
+    class R,E,X,L,A,O,I private;
     class C data;
 ```
 
@@ -168,6 +169,18 @@ Security is deliberately redundant:
 The RAG process is read-only toward Chroma. Ingestion is the only vector writer.
 
 ## 7. LangGraph workflow
+
+The current graph adds a provider-planning layer before the legacy retrieval path. Provider
+adapters implement capabilities, exact lookup, structured aggregates, semantic retrieval, health,
+and freshness behind one registry. Explicit source chips are an allowlist: `All` is exclusive,
+while Jira, Confluence, and GitHub can be combined only when the authorized provider catalog permits
+federation. Disabling provider routing sends eligible requests through the legacy pipeline without
+changing its evidence ordering.
+
+Structured Jira requests resolve before provider routing. Conversation context version 3 stores a
+server-owned Jira scope with typed filters, operation, snapshot completeness, and pagination offset.
+Elliptical turns such as “which are in progress?” inherit that scope, reapply authorization, and
+query current-state Jira records; previous assistant prose is never evidence.
 
 ```mermaid
 flowchart TD
@@ -287,6 +300,12 @@ reverify the remainder; it cannot invent replacement facts.
 
 ## 9. Model architecture
 
+Model access is routed through the LiteLLM SDK. `app/model_gateway.py` builds a bounded LiteLLM
+router from models configured in the environment and exposes it to LangChain through
+`ChatLiteLLMRouter`. Model groups, fallback behavior, and routing strategy are configuration data.
+Provider routing and model routing are independent: the former chooses evidence sources, while the
+latter chooses an LLM deployment after evidence has been selected.
+
 The service has three distinct model jobs:
 
 | Job | Current implementation | Why separate |
@@ -295,9 +314,9 @@ The service has three distinct model jobs:
 | Candidate reranking/grounding | Local `bge-reranker-v2-m3` | More precise pairwise relevance/support |
 | Planning and answering | Configured Ollama, OpenAI, or Azure OpenAI model | Produces structured plans and language |
 
-Development can use a local Ollama model. Production may use an explicitly configured provider.
-There is no automatic provider fallback. Model profiles change cost/latency selection but never
-change project access.
+Development can use a local Ollama model or configured hosted deployments. LiteLLM may perform
+explicitly configured fallback within a model group. Model profiles and fallback order change
+cost/latency selection but never change project access.
 
 Factual operations use temperature `0`. Bounded overview synthesis may use a small configured
 temperature, capped at `0.2`. Retrieval, authorization, reranking, citation validation, and exact
@@ -344,6 +363,10 @@ but are never evidence. Every answer performs fresh authorized retrieval.
 
 RAG may return a private context update. The backend decides whether to persist it and protects
 against an older concurrent response overwriting newer state.
+
+Structured scope contains normalized routing state only: provider, resource type, typed filters,
+operation, grouping, snapshot timestamp/completeness, page size/offset, and active subject. It is
+validated on every turn and cleared when the project, provider, filters, or subject changes.
 
 ## 14. Failure behavior
 
