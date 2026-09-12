@@ -1,0 +1,85 @@
+{
+  "runId": "atlassian-integration-20260911",
+  "status": "RUNNING_READ_ONLY_REST_FALLBACK",
+  "revisions": {
+    "rag": "f0a1854",
+    "backend": "dd8f452",
+    "ingestion": "3b9e61c",
+    "atlassian": "f815e4e"
+  },
+  "scope": {
+    "applicationProject": "T2.0",
+    "jiraSite": "naveenraj-elangovan.atlassian.net",
+    "jiraProject": "T0",
+    "logicalCollection": "jira-stage-20260911-jira-complete-v3",
+    "schemaVersion": "3",
+    "checkpoint": "2026-09-12T02:57:18.497854+00:00",
+    "jiraFreshAt": "2026-09-12T03:02:25.806783+00:00"
+  },
+  "inventory": {
+    "collectionRecords": 8097,
+    "jiraChunks": 2971,
+    "currentIssues": 131,
+    "uniqueCurrentIdentities": 131,
+    "posIssues": 60,
+    "botIssues": 60,
+    "chunkKinds": {
+      "CURRENT": 131,
+      "DESCRIPTION": 1442,
+      "ACCEPTANCE": 245,
+      "RELATIONSHIP": 228,
+      "CUSTOM_FIELD": 257,
+      "COMMENT": 421,
+      "CHANGELOG": 231,
+      "ATTACHMENT": 16
+    },
+    "languages": {"es": 1134, "en": 922, "mixed": 240, "und": 675},
+    "tokens": {"min": 1, "p50": 34, "p95": 89, "max": 223, "over512": 0}
+  },
+  "quarantine": {
+    "reason": "POTENTIAL_SECRET",
+    "latestVersionNotIndexed": [
+      "T0-122", "T0-124", "T0-125", "T0-127",
+      "T0-128", "T0-129", "T0-130", "T0-131"
+    ],
+    "previousValidVersionRetained": true
+  },
+  "quality": {
+    "evaluationCases": 40,
+    "httpSuccess": 1.0,
+    "candidateEvidenceRecall": 1.0,
+    "selectedEvidenceRecall": 1.0,
+    "groundedAnswerOrAbstention": 0.9333333333,
+    "negativeSafeAbstention": 1.0,
+    "exactCurrentStatus": {"passed": 4, "total": 4},
+    "exactAggregates": {"passed": 2, "total": 2},
+    "unauthorizedExposure": 0,
+    "silentTokenOverflow": 0,
+    "citationCorrectness": null,
+    "conversationAssertionsPassed": 31
+  },
+  "eventCanary": {
+    "accepted": true,
+    "duplicateReplayRejected": true,
+    "targetedIngestionHttpStatus": 200,
+    "collectionCountBefore": 8097,
+    "collectionCountAfter": 8097,
+    "currentBefore": 131,
+    "currentAfter": 131,
+    "uniqueCurrentAfter": 131
+  },
+  "tests": {
+    "ragPassed": 1141,
+    "atlassianPassed": 25,
+    "backendFullSuite": "PASS",
+    "ingestionFullSuite": "PASS"
+  },
+  "activation": {
+    "restFallback": true,
+    "forgeRegistered": false,
+    "forgeInstalled": false,
+    "rovoMcpServiceAuthorized": false,
+    "perUserRovoSessionsActive": false,
+    "writeEnabled": false
+  }
+}
