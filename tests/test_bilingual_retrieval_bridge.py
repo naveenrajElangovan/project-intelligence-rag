@@ -157,13 +157,13 @@ def test_exhausted_retries_still_attempt_an_answer_when_evidence_exists() -> Non
     assert _router(settings.max_retrieval_attempts, [_document(0.009)]) == "generate"
 
 
-def test_exhausted_noise_ends_below_the_derived_floor_only() -> None:
+def test_exhausted_low_scored_evidence_still_reaches_truth_gates() -> None:
     settings = _settings()
     documents = [_document(0.0009)]
 
     assert _router(
         settings.max_retrieval_attempts, documents, relevance=0.0009
-    ) == "end"
+    ) == "generate"
     assert _router(
         settings.max_retrieval_attempts, documents, relevance=0.0011
     ) == "generate"
@@ -194,7 +194,7 @@ def test_complete_evidence_goes_straight_to_generation() -> None:
     assert _router(1, [_document(0.9)], missing=()) == "generate"
 
 
-def test_explicit_zero_relevance_ends_before_generation() -> None:
+def test_explicit_zero_relevance_with_evidence_reaches_truth_gates() -> None:
     from app.workflow_nodes.retrieval import RetrievalNodesMixin
 
     router = RetrievalNodesMixin.__new__(RetrievalNodesMixin)
@@ -207,7 +207,7 @@ def test_explicit_zero_relevance_ends_before_generation() -> None:
             "missing_requirements": (),
             "retrieval_attempt": 1,
         }
-    ) == "end"
+    ) == "generate"
 
 
 def test_a_populated_ungrounded_request_still_reaches_the_truth_gate() -> None:

@@ -38,15 +38,17 @@ def test_only_grounding_may_end_a_request_that_holds_documents() -> None:
     retrieval._settings = settings
     assert retrieval._route_after_rerank({"documents": [document]}) != "end"
     for grounded in (None, False):
-        assert retrieval._route_after_evidence_completeness(
-            {
-                "documents": [document],
-                "grounded": grounded,
-                "missing_requirements": ("term:checkout",),
-                "retrieval_attempt": settings.max_retrieval_attempts,
-                "context_relevance": settings.context_relevance_floor,
-            }
-        ) != "end"
+        for relevance in (0.0, settings.context_relevance_floor, 1.0):
+            assert retrieval._route_after_evidence_completeness(
+                {
+                    "documents": [document],
+                    "grounded": grounded,
+                    "missing_requirements": ("term:checkout",),
+                    "retrieval_attempt": settings.max_retrieval_attempts,
+                    "context_quality": "INSUFFICIENT",
+                    "context_relevance": relevance,
+                }
+            ) != "end"
 
     answering = AnswerNodesMixin.__new__(AnswerNodesMixin)
     answering._settings = settings

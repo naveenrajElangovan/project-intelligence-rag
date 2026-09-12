@@ -154,22 +154,55 @@ def test_supported_but_irrelevant_answer_gets_one_bounded_repair() -> None:
     ]
 
 
-def test_relevance_repair_fails_closed_after_one_attempt() -> None:
+def test_relevance_repair_and_extractive_recovery_fail_closed_when_both_are_irrelevant() -> None:
     result, workflow, _ = _verify(repaired_is_relevant=False)
 
     assert result["grounded"] is False
     assert result["grounding_reason"] == "ANSWER_NOT_RELEVANT"
     assert workflow._generator.repairs == 1
+    assert workflow._grounding_verifier.relevance_calls == 3
+
+
+def test_unsupported_repair_can_recover_only_from_independently_grounded_source_text() -> None:
+    result, workflow, _ = _verify(repaired_is_supported=False)
+
+    assert result["grounded"] is True
+    assert result["grounding_reason"] == "EXTRACTIVE_EVIDENCE_SUPPORTED"
+    assert "entry-17 category audit state accepted" in result["generated"].answer
+    assert workflow._generator.repairs == 1
     assert workflow._grounding_verifier.relevance_calls == 2
 
 
-def test_relevance_repair_cannot_bypass_grounding() -> None:
-    result, workflow, _ = _verify(repaired_is_supported=False)
+def test_grounded_neighboring_subject_is_rejected_after_zero_relevance_context() -> None:
+    workflow = AnswerNodesMixin()
+    workflow._request = RagRequest(
+        projectId="DEMO",
+        collectionName="project-intelligence",
+        question="What is memoy here?",
+        accessPolicyIds=["project:DEMO"],
+    )
+    workflow._settings = Settings(_env_file=None, environment="development")
+    workflow._vocabulary = SimpleNamespace(entities=(), code_extensions=())
+    workflow._generator = _Generator()
+    workflow._grounding_verifier = _Verifier()
+    result = asyncio.run(
+        workflow._verify_grounding(
+            {
+                "documents": [_document()],
+                "generated": GroundedAnswer(answer=INITIAL, citations=[1]),
+                "resolved_question": "What is memoy here?",
+                "answer_relevance_query": "What is memoy here?",
+                "context_failure_reason": "LOW_RELEVANCE",
+                "language": "en",
+                "query_intent": "CODE_ASSISTED",
+                "source_route": "MIXED",
+                "answer_style": "concise",
+            }
+        )
+    )
 
     assert result["grounded"] is False
-    assert result["grounding_reason"] == "ANSWER_NOT_RELEVANT"
-    assert workflow._generator.repairs == 1
-    assert workflow._grounding_verifier.relevance_calls == 1
+    assert result["grounding_reason"] == "EVIDENCE_NOT_TOPICAL"
 
 
 def test_single_record_generation_enforces_a_real_details_table() -> None:

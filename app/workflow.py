@@ -9,8 +9,8 @@ from typing import TypedDict
 from langchain_core.documents import Document
 from app.config import Settings
 from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedAnswer,
-                     LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator,
-                     TokenUsage, insufficient_evidence_answer, refusal_answer)
+                     LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator, TokenUsage,
+                     insufficient_evidence_answer, query_aware_refusal_answer, refusal_answer)
 from app.models import ConversationContextUpdate, RagRequest, RagResponse, SourceReference
 from app.catalog_answers import deterministic_catalog_response
 from app.grounding import LocalCitationGroundingVerifier
@@ -181,7 +181,6 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
 
     async def run(self) -> RagResponse:
         """Execute the graph and return one fully verified response."""
-
         began = started()
         deterministic = json_transform_response(self._request, began)
         deterministic = deterministic or await deterministic_catalog_response(
@@ -305,6 +304,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
                 if unverified
                 else "INSUFFICIENT_EVIDENCE"
             )
+            refusal = query_aware_refusal_answer(self._request.question, refusal_reason, language)
             if refusal_reason == "ENTITY_MISMATCH":
                 requested = str(state.get("entity_mismatch_requested") or "")
                 suggested = str(state.get("entity_mismatch_suggested") or "")

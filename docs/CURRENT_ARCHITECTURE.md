@@ -309,10 +309,12 @@ If relevance or grounding is insufficient, a separate safe-response model receiv
 question, language, and typed failure category. It receives no evidence and cannot turn the failure
 into an unsupported answer. Candidates assessed at zero relevance remain available to private
 tracing but are omitted from public source cards, so unrelated providers do not appear to support
-the abstention. An explicit zero-relevance verdict ends before answer generation, citation repair,
-and grounding because those stages cannot convert unrelated evidence into a supported answer;
-borderline non-zero evidence still receives every existing truth gate. A static content-free
-response is the last fallback when the safe responder is also unavailable.
+the abstention. Retrieval relevance is a ranking signal rather than a truth verdict: every populated
+authorized evidence pool reaches generation and grounding, and only an empty pool may end early.
+If a synthesized paraphrase fails grounding despite strong lexical evidence, a provider-neutral
+recovery path may return complete source sentences with citations after the same authorization,
+anchor, negation, topicality, and grounding checks. A static content-free response is the last
+fallback when the safe responder is also unavailable.
 
 The local grounding verifier uses multilingual BGE similarity plus deterministic exact-value,
 negation, and citation checks. A project-overview answer may remove only unsupported sentences and
@@ -509,3 +511,10 @@ not import the composition root. Architecture tests enforce these boundaries.
 8. Missing evidence produces abstention, not general-knowledge completion.
 9. Ingestion is the only vector writer; RAG remains read-only.
 10. Telemetry never contains questions, answers, evidence, credentials, or raw identity values.
+11. Store operations, developer implementation, Jira, Confluence, GitHub, English, and Spanish
+    questions use the same provider-neutral answer-quality contracts.
+12. Incident fixes may add typed capabilities, but never question-specific routes, vocabulary,
+    thresholds, or canned answers. Every such change covers positive, negative, bilingual,
+    authorization, provider-scope, and legacy-provider regressions.
+13. Authorization and explicit source selection constrain evidence before ranking. Retrieval scores
+    order authorized evidence; generation explains it; grounding decides whether claims are released.

@@ -79,6 +79,12 @@ _COMPLETION_CHECK = re.compile(
     r"\b(?:ya\s+)?(?:se\s+)?(?:complet[oó]|termin[oó]|cerr[oó]|resolvi[oó])\b",
     re.I,
 )
+_CURRENT_FACT = re.compile(
+    r"\b(?:status|priority|assignee|assigned|owner|reporter|resolution|due date|created|updated|"
+    r"estado|prioridad|asignad[oa]|responsable|reportad[oa]|resoluci[oó]n|fecha l[ií]mite|"
+    r"cread[oa]|actualizad[oa])\b",
+    re.I,
+)
 _TOPIC_STOP_WORDS = {
     "all",
     "and",
@@ -299,6 +305,7 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
             filters={"issue_key": keys},
+            requested_fact="CHILDREN",
         )
     if section_kinds and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
         section_filters: dict[str, tuple[str, ...]] = {"section_kind": section_kinds}
@@ -321,7 +328,13 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
             filters={"issue_key": keys},
-            requested_fact="COMPLETION" if _COMPLETION_CHECK.search(question) else None,
+            requested_fact=(
+                "COMPLETION"
+                if _COMPLETION_CHECK.search(question)
+                else "CURRENT"
+                if _CURRENT_FACT.search(question)
+                else None
+            ),
         )
     filters = _jira_filters(question)
     pending_work = bool(_PENDING_WORK.search(question))
@@ -473,11 +486,16 @@ def _jira_structured_followup(
         filters = {"issue_key": issue_keys}
         operation = StructuredOperation.DETAIL
         requested_fact = "COMPLETION"
+    elif _CURRENT_FACT.search(question) and len(filters.get("issue_key", ())) == 1:
+        filters = {"issue_key": filters["issue_key"]}
+        operation = StructuredOperation.DETAIL
+        requested_fact = "CURRENT"
     elif candidate := _jira_structured_query(question, assume_jira=True):
         operation = candidate.operation
         group_by = candidate.group_by
         section_kind = candidate.section_kind
         section_kinds = candidate.section_kinds
+        requested_fact = candidate.requested_fact
         incoming = candidate.filters
         if "issue_key" in incoming:
             filters = dict(incoming)

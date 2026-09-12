@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import Settings
-from app.llm import insufficient_evidence_answer, pipeline_unavailable_answer, refusal_answer
+from app.llm import (
+    insufficient_evidence_answer,
+    pipeline_unavailable_answer,
+    query_aware_refusal_answer,
+    refusal_answer,
+)
 from app.models import RagRequest
 from app.workflow import AuthorizedRagWorkflow
 
@@ -50,6 +55,17 @@ def test_pipeline_failure_fallback_is_bounded_and_query_aware() -> None:
 
     assert "what is memoy here" in answer
     assert len(pipeline_unavailable_answer("en", "x" * 500)) < 260
+
+
+def test_query_aware_refusal_is_natural_and_names_the_unresolved_subject() -> None:
+    english = query_aware_refusal_answer("What is memoy here?", "UNVERIFIED_EVIDENCE", "en")
+    spanish = query_aware_refusal_answer("¿Qué es memoy aquí?", "UNVERIFIED_EVIDENCE", "es")
+
+    assert "What is memoy here?" in english
+    assert "Clarify the term" in english
+    assert "¿Qué es memoy aquí?" in spanish
+    assert "Aclara el término" in spanish
+    assert "UNVERIFIED_EVIDENCE" not in english + spanish
 
 
 def test_missing_evidence_messages_are_honest_and_bilingual() -> None:

@@ -50,7 +50,9 @@ from app.workflow_support.deterministic_answers import (
     _deterministic_canonical_route_answer,
     _deterministic_code_location_answer,
     _deterministic_delivery_answer,
+    _deterministic_extractive_answer,
     _deterministic_feature_inventory_answer,
+    _has_strong_evidence_anchor,
     _deterministic_identifier_answer,
     _deterministic_structured_inventory_answer,
     _feature_inventory_answer_verified,
@@ -2775,6 +2777,32 @@ class AnswerNodesMixin:
                     )
                 reason_code = "REPAIRED_SUPPORTED" if grounded else verdict.reason_code
                 state = {**state, "generated": repaired}
+        extractive_fallback_used = 0
+        # A cross-encoder can reject a faithful paraphrase even when retrieval
+        # contains an exact answer. Recover with complete source sentences only
+        # after normal synthesis, claim pruning, citation realignment, and one
+        # bounded repair have failed. This applies uniformly to store guidance,
+        # developer documentation, code, Jira, and future providers.
+        if not grounded and state.get("documents"):
+            extracted = _deterministic_extractive_answer(
+                answer_question,
+                state["documents"],
+                state.get("language", "mixed"),
+            )
+            if extracted is not None:
+                extracted_verdict = await self._grounding_verifier.verify(
+                    answer_question,
+                    state["documents"],
+                    extracted,
+                    answer_language=state.get("language", ""),
+                )
+                usage = _add_usage(usage, self._grounding_verifier.last_usage)
+                if extracted_verdict.supported:
+                    state = {**state, "generated": extracted}
+                    generated = extracted
+                    grounded = True
+                    reason_code = "EXTRACTIVE_EVIDENCE_SUPPORTED"
+                    extractive_fallback_used = 1
         population_expected = tuple(state.get("coverage_expected_identifiers", ()))
         population_missing = _coverage(population_expected, state["generated"].answer)
         field_expected = tuple(state.get("coverage_expected_fields", ()))
@@ -2863,9 +2891,49 @@ class AnswerNodesMixin:
                 addresses = True
                 relevance_repair_succeeded = 1
                 reason_code = "RELEVANCE_REPAIRED_SUPPORTED"
+        # Topicality is evaluated after claim support. A fully supported answer
+        # can still phrase the subject too indirectly for that scorer, so the
+        # same source-sentence recovery must cover this failure mode as well.
+        # Thresholds remain unchanged: both support and topicality must pass.
+        if grounded and not addresses and state.get("documents"):
+            extracted = _deterministic_extractive_answer(
+                answer_question,
+                state["documents"],
+                state.get("language", "mixed"),
+            )
+            if extracted is not None:
+                extracted_verdict = await self._grounding_verifier.verify(
+                    answer_question,
+                    state["documents"],
+                    extracted,
+                    answer_language=state.get("language", ""),
+                )
+                usage = _add_usage(usage, self._grounding_verifier.last_usage)
+                if extracted_verdict.supported:
+                    extracted_addresses, extracted_relevance = (
+                        await self._grounding_verifier.answer_addresses_question(
+                            relevance_question,
+                            extracted.answer,
+                            threshold=self._settings.answer_relevance_threshold,
+                        )
+                    )
+                    if extracted_addresses:
+                        state = {**state, "generated": extracted}
+                        generated = extracted
+                        addresses = True
+                        answer_relevance = extracted_relevance
+                        reason_code = "EXTRACTIVE_EVIDENCE_SUPPORTED"
+                        extractive_fallback_used = 1
         if grounded and not addresses:
             grounded = False
             reason_code = "ANSWER_NOT_RELEVANT"
+        if (
+            grounded
+            and state.get("context_failure_reason") == "LOW_RELEVANCE"
+            and not _has_strong_evidence_anchor(relevance_question, state.get("documents", []))
+        ):
+            grounded = False
+            reason_code = "EVIDENCE_NOT_TOPICAL"
         stage_complete(
             "verify_grounding",
             self._request.project_id,
@@ -2886,6 +2954,7 @@ class AnswerNodesMixin:
                 "post_prune_regenerated": post_prune_regenerated,
                 "post_prune_below_floor": post_prune_below_floor,
                 "claim_pruning_bypassed": claim_pruning_bypassed,
+                "extractive_fallback_used": extractive_fallback_used,
                 "coverage_expected": len(population_expected),
                 "coverage_covered": len(population_expected) - len(population_missing),
                 "coverage_missing_count": len(population_missing),
@@ -2926,6 +2995,7 @@ class AnswerNodesMixin:
                 "REPAIRED_SUPPORTED",
                 "CLAIMS_REMOVED_SUPPORTED",
                 "RELEVANCE_REPAIRED_SUPPORTED",
+                "EXTRACTIVE_EVIDENCE_SUPPORTED",
             },
         }
 

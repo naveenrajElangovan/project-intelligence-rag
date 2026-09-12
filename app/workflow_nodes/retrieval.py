@@ -72,6 +72,77 @@ def _parent_reconstruction_anchors(
     return documents[:1] if single_parent else documents
 
 
+def _scope_candidates_to_planned_types(
+    documents: list[Document], source_types: tuple[str, ...]
+) -> list[Document]:
+    """Enforce the planner's evidence contract before reranking and generation.
+
+    Provider fan-out answers where evidence may be found; source types answer
+    which evidence is authoritative for this question. Mixing those two sets
+    allowed a federated repair to cite Jira for a PAGE+CODE question and made the
+    final output gate discard an otherwise answerable response.
+    """
+
+    allowed = {value.upper() for value in source_types if value}
+    if not allowed:
+        return documents
+    typed = [document for document in documents if _document_source_type(document)]
+    if not typed:
+        # Lightweight legacy/custom retrievers may not provide source metadata.
+        return documents
+    return [
+        document for document in documents if _document_source_type(document) in allowed
+    ]
+
+
+_LEXICAL_ANCHOR_NOISE = {
+    "about", "all", "anything", "are", "can", "could", "details", "does",
+    "explain", "for", "from", "give", "have", "here", "how", "in", "is",
+    "me", "of", "project", "tell", "the", "this", "what", "where", "which",
+    "with", "you", "algo", "aqui", "cómo", "cual", "cuáles", "dame", "de",
+    "del", "donde", "el", "en", "esta", "este", "explica", "hay", "la",
+    "las", "los", "para", "proyecto", "que", "qué", "sobre", "tiene",
+}
+
+
+def _strong_lexical_anchors(
+    question: str, documents: list[Document], *, limit: int = 2
+) -> list[Document]:
+    """Protect strong literal matches from semantic reranker displacement."""
+
+    terms = tuple(
+        dict.fromkeys(
+            word
+            for word in re.findall(r"[\wáéíóúüñ]+", question.casefold())
+            if len(word) >= 3
+            and word not in _LEXICAL_ANCHOR_NOISE
+            and not re.fullmatch(r"t?\d+(?:\.\d+)*", word)
+        )
+    )
+    if not terms:
+        return []
+    required = len(terms) if len(terms) <= 2 else 2
+    matches: list[tuple[int, int, int, float, int, Document]] = []
+    for position, document in enumerate(documents):
+        searchable = " ".join(
+            (
+                str(document.metadata.get("title") or ""),
+                str(document.metadata.get("reference") or ""),
+                document.page_content,
+            )
+        ).casefold()
+        words = set(re.findall(r"[\wáéíóúüñ]+", searchable))
+        overlap = sum(term in words for term in terms)
+        if overlap < required:
+            continue
+        phrase = int(" ".join(terms) in searchable)
+        prose = int("|" not in document.page_content)
+        lexical = float(document.metadata.get("lexical_score") or 0.0)
+        matches.append((overlap, phrase, prose, lexical, -position, document))
+    matches.sort(key=lambda item: item[:5], reverse=True)
+    return [item[-1] for item in matches[:limit]]
+
+
 def _single_record_structure_score(document: Document) -> int:
     """Grade whether one chunk can support a complete record response.
 
@@ -1068,6 +1139,20 @@ class RetrievalNodesMixin:
             if state.get("reconstruct_parent_records")
             else tuple(dict.fromkeys((*state.get("rerank_queries", ()), *queries)))
         )
+        # Reciprocal-rank fusion is allowed to reorder lexical and dense arms,
+        # but it must not erase the strongest literal evidence before the local
+        # reranker gets a chance to judge it. This is provider neutral and the
+        # planned source-type boundary is enforced again at rerank entry.
+        pre_rerank_lexical_anchors = _strong_lexical_anchors(
+            state.get("resolved_question", self._request.question),
+            list(lexical_candidates or []),
+        )
+        if pre_rerank_lexical_anchors:
+            candidates = _merge_ranked_documents(
+                pre_rerank_lexical_anchors,
+                candidates,
+                top_n=len(candidates) + len(pre_rerank_lexical_anchors),
+            )
         from app.quality_tracing import record_candidate_scores
 
         record_candidate_scores(candidates)
@@ -1225,7 +1310,9 @@ class RetrievalNodesMixin:
         """Apply intent-specific local ranking to a bounded candidate set."""
 
         began = started()
-        candidates = state.get("candidates", [])
+        candidates = _scope_candidates_to_planned_types(
+            list(state.get("candidates", [])), tuple(state.get("source_types", ()))
+        )
         if state.get("query_intent") == "ENTITY_OVERVIEW":
             candidates = candidates[: self._settings.retrieval_top_k]
         inventory_question = is_inventory_question(self._request.question)
@@ -1551,6 +1638,16 @@ class RetrievalNodesMixin:
             state.get("repair_requirements", ()),
             top_n=result_top_n,
         )
+        lexical_anchors = _strong_lexical_anchors(
+            state.get("resolved_question", self._request.question),
+            all_candidates,
+        )
+        if lexical_anchors:
+            documents = _merge_ranked_documents(
+                lexical_anchors,
+                documents,
+                top_n=result_top_n,
+            )
         if documentation_reserved_slots:
             primary = [
                 document for document in documents if _document_source_type(document) == "PAGE"
@@ -2069,26 +2166,14 @@ class RetrievalNodesMixin:
         return result
 
     def _route_after_evidence_completeness(self, state: RagState) -> str:
-        # An explicit zero-relevance verdict cannot become an evidence-backed
-        # answer through generation. End here so the response layer can produce
-        # a natural, question-aware safe response without spending time on
-        # generation, citation repair, and grounding. Borderline non-zero
-        # evidence still follows the full truth-gate path below.
-        if (
-            state.get("context_quality") == "INSUFFICIENT"
-            and float(state.get("context_relevance") or 0.0)
-            < self._settings.context_relevance_floor
-        ):
-            return "end"
         if state.get("grounded") is False:
             return "generate" if state.get("documents") else "end"
         if not state.get("missing_requirements"):
             return "generate"
         if state.get("retrieval_attempt", 1) < self._settings.max_retrieval_attempts:
             return "repair_completeness"
-        # This floor is derived below every answered-and-grounded Layer 1 case.
-        # It is consulted only after bounded repair is exhausted, so borderline
-        # evidence still gets the same repair and truth-gate path as before.
-        if float(state.get("context_relevance") or 0.0) < self._settings.context_relevance_floor:
-            return "end"
+        # Retrieval relevance is a ranking signal, not a truth verdict. A weak
+        # score can accompany exact lexical evidence, code, translated text, or
+        # short Jira fields. Only an empty authorized pool may end before the
+        # generator and grounding gates inspect that evidence.
         return "generate" if state.get("documents") else "end"

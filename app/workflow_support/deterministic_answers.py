@@ -16,6 +16,155 @@ from app.workflow_support.query_analysis import (
 )
 
 
+_EXTRACTIVE_QUERY_NOISE = {
+    "about", "all", "anything", "are", "can", "could", "details", "does",
+    "explain", "for", "from", "give", "have", "here", "how", "in", "is",
+    "me", "of", "project", "tell", "the", "this", "what", "where", "which",
+    "with", "you", "algo", "aqui", "cómo", "cual", "cuáles", "dame", "de",
+    "del", "donde", "el", "en", "esta", "este", "explica", "hay", "la",
+    "las", "los", "me", "para", "proyecto", "que", "qué", "sobre", "tiene",
+}
+
+
+def _has_strong_evidence_anchor(question: str, documents: list[Document]) -> bool:
+    """Return whether authorized evidence contains the question's concrete subject.
+
+    This is a provider- and domain-neutral fail-closed guard for the narrow case
+    where semantic context evaluation reported zero relevance. It does not rank
+    documents or decide whether a claim is true; it prevents a grounded answer
+    about a neighboring subject from being released as an answer to the question.
+    """
+
+    query_words = tuple(
+        dict.fromkeys(
+            word
+            for word in _normalized_words(question)
+            if len(word) >= 3
+            and word not in _EXTRACTIVE_QUERY_NOISE
+            and not re.fullmatch(r"t?\d+(?:\.\d+)*", word)
+        )
+    )
+    if not query_words:
+        return False
+    required_overlap = len(query_words) if len(query_words) <= 2 else 2
+    for document in documents:
+        evidence_words = set(_normalized_words(document.page_content))
+        if sum(word in evidence_words for word in query_words) >= required_overlap:
+            return True
+        metadata_words = set(
+            _normalized_words(
+                " ".join(
+                    str(document.metadata.get(field) or "")
+                    for field in ("title", "reference", "issue_key", "locator")
+                )
+            )
+        )
+        if sum(word in metadata_words for word in query_words) >= required_overlap:
+            return True
+    return False
+
+
+def _deterministic_extractive_answer(
+    question: str, documents: list[Document], language: str
+) -> GroundedAnswer | None:
+    """Recover an answer by quoting strongly matching authorized evidence.
+
+    This is the final recovery path when a generated paraphrase cannot pass the
+    grounding model. It is deliberately domain and provider neutral. Candidate
+    windows must share every meaningful query term when the question has at most
+    two, or at least two terms for a longer question. The output copies complete
+    source sentences, so it cannot introduce a fact that is absent from the
+    indexed evidence.
+    """
+
+    query_words = tuple(
+        dict.fromkeys(
+            word
+            for word in _normalized_words(question)
+            if len(word) >= 3
+            and word not in _EXTRACTIVE_QUERY_NOISE
+            and not re.fullmatch(r"t?\d+(?:\.\d+)*", word)
+        )
+    )
+    if not query_words:
+        return None
+    required_overlap = len(query_words) if len(query_words) <= 2 else 2
+    ranked: list[tuple[tuple[float, ...], int, tuple[str, ...]]] = []
+    for source_number, document in enumerate(documents, start=1):
+        raw_segments = re.split(r"(?<=[.!?])\s+|\n+", document.page_content)
+        segments = [
+            " ".join(segment.strip().strip("#>*- ").split())
+            for segment in raw_segments
+            if segment.strip()
+        ]
+        for start in range(len(segments)):
+            for width in range(1, min(3, len(segments) - start) + 1):
+                window = tuple(
+                    segment for segment in segments[start : start + width]
+                    if 4 <= len(re.findall(r"\w+", segment)) <= 100
+                )
+                if not window:
+                    continue
+                folded = " ".join(window).casefold()
+                overlap = sum(word in set(_normalized_words(folded)) for word in query_words)
+                if overlap < required_overlap:
+                    continue
+                phrase_bonus = int(" ".join(query_words) in folded)
+                anchor_words = set(_normalized_words(window[0]))
+                anchor_overlap = sum(word in anchor_words for word in query_words)
+                metadata = document.metadata
+                authority = {"PAGE": 3, "ISSUE": 2, "CODE": 1}.get(
+                    str(metadata.get("source_type") or "").upper(), 0
+                )
+                retrieval = max(
+                    float(metadata.get("rerank_score") or 0.0),
+                    float(metadata.get("lexical_score") or 0.0),
+                    float(metadata.get("score") or 0.0),
+                )
+                word_count = sum(len(re.findall(r"\w+", value)) for value in window)
+                prose_window = int(not any("|" in value for value in window))
+                ranked.append(
+                    (
+                        (
+                            float(overlap),
+                            float(phrase_bonus),
+                            float(anchor_overlap),
+                            float(authority),
+                            float(prose_window),
+                            float(len(window)),
+                            retrieval,
+                            -float(word_count),
+                        ),
+                        source_number,
+                        window,
+                    )
+                )
+    if not ranked:
+        return None
+    _score, source_number, window = max(ranked, key=lambda item: item[0])
+    substantive = tuple(
+        sentence
+        for sentence in window
+        if not re.search(
+            r"(?:section identity|retrieval terms|document id|"
+            r"identidad de secci[oó]n|t[eé]rminos de recuperaci[oó]n)\s*:",
+            sentence,
+            re.IGNORECASE,
+        )
+    )
+    if substantive:
+        window = substantive
+    cited_sentences = [
+        f"{sentence.rstrip('.')} [SOURCE {source_number}]." for sentence in window
+    ]
+    heading = " ".join(question.split()).strip("# ")
+    return GroundedAnswer(
+        answer=f"### {heading}\n" + "\n".join(cited_sentences),
+        citations=[source_number],
+        missing_information=[],
+    )
+
+
 def _deterministic_canonical_route_answer(
     question: str, documents: list[Document], language: str
 ) -> GroundedAnswer | None:

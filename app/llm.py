@@ -244,6 +244,25 @@ def refusal_answer(reason: str, language: str) -> str:
     )
 
 
+def query_aware_refusal_answer(question: str, reason: str, language: str) -> str:
+    """Return a bounded natural fallback that names the unresolved request."""
+
+    subject = " ".join(question.split()).strip()[:180]
+    if not subject:
+        return refusal_answer(reason, language)
+    if language == "es":
+        if reason == "NO_ACCESS":
+            return f"No tengo acceso autorizado para comprobar «{subject}». Prueba con una fuente o un proyecto que tengas habilitado."
+        if reason == "TEMPORARILY_UNAVAILABLE":
+            return f"No pude completar ahora la búsqueda de «{subject}». Inténtalo de nuevo en unos instantes."
+        return f"Encontré material relacionado, pero no confirma una respuesta para «{subject}». Aclara el término o indica la función, el ticket o el documento que quieres revisar."
+    if reason == "NO_ACCESS":
+        return f"I don’t have authorized access to verify “{subject}”. Try a source or project that is enabled for your account."
+    if reason == "TEMPORARILY_UNAVAILABLE":
+        return f"I couldn’t complete the search for “{subject}” right now. Please try again in a moment."
+    return f"I found related material, but it does not confirm an answer to “{subject}”. Clarify the term or name the feature, ticket, or document you want checked."
+
+
 class QueryPlan(BaseModel):
     language: Literal["en", "es", "mixed"]
     translated_query: str = Field(default="", max_length=4000)
@@ -529,7 +548,15 @@ class LangChainSafeResponseGenerator:
                 self._settings,
             )
         self.last_usage = usage
-        return value.message.strip()
+        message = value.message.strip()
+        if re.search(
+            r"\b(?:do not (?:state|mention|answer)|invite a|naming the exact|suggest checking|"
+            r"no (?:indiques|menciones|respondas)|invita a|sugiere comprobar)\b",
+            message,
+            re.IGNORECASE,
+        ):
+            raise ValueError("Safe-response model returned instruction-like prose.")
+        return message
 
 
 class ConversationQueryResolver:

@@ -448,9 +448,12 @@ typed failure reason, but no project evidence. It writes a short response that
 fits the question without inventing an answer. A static content-free response
 is used only if that safe-response model call itself fails. This prevents an
 unanswerable question from appearing to be supported by unrelated Jira,
-GitHub, or Confluence sources. An explicit zero-relevance assessment skips
-answer generation, citation repair, and grounding; non-zero borderline evidence
-still uses the complete verification path.
+GitHub, or Confluence sources. Retrieval scores only rank evidence. Every
+populated authorized pool uses the complete generation and verification path;
+only an empty pool may terminate before those gates. If synthesis is rejected,
+a provider-neutral extractive recovery can return strongly matching complete
+source sentences, and the normal grounding and topicality checks still decide
+whether they are safe to show.
 
 Each provider window retains an aligned request identity through reciprocal-rank
 fusion. The number of selected providers can differ from the number of source

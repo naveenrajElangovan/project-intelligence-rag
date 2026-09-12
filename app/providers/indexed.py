@@ -115,6 +115,14 @@ class IndexedProviderAdapter(ProviderAdapter):
             )
         if query.operation in {StructuredOperation.SECTION, StructuredOperation.SECTION_COUNT}:
             return await self._jira_sections(query, loader)
+        if (
+            query.operation == StructuredOperation.DETAIL
+            and query.requested_fact in {"CURRENT", "COMPLETION"}
+            and query.filters.get("issue_key")
+        ):
+            exact = getattr(self._retriever, "ainvoke_exact_identifiers", None)
+            if exact is not None:
+                return await self._jira_exact_current(query, exact)
         source_types = (
             ("ISSUE", "ATTACHMENT")
             if query.operation in {StructuredOperation.OVERVIEW, StructuredOperation.DETAIL}
@@ -291,6 +299,38 @@ class IndexedProviderAdapter(ProviderAdapter):
             ),
             degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
             applied_filter_rule=fixed_rule,
+        )
+
+    async def _jira_exact_current(self, query: StructuredQuery, loader: object) -> StructuredResult:
+        """Read scalar current-state facts without scanning the complete Jira inventory."""
+
+        requested_keys = tuple(
+            dict.fromkeys(value.upper() for value in query.filters.get("issue_key", ()))
+        )
+        documents: list[Document] = []
+        for issue_key in requested_keys:
+            documents.extend(await loader((issue_key,), ("ISSUE",)))
+        current_by_key: dict[str, Document] = {}
+        for document in documents:
+            metadata = document.metadata
+            issue_key = str(metadata.get("issue_key") or "").upper()
+            if (
+                issue_key in requested_keys
+                and str(metadata.get("source_type") or "").upper() == "ISSUE"
+                and str(metadata.get("jira_chunk_kind") or "").upper() == "CURRENT"
+            ):
+                current_by_key[issue_key] = document
+        ordered = [current_by_key[key] for key in requested_keys if key in current_by_key]
+        return StructuredResult(
+            operation=query.operation,
+            provider=self.name,
+            complete=True,
+            snapshot_at=_snapshot_at(ordered),
+            total=len(ordered),
+            rows=tuple(_row(document) for document in ordered),
+            evidence=tuple(
+                _envelope(self.name, self._project_id, document) for document in ordered
+            ),
         )
 
     async def _jira_sections(self, query: StructuredQuery, loader: object) -> StructuredResult:

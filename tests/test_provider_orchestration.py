@@ -332,6 +332,23 @@ def test_spanish_completion_followup_after_issue_history_is_structured() -> None
     assert selection.structured_query.requested_fact == "COMPLETION"
 
 
+def test_scalar_followup_after_issue_history_uses_exact_current_lookup() -> None:
+    scope = _scope(
+        filters={"issue_key": ("T0-122",), "section_kind": ("CHANGELOG",)},
+        operation="SECTION",
+    )
+
+    english = select_providers("What is its current status?", ENABLED, scope)
+    spanish = select_providers("¿Cuál es su estado actual?", ENABLED, scope)
+
+    for selection in (english, spanish):
+        assert selection.mode == ExecutionMode.STRUCTURED
+        assert selection.structured_query is not None
+        assert selection.structured_query.operation == StructuredOperation.DETAIL
+        assert selection.structured_query.filters == {"issue_key": ("T0-122",)}
+        assert selection.structured_query.requested_fact == "CURRENT"
+
+
 def test_spanish_status_followup_is_structured() -> None:
     selection = select_providers("¿cuáles están en progreso?", ENABLED, _scope())
 
@@ -354,6 +371,50 @@ def test_exact_issue_comment_and_detail_queries_bypass_semantic_search() -> None
     assert comments.structured_query.filters["issue_key"] == ("T0-13",)
     assert detail.structured_query is not None
     assert detail.structured_query.operation == StructuredOperation.DETAIL
+    assert detail.structured_query.requested_fact == "CURRENT"
+
+
+def test_exact_current_jira_fact_does_not_scan_complete_inventory() -> None:
+    class ExactRetriever:
+        snapshot_called = False
+
+        async def authorized_source_snapshot(self, source_types):
+            self.snapshot_called = True
+            raise AssertionError("scalar exact lookup must not scan the complete inventory")
+
+        async def ainvoke_exact_identifiers(self, identifiers, source_types):
+            assert identifiers == ("T0-122",)
+            assert source_types == ("ISSUE",)
+            return [_issue("jira:c:T0-122:CURRENT", "T0-122", "Linux QA", "POS", "Done")]
+
+    retriever = ExactRetriever()
+    selection = select_providers("What is the current status of T0-122?", ENABLED)
+    result = asyncio.run(
+        IndexedProviderAdapter(ProviderName.JIRA, "T2.0", retriever).aggregate(
+            selection.structured_query
+        )
+    )
+
+    assert retriever.snapshot_called is False
+    assert result.complete is True
+    assert result.total == 1
+    assert result.rows[0]["key"] == "T0-122"
+    assert result.rows[0]["status"] == "Done"
+
+
+def test_spanish_exact_current_fact_uses_the_same_structured_contract() -> None:
+    selection = select_providers("¿Cuál es el estado de T0-122?", ENABLED)
+
+    assert selection.structured_query is not None
+    assert selection.structured_query.operation == StructuredOperation.DETAIL
+    assert selection.structured_query.requested_fact == "CURRENT"
+
+
+def test_child_request_retains_complete_hierarchy_path() -> None:
+    selection = select_providers("Show child work items of T0-7", ENABLED)
+
+    assert selection.structured_query is not None
+    assert selection.structured_query.requested_fact == "CHILDREN"
 
 
 def test_project_lead_report_uses_complete_status_distribution() -> None:

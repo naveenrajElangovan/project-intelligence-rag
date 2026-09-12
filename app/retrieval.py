@@ -1054,7 +1054,12 @@ class ChromaAccessRetriever(BaseRetriever):
         ranked = _rank_cached_corpus(query, cached)
         for document in ranked:
             document.metadata["retrieval_channel"] = "lexical"
-        return ranked[: self.top_k]
+        # BM25 length normalization favors compact table rows over long prose
+        # chunks that define the same subject. Return a wider in-memory candidate
+        # window so the hybrid anchor selector can preserve an explanatory
+        # source before semantic reranking. This performs no additional Chroma
+        # read and does not widen the final evidence window.
+        return ranked[: max(self.top_k, 100)]
 
     def _rare_query_terms(self, query: str, source_types: tuple[str, ...]) -> tuple[str, ...]:
         cached = self._cached_authorized_corpus(source_types, allow_stale=True)
