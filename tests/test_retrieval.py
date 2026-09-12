@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from langchain_core.documents import Document
 
 from app.retrieval import (
@@ -633,6 +634,85 @@ def test_cached_lexical_index_matches_reference_bm25_order() -> None:
     ]
 
 
+def test_expired_lexical_cache_is_served_while_refresh_is_scheduled(monkeypatch) -> None:
+    _FALLBACK_CORPUS_CACHE.clear()
+    index = QuotaFallbackIndex()
+    retriever = ChromaAccessRetriever(
+        index=index,
+        chroma_host="stale-while-refresh.local",
+        collection_name="project-intelligence",
+        embedder=FakeEmbedder(),
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+        lexical_fallback_cache_ttl_seconds=300,
+    )
+    initial = retriever._cached_authorized_corpus(("CODE",))
+    key = next(reversed(_FALLBACK_CORPUS_CACHE))
+    _FALLBACK_CORPUS_CACHE[key] = replace(initial, expires_at=0)
+    scheduled = []
+    monkeypatch.setattr(
+        retriever,
+        "_schedule_fallback_corpus_refresh",
+        lambda cache_key, source_types: scheduled.append((cache_key, source_types)),
+    )
+
+    stale = retriever._cached_authorized_corpus(("CODE",), allow_stale=True)
+
+    assert stale.documents == initial.documents
+    assert scheduled == [(key, ("CODE",))]
+    assert index.get_calls == 1
+
+
+def test_exact_snapshot_refreshes_an_expired_lexical_cache() -> None:
+    _FALLBACK_CORPUS_CACHE.clear()
+    index = QuotaFallbackIndex()
+    retriever = ChromaAccessRetriever(
+        index=index,
+        chroma_host="authoritative-refresh.local",
+        collection_name="project-intelligence",
+        embedder=FakeEmbedder(),
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+        lexical_fallback_cache_ttl_seconds=300,
+    )
+    initial = retriever._cached_authorized_corpus(("CODE",))
+    key = next(reversed(_FALLBACK_CORPUS_CACHE))
+    _FALLBACK_CORPUS_CACHE[key] = replace(initial, expires_at=0)
+
+    asyncio.run(retriever.authorized_source_snapshot(("CODE",)))
+
+    assert index.get_calls == 2
+
+
+def test_provider_lexical_view_is_derived_from_warm_complete_corpus() -> None:
+    _FALLBACK_CORPUS_CACHE.clear()
+    index = QuotaFallbackIndex()
+    retriever = ChromaAccessRetriever(
+        index=index,
+        chroma_host="derived-provider-view.local",
+        collection_name="project-intelligence",
+        embedder=FakeEmbedder(),
+        project_id="DEMO",
+        access_policy_ids=("project:DEMO",),
+        required_schema_version="3",
+        required_embedding_model="multilingual-e5-large",
+        lexical_fallback_cache_ttl_seconds=300,
+    )
+
+    complete = retriever._cached_authorized_corpus(())
+    complete_scan_calls = index.get_calls
+    provider = retriever._cached_authorized_corpus(("CODE",), allow_stale=True)
+
+    assert index.get_calls == complete_scan_calls
+    assert provider.documents
+    assert all(document.metadata["source_type"] == "CODE" for document in provider.documents)
+    assert len(provider.documents) <= len(complete.documents)
+
+
 def test_document_visible_cache_scope_ignores_user_and_role_but_keeps_departments() -> None:
     first = document_visible_policies(
         "DEMO",
@@ -686,7 +766,7 @@ def test_rare_terms_use_corpus_percentile_not_query_percentile(monkeypatch) -> N
     monkeypatch.setattr(
         ChromaAccessRetriever,
         "_cached_authorized_corpus",
-        lambda _self, _source_types: cached,
+        lambda _self, _source_types, **_kwargs: cached,
     )
 
     assert _retriever_for_rare_terms()._rare_query_terms("common unicorn", ()) == ("unicorn",)
@@ -713,11 +793,14 @@ def test_startup_warms_each_project_scoped_lexical_corpus(monkeypatch) -> None:
         def list_collections(self):
             return [Collection()]
 
-    warmed_scopes = []
+    warmed = []
 
     class Retriever:
+        def __init__(self, schema_version):
+            self.schema_version = schema_version
+
         def _cached_authorized_corpus(self, scope):
-            warmed_scopes.append(scope)
+            warmed.append((self.schema_version, scope))
 
     from app.config import Settings
 
@@ -725,7 +808,7 @@ def test_startup_warms_each_project_scoped_lexical_corpus(monkeypatch) -> None:
     monkeypatch.setattr(
         ChromaAccessRetriever,
         "create",
-        lambda **_kwargs: Retriever(),
+        lambda **kwargs: Retriever(kwargs["required_schema_version"]),
     )
     count = asyncio.run(
         warm_authorized_lexical_corpora(
@@ -734,4 +817,4 @@ def test_startup_warms_each_project_scoped_lexical_corpus(monkeypatch) -> None:
     )
 
     assert count == 1
-    assert warmed_scopes == [(), ("PAGE",), ("CODE",), ("ISSUE",)]
+    assert warmed == [("4", ()), ("3", ())]

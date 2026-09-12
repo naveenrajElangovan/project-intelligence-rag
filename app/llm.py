@@ -192,8 +192,15 @@ def insufficient_evidence_answer(language: str) -> str:
     return INSUFFICIENT_EVIDENCE_ANSWER_ES if language == "es" else INSUFFICIENT_EVIDENCE_ANSWER
 
 
-def pipeline_unavailable_answer(language: str) -> str:
-    return PIPELINE_UNAVAILABLE_ANSWER_ES if language == "es" else PIPELINE_UNAVAILABLE_ANSWER
+def pipeline_unavailable_answer(language: str, question: str = "") -> str:
+    """Return a bounded, query-aware fallback when no model call is safe."""
+
+    subject = " ".join(question.split())[:160].strip()
+    if not subject:
+        return PIPELINE_UNAVAILABLE_ANSWER_ES if language == "es" else PIPELINE_UNAVAILABLE_ANSWER
+    if language == "es":
+        return f"No pude completar la búsqueda del proyecto para «{subject}» en este momento. Inténtalo de nuevo en unos instantes."
+    return f"I couldn’t complete the project search for “{subject}” right now. Please try again in a moment."
 
 
 _REFUSAL_ANSWERS = {

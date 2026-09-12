@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     accelerator_max_concurrency: int = 1
     warm_local_models_on_startup: bool = True
     local_max_concurrency: int = 1
-    generated_refusals_enabled: bool = False
+    generated_refusals_enabled: bool = True
     max_inflight_requests: int = 4
     provider_router_enabled: bool = True
     provider_federation_enabled: bool = True

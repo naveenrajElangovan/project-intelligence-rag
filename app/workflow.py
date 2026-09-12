@@ -278,7 +278,7 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
             usage = TokenUsage()
             model_provider = "none"
             model_name = "none"
-            unverified = bool(documents) and state.get("grounded") is False and state.get("grounding_reason") != "INCOMPLETE_EVIDENCE"
+            unverified = bool(documents) and state.get("grounded") is False and not {state.get("grounding_reason"), state.get("context_quality")} & {"INCOMPLETE_EVIDENCE", "INSUFFICIENT"}
             population_miss = bool(state.get("coverage_expected")) and bool(
                 state.get("population_retrieval_miss")
             )

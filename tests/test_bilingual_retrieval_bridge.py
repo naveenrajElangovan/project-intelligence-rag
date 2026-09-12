@@ -194,6 +194,22 @@ def test_complete_evidence_goes_straight_to_generation() -> None:
     assert _router(1, [_document(0.9)], missing=()) == "generate"
 
 
+def test_explicit_zero_relevance_ends_before_generation() -> None:
+    from app.workflow_nodes.retrieval import RetrievalNodesMixin
+
+    router = RetrievalNodesMixin.__new__(RetrievalNodesMixin)
+    router._settings = _settings()
+    assert router._route_after_evidence_completeness(
+        {
+            "documents": [_document(0.0)],
+            "context_quality": "INSUFFICIENT",
+            "context_relevance": 0.0,
+            "missing_requirements": (),
+            "retrieval_attempt": 1,
+        }
+    ) == "end"
+
+
 def test_a_populated_ungrounded_request_still_reaches_the_truth_gate() -> None:
     from app.workflow_nodes.retrieval import RetrievalNodesMixin
 

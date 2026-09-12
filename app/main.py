@@ -507,7 +507,7 @@ async def answer(request: RagRequest, settings: Settings = Depends(get_settings)
         )
         # The dependency or request budget has already failed. A second model
         # call would queue behind the same outage and delay the 503 again.
-        user_message = pipeline_unavailable_answer(language)
+        user_message = pipeline_unavailable_answer(language, request.question)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, user_message) from failure
     finally:
         request_slot.release()
@@ -585,7 +585,7 @@ async def answer_stream(
                 language=language,
                 reason_code=failure_code,
             )
-            message = pipeline_unavailable_answer(language)
+            message = pipeline_unavailable_answer(language, request.question)
             yield (
                 json.dumps(
                     {"type": "error", "message": message},

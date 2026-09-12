@@ -424,6 +424,34 @@ one embedding call per provider. Provider selection remains constrained by the
 backend-authorized catalog and every Chroma search reapplies the project and
 access-policy filters.
 
+For English questions, the Spanish translation is produced while the original
+provider windows are already searching. The translated provider windows begin
+as soon as translation finishes and overlap the remaining original searches.
+The same provider budgets and rank-fusion inputs are retained, so bilingual
+recall is unchanged while the two language passes no longer add their full
+latencies serially.
+
+The lexical companion index uses stale-while-refresh behavior. An expired,
+previously authorized lexical view is served immediately while one bounded
+background worker rebuilds that exact project, policy, collection, schema, and
+source-type view. Dense retrieval continues to query Chroma on every request,
+so newly ingested records remain available while the lexical view refreshes.
+Exact inventories and Jira aggregates deliberately bypass the stale path and
+perform a complete current scan; this keeps counts and complete lists exact.
+The refresh is single-flight per cache key and replaces the cache only after a
+complete rebuild.
+
+When retrieved candidates have zero assessed relevance, they are retained in
+private diagnostics but are not returned as public source cards. The safe
+response generator receives the user's question, response language, and a
+typed failure reason, but no project evidence. It writes a short response that
+fits the question without inventing an answer. A static content-free response
+is used only if that safe-response model call itself fails. This prevents an
+unanswerable question from appearing to be supported by unrelated Jira,
+GitHub, or Confluence sources. An explicit zero-relevance assessment skips
+answer generation, citation repair, and grounding; non-zero borderline evidence
+still uses the complete verification path.
+
 Each provider window retains an aligned request identity through reciprocal-rank
 fusion. The number of selected providers can differ from the number of source
 types because attachments can belong to both Jira and Confluence; fusion must

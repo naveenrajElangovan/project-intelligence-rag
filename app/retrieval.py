@@ -6,6 +6,7 @@ import threading
 import time
 import httpx
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,8 +40,31 @@ class _FallbackCorpus:
     average_document_length: float
 
 
+def _indexed_fallback_corpus(
+    documents: tuple[Document, ...] | list[Document],
+    *,
+    truncated: bool,
+    expires_at: float,
+) -> _FallbackCorpus:
+    materialized = tuple(documents)
+    document_frequency, term_frequencies, document_lengths = _lexical_index(materialized)
+    return _FallbackCorpus(
+        expires_at=expires_at,
+        documents=materialized,
+        truncated=truncated,
+        document_frequency=document_frequency,
+        term_frequencies=term_frequencies,
+        document_lengths=document_lengths,
+        average_document_length=sum(document_lengths) / max(1, len(document_lengths)),
+    )
+
+
 _FALLBACK_CORPUS_CACHE: OrderedDict[tuple[object, ...], _FallbackCorpus] = OrderedDict()
 _FALLBACK_CORPUS_LOCK = threading.Lock()
+_FALLBACK_CORPUS_REFRESHING: set[tuple[object, ...]] = set()
+_FALLBACK_REFRESH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="lexical-corpus-refresh"
+)
 _CHROMA_CLIENTS: dict[tuple[str, int], Any] = {}
 _CHROMA_COLLECTIONS: dict[tuple[str, int, str], Any] = {}
 _CHROMA_CLIENTS_LOCK = threading.Lock()
@@ -127,31 +151,31 @@ async def warm_authorized_lexical_corpora(settings: Any, embedder: Any) -> int:
         project_id = str(metadata.get("project_id") or "").strip()
         if not project_id or metadata.get("logical_collection") != settings.chroma_collection:
             continue
-        retriever = ChromaAccessRetriever.create(
-            chroma_host=settings.chroma_host,
-            chroma_port=settings.chroma_port,
-            collection_name=settings.chroma_collection,
-            text_field="chunk_text",
-            project_id=project_id,
-            access_policy_ids=(f"project:{project_id}",),
-            top_k=settings.retrieval_top_k,
-            score_threshold=settings.retrieval_score_threshold,
-            required_schema_version=settings.supported_schema_versions[0],
-            required_embedding_model=settings.supported_embedding_models[0],
-            retry_attempts=settings.dependency_retry_attempts,
-            timeout_seconds=settings.dependency_timeout_seconds,
-            lexical_fallback_enabled=settings.lexical_fallback_enabled,
-            lexical_fallback_max_records=settings.lexical_fallback_max_records,
-            lexical_fallback_cache_ttl_seconds=settings.lexical_fallback_cache_ttl_seconds,
-            lexical_fallback_cache_max_entries=settings.lexical_fallback_cache_max_entries,
-            vocabulary_cache_ttl_seconds=settings.vocabulary_cache_ttl_seconds,
-            embedder=embedder,
-        )
-        # These are the exact scopes produced by query planning. CODE_ASSISTED
-        # and CROSS_SOURCE split PAGE/CODE into independent calls, while delivery
-        # uses ISSUE and the remaining intents use the mixed corpus.
-        for source_scope in ((), ("PAGE",), ("CODE",), ("ISSUE",)):
-            await asyncio.to_thread(retriever._cached_authorized_corpus, source_scope)
+        # Warm one complete view for each accepted schema. Provider-specific
+        # views are derived from it in memory, which avoids another complete
+        # Chroma scan for every source combination.
+        for schema_version in settings.supported_schema_versions:
+            retriever = ChromaAccessRetriever.create(
+                chroma_host=settings.chroma_host,
+                chroma_port=settings.chroma_port,
+                collection_name=settings.chroma_collection,
+                text_field="chunk_text",
+                project_id=project_id,
+                access_policy_ids=(f"project:{project_id}",),
+                top_k=settings.retrieval_top_k,
+                score_threshold=settings.retrieval_score_threshold,
+                required_schema_version=schema_version,
+                required_embedding_model=settings.supported_embedding_models[0],
+                retry_attempts=settings.dependency_retry_attempts,
+                timeout_seconds=settings.dependency_timeout_seconds,
+                lexical_fallback_enabled=settings.lexical_fallback_enabled,
+                lexical_fallback_max_records=settings.lexical_fallback_max_records,
+                lexical_fallback_cache_ttl_seconds=settings.lexical_fallback_cache_ttl_seconds,
+                lexical_fallback_cache_max_entries=settings.lexical_fallback_cache_max_entries,
+                vocabulary_cache_ttl_seconds=settings.vocabulary_cache_ttl_seconds,
+                embedder=embedder,
+            )
+            await asyncio.to_thread(retriever._cached_authorized_corpus, ())
         warmed += 1
     return warmed
 
@@ -1026,14 +1050,14 @@ class ChromaAccessRetriever(BaseRetriever):
         return ranked[: self.top_k]
 
     def _lexical_candidates(self, query: str, source_types: tuple[str, ...]) -> list[Document]:
-        cached = self._cached_authorized_corpus(source_types)
+        cached = self._cached_authorized_corpus(source_types, allow_stale=True)
         ranked = _rank_cached_corpus(query, cached)
         for document in ranked:
             document.metadata["retrieval_channel"] = "lexical"
         return ranked[: self.top_k]
 
     def _rare_query_terms(self, query: str, source_types: tuple[str, ...]) -> tuple[str, ...]:
-        cached = self._cached_authorized_corpus(source_types)
+        cached = self._cached_authorized_corpus(source_types, allow_stale=True)
         corpus = cached.documents
         if not corpus:
             return ()
@@ -1090,7 +1114,9 @@ class ChromaAccessRetriever(BaseRetriever):
                 population.setdefault(entity_key, document)
         return [population[key] for key in sorted(population)]
 
-    def _cached_authorized_corpus(self, source_types: tuple[str, ...]) -> _FallbackCorpus:
+    def _cached_authorized_corpus(
+        self, source_types: tuple[str, ...], *, allow_stale: bool = False
+    ) -> _FallbackCorpus:
         visible_policies = document_visible_policies(self.project_id, self.access_policy_ids)
         key = (
             self.chroma_host,
@@ -1112,18 +1138,40 @@ class ChromaAccessRetriever(BaseRetriever):
                 if cached is not None:
                     _FALLBACK_CORPUS_CACHE.move_to_end(key)
             if cached and cached.expires_at <= now:
+                if allow_stale:
+                    self._schedule_fallback_corpus_refresh(key, source_types)
+                    return cached
                 cached = None
+        if cached is None and source_types and self.lexical_fallback_cache_ttl_seconds:
+            parent_key = (*key[:4], (), *key[5:])
+            with _FALLBACK_CORPUS_LOCK:
+                parent = _FALLBACK_CORPUS_CACHE.get(parent_key)
+            if parent is not None and (parent.expires_at > now or allow_stale):
+                allowed_types = frozenset(source_types)
+                cached = _indexed_fallback_corpus(
+                    tuple(
+                        document
+                        for document in parent.documents
+                        if str(document.metadata.get("source_type") or "").upper()
+                        in allowed_types
+                    ),
+                    truncated=parent.truncated,
+                    expires_at=parent.expires_at,
+                )
+                with _FALLBACK_CORPUS_LOCK:
+                    _FALLBACK_CORPUS_CACHE[key] = cached
+                    _FALLBACK_CORPUS_CACHE.move_to_end(key)
+                    while len(_FALLBACK_CORPUS_CACHE) > self.lexical_fallback_cache_max_entries:
+                        _FALLBACK_CORPUS_CACHE.popitem(last=False)
+                    lexical_cache_entries(len(_FALLBACK_CORPUS_CACHE))
+                if parent.expires_at <= now:
+                    self._schedule_fallback_corpus_refresh(parent_key, ())
         if cached is None:
             documents, truncated = self._fetch_fallback_corpus(source_types)
-            document_frequency, term_frequencies, document_lengths = _lexical_index(documents)
-            cached = _FallbackCorpus(
-                expires_at=now + self.lexical_fallback_cache_ttl_seconds,
-                documents=tuple(documents),
+            cached = _indexed_fallback_corpus(
+                documents,
                 truncated=truncated,
-                document_frequency=document_frequency,
-                term_frequencies=term_frequencies,
-                document_lengths=document_lengths,
-                average_document_length=(sum(document_lengths) / max(1, len(document_lengths))),
+                expires_at=now + self.lexical_fallback_cache_ttl_seconds,
             )
             if self.lexical_fallback_cache_ttl_seconds:
                 with _FALLBACK_CORPUS_LOCK:
@@ -1133,6 +1181,44 @@ class ChromaAccessRetriever(BaseRetriever):
                         _FALLBACK_CORPUS_CACHE.popitem(last=False)
                     lexical_cache_entries(len(_FALLBACK_CORPUS_CACHE))
         return cached
+
+    def _schedule_fallback_corpus_refresh(
+        self, key: tuple[object, ...], source_types: tuple[str, ...]
+    ) -> None:
+        """Refresh one expired lexical view without blocking an answer request.
+
+        Dense retrieval continues to read Chroma directly, so newly indexed
+        content remains immediately searchable while the lexical companion is
+        rebuilt. Exact inventories deliberately do not use this stale path.
+        """
+
+        with _FALLBACK_CORPUS_LOCK:
+            if key in _FALLBACK_CORPUS_REFRESHING:
+                return
+            _FALLBACK_CORPUS_REFRESHING.add(key)
+        _FALLBACK_REFRESH_EXECUTOR.submit(
+            self._refresh_fallback_corpus, key, source_types
+        )
+
+    def _refresh_fallback_corpus(
+        self, key: tuple[object, ...], source_types: tuple[str, ...]
+    ) -> None:
+        try:
+            documents, truncated = self._fetch_fallback_corpus(source_types)
+            refreshed = _indexed_fallback_corpus(
+                documents,
+                truncated=truncated,
+                expires_at=time.monotonic() + self.lexical_fallback_cache_ttl_seconds,
+            )
+            with _FALLBACK_CORPUS_LOCK:
+                _FALLBACK_CORPUS_CACHE[key] = refreshed
+                _FALLBACK_CORPUS_CACHE.move_to_end(key)
+                while len(_FALLBACK_CORPUS_CACHE) > self.lexical_fallback_cache_max_entries:
+                    _FALLBACK_CORPUS_CACHE.popitem(last=False)
+                lexical_cache_entries(len(_FALLBACK_CORPUS_CACHE))
+        finally:
+            with _FALLBACK_CORPUS_LOCK:
+                _FALLBACK_CORPUS_REFRESHING.discard(key)
 
     def _fetch_fallback_corpus(self, source_types: tuple[str, ...]) -> tuple[list[Document], bool]:
         base_filters: list[dict[str, object]] = [

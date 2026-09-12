@@ -242,8 +242,19 @@ The current hybrid design combines:
 - metadata weighting for titles, paths, references, locators, and indexed keywords;
 - reciprocal-rank fusion so incomparable raw score scales are not mixed directly.
 
-The lexical stage can reorder the authorized candidate window. It cannot recover a record that was
-never returned from the bounded Chroma search; the dense top-k window remains the recall boundary.
+The lexical stage ranks the authorized corpus independently and can recover exact terms that do not
+appear in the dense candidate window. Its cached corpus is keyed by collection, project, access
+scope, schema, embedding model, and source type. After expiry, ordinary semantic requests serve the
+last valid lexical view while one bounded background worker refreshes it; live dense search still
+queries Chroma on every request. Exact inventories and structured Jira aggregates require a fresh,
+complete scan and never use the stale path. This removes cache-expiry latency spikes without making
+exact counts stale or hiding newly indexed content from semantic retrieval.
+
+For bilingual retrieval, translation and the original-language dense request
+start together. Once translation completes, its provider-scoped searches run
+concurrently with the original searches. The candidate identities, provider
+budgets, rank-fusion inputs, and final ordering remain the same as the serial
+execution; only the wait topology changes.
 
 ### Candidate validation and selection
 
@@ -293,6 +304,15 @@ An answer is released only after these gates:
 
 Internal `[SOURCE n]` markers survive until validation finishes. They are then removed from visible
 prose while structured source objects remain in the response.
+
+If relevance or grounding is insufficient, a separate safe-response model receives only the user
+question, language, and typed failure category. It receives no evidence and cannot turn the failure
+into an unsupported answer. Candidates assessed at zero relevance remain available to private
+tracing but are omitted from public source cards, so unrelated providers do not appear to support
+the abstention. An explicit zero-relevance verdict ends before answer generation, citation repair,
+and grounding because those stages cannot convert unrelated evidence into a supported answer;
+borderline non-zero evidence still receives every existing truth gate. A static content-free
+response is the last fallback when the safe responder is also unavailable.
 
 The local grounding verifier uses multilingual BGE similarity plus deterministic exact-value,
 negation, and citation checks. A project-overview answer may remove only unsupported sentences and

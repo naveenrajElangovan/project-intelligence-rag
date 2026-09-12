@@ -685,6 +685,53 @@ class RetrievalNodesMixin:
             )
 
         base_results_task = asyncio.create_task(retrieve_initial())
+        translated_results_task = None
+        if translation_task is not None and translation_slot is not None:
+            async def retrieve_translated():
+                try:
+                    translated = await translation_task
+                except Exception:
+                    return "", (), [], []
+                if not _safe_translation_variant(
+                    resolved_question, translated, self._vocabulary.entities
+                ) or translated in queries:
+                    return "", (), [], []
+                translated_queries = [translated]
+                terminology = retrieval_terminology_variant(translated)
+                if (
+                    terminology
+                    and len(queries) + len(translated_queries) < self._settings.max_query_variants
+                    and _safe_translation_variant(
+                        resolved_question, terminology, self._vocabulary.entities
+                    )
+                ):
+                    translated_queries.append(terminology)
+                if provider_scopes and federated_loader is not None:
+                    grouped = await asyncio.gather(
+                        *(federated_loader(query, provider_scopes) for query in translated_queries)
+                    )
+                    aligned = [
+                        (query, (provider,))
+                        for query in translated_queries
+                        for provider, _source_types in provider_scopes
+                    ]
+                    flattened = [
+                        documents for query_groups in grouped for documents in query_groups
+                    ]
+                    return translated, tuple(translated_queries), aligned, flattened
+                additional = list(
+                    dict.fromkeys(
+                        (query, scope) for query in translated_queries for scope in scopes
+                    )
+                )
+                translated_results = list(
+                    await asyncio.gather(
+                        *(self._retrieve_scope(query, scope) for query, scope in additional)
+                    )
+                )
+                return translated, tuple(translated_queries), additional, translated_results
+
+            translated_results_task = asyncio.create_task(retrieve_translated())
         resolved_question = state.get("resolved_question", self._request.question)
         exact_identifiers = _exact_identifier_tokens(resolved_question, self._vocabulary.entities)
         # Execute deterministic structured/lexical channels before semantic
@@ -742,50 +789,15 @@ class RetrievalNodesMixin:
             reason_code="COMPLETE",
             language=state.get("language", "und"),
         )
-        if translation_task is not None and translation_slot is not None:
-            try:
-                translated = await translation_task
-            except Exception:
-                translated = ""
-            if (
-                _safe_translation_variant(resolved_question, translated, self._vocabulary.entities)
-                and translated not in queries
-            ):
+        if translated_results_task is not None and translation_slot is not None:
+            translated, translated_queries, additional, translated_results = (
+                await translated_results_task
+            )
+            if translated:
                 queries[translation_slot] = translated
-                terminology = retrieval_terminology_variant(translated)
-                if (
-                    terminology
-                    and len(queries) < self._settings.max_query_variants
-                    and _safe_translation_variant(
-                        resolved_question, terminology, self._vocabulary.entities
-                    )
-                ):
-                    queries.append(terminology)
-                additional = list(
-                    dict.fromkeys(
-                        (query, scope) for query in queries[translation_slot:] for scope in scopes
-                    )
-                )
-                if provider_scopes and federated_loader is not None:
-                    additional_queries = tuple(dict.fromkeys(query for query, _scope in additional))
-                    grouped = await asyncio.gather(
-                        *(federated_loader(query, provider_scopes) for query in additional_queries)
-                    )
-                    requests.extend(
-                        (query, (provider,))
-                        for query in additional_queries
-                        for provider, _source_types in provider_scopes
-                    )
-                    results.extend(
-                        documents for query_groups in grouped for documents in query_groups
-                    )
-                else:
-                    requests.extend(additional)
-                    results.extend(
-                        await asyncio.gather(
-                            *(self._retrieve_scope(query, scope) for query, scope in additional)
-                        )
-                    )
+                queries.extend(translated_queries[1:])
+                requests.extend(additional)
+                results.extend(translated_results)
             else:
                 queries.pop(translation_slot)
         (
@@ -2057,6 +2069,17 @@ class RetrievalNodesMixin:
         return result
 
     def _route_after_evidence_completeness(self, state: RagState) -> str:
+        # An explicit zero-relevance verdict cannot become an evidence-backed
+        # answer through generation. End here so the response layer can produce
+        # a natural, question-aware safe response without spending time on
+        # generation, citation repair, and grounding. Borderline non-zero
+        # evidence still follows the full truth-gate path below.
+        if (
+            state.get("context_quality") == "INSUFFICIENT"
+            and float(state.get("context_relevance") or 0.0)
+            < self._settings.context_relevance_floor
+        ):
+            return "end"
         if state.get("grounded") is False:
             return "generate" if state.get("documents") else "end"
         if not state.get("missing_requirements"):

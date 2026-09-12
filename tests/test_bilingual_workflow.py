@@ -365,6 +365,10 @@ def test_no_evidence_uses_model_written_safe_response_without_sources(monkeypatc
     assert response.answer.startswith("No tengo información indexada suficiente")
 
 
+def test_natural_safe_responses_are_enabled_by_default() -> None:
+    assert Settings(_env_file=None, environment="development").generated_refusals_enabled is True
+
+
 def test_entity_overview_intent_is_bounded_to_broad_pos_or_bot_questions() -> None:
     entities = ("pos", "bot")
     assert workflow_module._entity_overview_entity("Tell me about POS", entities) == "pos"

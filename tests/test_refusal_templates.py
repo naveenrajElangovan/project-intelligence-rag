@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import Settings
-from app.llm import insufficient_evidence_answer, refusal_answer
+from app.llm import insufficient_evidence_answer, pipeline_unavailable_answer, refusal_answer
 from app.models import RagRequest
 from app.workflow import AuthorizedRagWorkflow
 
@@ -43,6 +43,13 @@ def test_every_refusal_reason_has_a_distinct_content_free_template(language: str
 
 def test_unknown_refusal_reason_uses_the_existing_fallback() -> None:
     assert refusal_answer("UNKNOWN", "es") == insufficient_evidence_answer("es")
+
+
+def test_pipeline_failure_fallback_is_bounded_and_query_aware() -> None:
+    answer = pipeline_unavailable_answer("en", "  what   is memoy here  ")
+
+    assert "what is memoy here" in answer
+    assert len(pipeline_unavailable_answer("en", "x" * 500)) < 260
 
 
 def test_missing_evidence_messages_are_honest_and_bilingual() -> None:
