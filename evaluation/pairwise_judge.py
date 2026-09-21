@@ -225,15 +225,12 @@ def aggregate(results: Sequence[PairResult]) -> dict[str, float | int | str]:
         rows = [r for r in scored if r.query_language == language]
         summary.update(_rates(rows, f"{language}."))
     if "en.candidate_win_rate" in summary and "es.candidate_win_rate" in summary:
-        summary["language_gap.candidate_win_rate"] = (
-            float(summary["en.candidate_win_rate"])
-            - float(summary["es.candidate_win_rate"])
-        )
+        summary["language_gap.candidate_win_rate"] = float(
+            summary["en.candidate_win_rate"]
+        ) - float(summary["es.candidate_win_rate"])
     # A judge that flips with the order has not measured quality. Say so in the
     # payload rather than leaving a reader to notice the diagnostic themselves.
     summary["verdict_reliability"] = (
-        "UNRELIABLE_POSITION_BIAS"
-        if float(summary["position_bias_rate"]) > 0.20
-        else "OK"
+        "UNRELIABLE_POSITION_BIAS" if float(summary["position_bias_rate"]) > 0.20 else "OK"
     )
     return summary

@@ -5,6 +5,7 @@ import re
 from app.llm import GroundedAnswer
 from app.workflow_support.answer_structure import material_claims, prune_unsupported_claims
 
+
 def _citations_valid(value: GroundedAnswer, count: int) -> bool:
     if not value.citations or any(index < 1 or index > count for index in value.citations):
         return False
@@ -43,14 +44,15 @@ def _citation_failure_reason(value: GroundedAnswer, count: int) -> str:
 
 
 def _normalize_citations(value: GroundedAnswer) -> GroundedAnswer:
-    """Mirror explicit answer markers into the structured citation field."""
+    """Remove prompt-only artifacts and mirror markers into structured citations."""
 
+    answer = _strip_internal_answer_artifacts(value.answer)
     answer = re.sub(
         r"\[SOURCE\s+(\d+(?:\s*,\s*(?:SOURCE\s+)?\d+)+)\]",
         lambda match: " ".join(
             f"[SOURCE {number}]" for number in re.findall(r"\d+", match.group(1))
         ),
-        value.answer,
+        answer,
         flags=re.IGNORECASE,
     )
     answer = re.sub(
@@ -64,6 +66,40 @@ def _normalize_citations(value: GroundedAnswer) -> GroundedAnswer:
     if mentioned == value.citations and answer == value.answer:
         return value
     return value.model_copy(update={"answer": answer, "citations": mentioned})
+
+
+def _strip_internal_answer_artifacts(answer: str) -> str:
+    """Remove evidence framing that must never cross the API boundary.
+
+    These strings are prompt delimiters and neutralized injection labels, not
+    corpus facts. A trailing prose Sources section is also forbidden because
+    source attribution is returned as structured metadata.
+    """
+
+    clean_lines: list[str] = []
+    for line in answer.splitlines():
+        if re.fullmatch(
+            r"\s*-{2,}(?:BEGIN|END) AUTHORIZED EVIDENCE "
+            r"[0-9a-f]+ SOURCE \d+-{2,}\s*",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if re.fullmatch(r"\s*</?AUTHORIZED_UNTRUSTED_EVIDENCE>\s*", line, re.IGNORECASE):
+            continue
+        clean_lines.append(line)
+    clean = "\n".join(clean_lines)
+    clean = re.sub(
+        r"\[embedded\s+(?:SOURCE\s+\d+|TITLE|CONTENT|REFERENCE)\]", "", clean, flags=re.IGNORECASE
+    )
+    clean = re.sub(
+        r"(?ims)\n{1,2}\s*#{1,6}\s+(?:sources|fuentes)\s*$.*\Z",
+        "",
+        clean,
+    )
+    clean = re.sub(r"[ \t]+\n", "\n", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
 
 
 def _answer_without_source_markers(answer: str) -> str:
@@ -111,9 +147,7 @@ def _pipe_row(cells: list[str]) -> str:
     return "| " + " | ".join(cells) + " |"
 
 
-def drop_uncited_claims(
-    value: GroundedAnswer, count: int
-) -> tuple[GroundedAnswer, int]:
+def drop_uncited_claims(value: GroundedAnswer, count: int) -> tuple[GroundedAnswer, int]:
     """Remove only the claims that carry no citation, keeping the cited ones.
 
     A single uncited sentence used to discard the whole answer, so seven verified
@@ -144,9 +178,7 @@ def drop_uncited_claims(
 
 def _all_material_sentences_cited(answer: str) -> bool:
     claims = material_claims(answer)
-    return bool(claims) and all(
-        re.search(r"\[SOURCE \d+\]", claim.text) for claim in claims
-    )
+    return bool(claims) and all(re.search(r"\[SOURCE \d+\]", claim.text) for claim in claims)
 
 
 def _overview_style_repair_needed(question: str, answer: str) -> bool:

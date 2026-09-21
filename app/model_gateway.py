@@ -5,8 +5,20 @@ from __future__ import annotations
 import os
 import json
 from functools import lru_cache
+from typing import Literal, cast
 
 from app.config import Settings
+from app.telemetry import log_ollama_request_async
+
+RoutingStrategy = Literal[
+    "simple-shuffle",
+    "least-busy",
+    "usage-based-routing",
+    "latency-based-routing",
+    "cost-based-routing",
+    "usage-based-routing-v2",
+    "lar1",
+]
 
 
 # LiteLLM otherwise performs a network read for its public price table at import
@@ -14,15 +26,46 @@ from app.config import Settings
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 
-def _provider_model(settings: Settings, provider: str, profile: str, task: str) -> tuple[str, dict[str, object]] | None:
+@lru_cache(maxsize=1)
+def _ollama_fingerprinted_async_client():
+    """Return LiteLLM's HTTP transport with content-free request tracing."""
+
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
+    return AsyncHTTPHandler(
+        event_hooks={"request": [log_ollama_request_async]},
+        client_alias="project-intelligence-ollama-fingerprint",
+    )
+
+
+async def close_model_gateway_clients() -> None:
+    """Close the cached LiteLLM transport during application/evaluator shutdown."""
+
+    if _ollama_fingerprinted_async_client.cache_info().currsize:
+        await _ollama_fingerprinted_async_client().close()
+        _ollama_fingerprinted_async_client.cache_clear()
+    from litellm.llms.custom_httpx.async_client_cleanup import (
+        close_litellm_async_clients,
+    )
+
+    await close_litellm_async_clients()
+
+
+def _provider_model(
+    settings: Settings, provider: str, profile: str, task: str
+) -> tuple[str, dict[str, object]] | None:
     if provider == "ollama":
         if not settings.local_inference_enabled or not settings.ollama_base_url:
             return None
-        name = settings.ollama_planner_model if task == "planner" else {
-            "budget": settings.ollama_planner_model,
-            "standard": settings.ollama_model,
-            "complex": settings.ollama_model,
-        }.get(profile, settings.ollama_model)
+        name = (
+            settings.ollama_planner_model
+            if task == "planner"
+            else {
+                "budget": settings.ollama_planner_model,
+                "standard": settings.ollama_model,
+                "complex": settings.ollama_model,
+            }.get(profile, settings.ollama_model)
+        )
         return f"ollama/{name}", {
             "api_base": settings.ollama_base_url,
             "num_ctx": settings.ollama_context_tokens,
@@ -72,21 +115,33 @@ def _route_spec(settings: Settings, profile: str, task: str, temperature: float)
         model, params = resolved
         group = f"pi-{task}-{profile}-{provider}"
         groups.append(group)
-        model_list.append({
-            "model_name": group,
-            "litellm_params": {
-                "model": model,
-                "temperature": temperature,
-                "timeout": settings.llm_timeout_seconds,
-                "max_retries": 0,
-                **params,
-            },
-        })
+        model_list.append(
+            {
+                "model_name": group,
+                "litellm_params": {
+                    "model": model,
+                    "temperature": temperature,
+                    # Keep LiteLLM's Ollama route at parity with the native
+                    # ChatOllama path. Temperature zero alone is not a complete
+                    # sampler specification on local runtimes.
+                    "seed": 0,
+                    "top_k": 1 if temperature == 0.0 else 40,
+                    "num_thread": 8,
+                    "timeout": settings.llm_timeout_seconds,
+                    "max_retries": 0,
+                    **params,
+                },
+            }
+        )
     if not model_list:
         raise ValueError("No environment-configured model is available to LiteLLM.")
-    fallbacks = [{groups[0]: groups[1:]}] if settings.litellm_fallbacks_enabled and len(groups) > 1 else []
-    return tuple(model_list), tuple(groups), tuple(
-        (key, tuple(value)) for item in fallbacks for key, value in item.items()
+    fallbacks = (
+        [{groups[0]: groups[1:]}] if settings.litellm_fallbacks_enabled and len(groups) > 1 else []
+    )
+    return (
+        tuple(model_list),
+        tuple(groups),
+        tuple((key, tuple(value)) for item in fallbacks for key, value in item.items()),
     )
 
 
@@ -95,7 +150,7 @@ def _cached_router(
     model_list_json: str,
     fallback_key: tuple[tuple[str, tuple[str, ...]], ...],
     timeout: float,
-    strategy: str,
+    strategy: RoutingStrategy,
 ):
     from litellm import Router
 
@@ -126,7 +181,16 @@ def build_litellm_chat_model(
         model_list_json,
         fallback_key,
         settings.llm_timeout_seconds,
-        settings.litellm_routing_strategy,
+        cast(RoutingStrategy, settings.litellm_routing_strategy),
+    )
+    # The deployed local stack routes Ollama through LiteLLM, so ChatOllama's
+    # native httpx hooks are not on that wire path. Inject LiteLLM's own async
+    # HTTP transport when Ollama is the sole route; the hook sees the finalized
+    # serialized request immediately before it is sent to /api/generate.
+    model_kwargs = (
+        {"client": _ollama_fingerprinted_async_client()}
+        if len(groups) == 1 and groups[0].endswith("-ollama")
+        else {}
     )
     return ChatLiteLLMRouter(
         router=router,
@@ -134,4 +198,5 @@ def build_litellm_chat_model(
         temperature=temperature,
         request_timeout=settings.llm_timeout_seconds,
         max_retries=0,
+        model_kwargs=model_kwargs,
     )

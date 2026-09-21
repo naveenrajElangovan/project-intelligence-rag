@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from langgraph.graph import END, START, StateGraph
 
@@ -25,16 +25,28 @@ def compiled_workflow_graph() -> Any:
 
     graph = StateGraph(RagState)
     for name in (
-        "provider_plan", "provider_execute", "provider_unavailable",
-        "plan_queries", "retrieve", "feature_affinity", "rerank",
-        "validate_evidence_completeness", "recover_query", "generate",
-        "validate_citations", "validate_completeness", "repair_completeness",
+        "provider_plan",
+        "provider_execute",
+        "provider_unavailable",
+        "plan_queries",
+        "retrieve",
+        "feature_affinity",
+        "rerank",
+        "validate_evidence_completeness",
+        "recover_query",
+        "generate",
+        "validate_citations",
+        "validate_completeness",
+        "repair_completeness",
         "verify_grounding",
     ):
-        graph.add_node(name, _node(f"_{name}"))
+        # LangGraph's overloads do not accept its own async TypedDict node shape
+        # under mypy 1.20, although StateGraph executes this callable directly.
+        graph.add_node(name, cast(Any, _node(f"_{name}")))
     graph.add_edge(START, "provider_plan")
     graph.add_conditional_edges(
-        "provider_plan", _route("_route_after_provider_plan"),
+        "provider_plan",
+        _route("_route_after_provider_plan"),
         {
             "structured": "provider_execute",
             "unavailable": "provider_unavailable",
@@ -47,22 +59,34 @@ def compiled_workflow_graph() -> Any:
     graph.add_edge("retrieve", "feature_affinity")
     graph.add_edge("feature_affinity", "rerank")
     graph.add_conditional_edges(
-        "rerank", _route("_route_after_rerank"),
-        {"validate_evidence": "validate_evidence_completeness", "recover_query": "recover_query", "end": END},
+        "rerank",
+        _route("_route_after_rerank"),
+        {
+            "validate_evidence": "validate_evidence_completeness",
+            "recover_query": "recover_query",
+            "end": END,
+        },
     )
     graph.add_conditional_edges(
-        "validate_evidence_completeness", _route("_route_after_evidence_completeness"),
+        "validate_evidence_completeness",
+        _route("_route_after_evidence_completeness"),
         {"generate": "generate", "repair_completeness": "repair_completeness", "end": END},
     )
     graph.add_conditional_edges(
-        "recover_query", lambda state: "retrieve" if state.get("queries") else "end",
+        "recover_query",
+        lambda state: "retrieve" if state.get("queries") else "end",
         {"retrieve": "retrieve", "end": END},
     )
     graph.add_edge("generate", "validate_citations")
     graph.add_edge("validate_citations", "validate_completeness")
     graph.add_conditional_edges(
-        "validate_completeness", _route("_route_after_completeness"),
-        {"verify_grounding": "verify_grounding", "repair_completeness": "repair_completeness", "end": END},
+        "validate_completeness",
+        _route("_route_after_completeness"),
+        {
+            "verify_grounding": "verify_grounding",
+            "repair_completeness": "repair_completeness",
+            "end": END,
+        },
     )
     graph.add_edge("repair_completeness", "retrieve")
     graph.add_edge("verify_grounding", END)

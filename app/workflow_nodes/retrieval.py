@@ -5,14 +5,18 @@ import hashlib
 import math
 import re
 from collections import Counter
+from typing import cast
 
 from langchain_core.documents import Document
 
 from app.config import Settings
-from app.models import RagRequest
+from app.grounding_contract import resolve_request
+from app.models import RagRequest, ResolvedRequest
+from app.reranking import LocalMultilingualReranker
+from app.retrieval import ChromaAccessRetriever
 
 from app.telemetry import stage_complete, started
-from app.reranking import progressive_rerank_candidates
+from app.reranking import progressive_rerank_candidates, source_balanced_rerank_window
 from app.workflow_nodes.state import RagState
 from app.workflow_support.completeness import (
     _answer_requirements,
@@ -60,8 +64,10 @@ from app.retrieval_pipeline import (
     ReciprocalRankFusion,
     deduplicate_candidate_bodies,
     validate_authorized_candidates,
+    balanced_source_ids,
 )
 from app.source_policy import SourcePolicyRegistry, deduplicate_authoritative_versions
+from app.vocabulary import CorpusVocabulary
 
 
 def _parent_reconstruction_anchors(
@@ -90,18 +96,62 @@ def _scope_candidates_to_planned_types(
     if not typed:
         # Lightweight legacy/custom retrievers may not provide source metadata.
         return documents
-    return [
-        document for document in documents if _document_source_type(document) in allowed
-    ]
+    return [document for document in documents if _document_source_type(document) in allowed]
 
 
 _LEXICAL_ANCHOR_NOISE = {
-    "about", "all", "anything", "are", "can", "could", "details", "does",
-    "explain", "for", "from", "give", "have", "here", "how", "in", "is",
-    "me", "of", "project", "tell", "the", "this", "what", "where", "which",
-    "with", "you", "algo", "aqui", "cómo", "cual", "cuáles", "dame", "de",
-    "del", "donde", "el", "en", "esta", "este", "explica", "hay", "la",
-    "las", "los", "para", "proyecto", "que", "qué", "sobre", "tiene",
+    "about",
+    "all",
+    "anything",
+    "are",
+    "can",
+    "could",
+    "details",
+    "does",
+    "explain",
+    "for",
+    "from",
+    "give",
+    "have",
+    "here",
+    "how",
+    "in",
+    "is",
+    "me",
+    "of",
+    "project",
+    "tell",
+    "the",
+    "this",
+    "what",
+    "where",
+    "which",
+    "with",
+    "you",
+    "algo",
+    "aqui",
+    "cómo",
+    "cual",
+    "cuáles",
+    "dame",
+    "de",
+    "del",
+    "donde",
+    "el",
+    "en",
+    "esta",
+    "este",
+    "explica",
+    "hay",
+    "la",
+    "las",
+    "los",
+    "para",
+    "proyecto",
+    "que",
+    "qué",
+    "sobre",
+    "tiene",
 }
 
 
@@ -189,6 +239,9 @@ def _single_record_evidence_order(documents: list[Document]) -> list[Document]:
 
 def _exact_identifier_tokens(value: str, entities: tuple[str, ...] = ()) -> tuple[str, ...]:
     ignored = {"CODE", "API", "HTTP", "JSON", "SQL"} | {entity.upper() for entity in entities}
+    section_identifiers = re.findall(
+        r"(?i)\b(?:section|secci[oó]n)\s+([A-Z][A-Z0-9]+-\d+)\b", value
+    )
     identifiers = (
         identifier for identifier in member_identifiers(value) if identifier not in ignored
     )
@@ -200,7 +253,11 @@ def _exact_identifier_tokens(value: str, entities: tuple[str, ...] = ()) -> tupl
         match.group(1).strip() if match.group(1) else match.group(2).strip()
         for match in re.finditer(r"`([^`]{2,80})`|[\"']([^\"']{2,80})[\"']", value)
     )
-    return tuple(dict.fromkeys([*identifiers, *labels, *quoted]))
+    filenames = re.findall(
+        r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_./-]+\.(?:kt|kts|py|js|jsx|ts|tsx|java|swift|go|rs|rb|php|cs|sql|ya?ml|json|toml))(?![A-Za-z0-9])",
+        value,
+    )
+    return tuple(dict.fromkeys([*section_identifiers, *identifiers, *labels, *filenames, *quoted]))
 
 
 def _forced_anchor_tokens(value: str) -> tuple[str, ...]:
@@ -214,7 +271,11 @@ def _forced_anchor_tokens(value: str) -> tuple[str, ...]:
         match.group(1).strip() if match.group(1) else match.group(2).strip()
         for match in re.finditer(r"`([^`]{2,80})`|[\"']([^\"']{2,80})[\"']", value)
     )
-    return tuple(dict.fromkeys([*labels, *quoted]))
+    filenames = re.findall(
+        r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_./-]+\.(?:kt|kts|py|js|jsx|ts|tsx|java|swift|go|rs|rb|php|cs|sql|ya?ml|json|toml))(?![A-Za-z0-9])",
+        value,
+    )
+    return tuple(dict.fromkeys([*labels, *filenames, *quoted]))
 
 
 def _canonical_route_tokens(
@@ -244,7 +305,11 @@ def _canonical_route_directive(
     """
 
     normalized_question = " ".join(re.findall(r"[a-z0-9à-ÿ]+", question.casefold()))
-    if len(normalized_question.split()) < 3:
+    # One-word fragments are too ambiguous to route, but an exact two-word
+    # question is still an authoritative corpus declaration. Rejecting it here
+    # made terse operational questions depend on nondeterministic model recovery
+    # even though the authorized index named their section explicitly.
+    if len(normalized_question.split()) < 2:
         return (), ""
     tokens: list[str] = []
     refusal_reason = ""
@@ -275,6 +340,60 @@ def _canonical_route_directive(
     return tuple(tokens), refusal_reason
 
 
+def _is_canonical_route_control_document(document: Document) -> bool:
+    """Keep canonical-question indexes in the control plane, never answer evidence."""
+
+    structure_value = document.metadata.get("structure_path") or ""
+    structure = (
+        " ".join(str(value) for value in structure_value)
+        if isinstance(structure_value, (list, tuple))
+        else str(structure_value)
+    )
+    return bool(
+        re.search(
+            r"(?<![A-Z0-9_-])QUESTION-[A-Z0-9_-]+(?![A-Z0-9_-])",
+            structure.upper(),
+        )
+    )
+
+
+def _matched_structure_route_tokens(documents: list[Document], tokens: tuple[str, ...]) -> set[str]:
+    """Return route IDs proven by section structure rather than body mentions."""
+
+    matched: set[str] = set()
+    for document in documents:
+        structure_value = document.metadata.get("structure_path") or ""
+        structure = (
+            " ".join(str(value) for value in structure_value)
+            if isinstance(structure_value, (list, tuple))
+            else str(structure_value)
+        ).upper()
+        for token in tokens:
+            if re.search(
+                rf"(?<![A-Z0-9_-]){re.escape(token.upper())}(?![A-Z0-9_-])",
+                structure,
+            ):
+                matched.add(token)
+    return matched
+
+
+def _mark_structure_route_candidates(documents: list[Document], tokens: tuple[str, ...]) -> None:
+    """Promote any retrieved exact target section, including beyond scan caps."""
+
+    for document in documents:
+        if not _matched_structure_route_tokens([document], tokens):
+            continue
+        document.metadata.pop("identifier_anchor", None)
+        document.metadata.pop("identifier_anchor_score", None)
+        document.metadata["canonical_route_anchor"] = True
+        document.metadata["canonical_route_candidate"] = True
+        document.metadata["canonical_route_match"] = True
+        document.metadata["canonical_route_match_score"] = max(
+            2.0,
+            float(document.metadata.get("canonical_route_match_score") or 0),
+        )
+
+
 async def _load_canonical_route_directive(
     retriever: object,
     question: str,
@@ -285,9 +404,58 @@ async def _load_canonical_route_directive(
 
     canonical_loader = getattr(retriever, "ainvoke_canonical_questions", None)
     canonical_documents = (
-        await canonical_loader(question, source_types) if canonical_loader is not None else []
+        # Canonical question indexes are routing control documents. A planner
+        # may classify Spanish words such as "código" as CODE, but that must not
+        # hide the PAGE index that declares the authorized operational route.
+        # The linked evidence remains project/policy filtered by the retriever.
+        await canonical_loader(question, ()) if canonical_loader is not None else []
     )
     return _canonical_route_directive(question, [*canonical_documents, *semantic_documents])
+
+
+def _mark_canonical_route_candidates(question: str, documents: list[Document]) -> None:
+    """Apply the serving path's neutral route-candidate metadata in one place."""
+
+    route_query = retrieval_terminology_variant(question) or question
+    route_terms = set(re.findall(r"[a-z0-9à-ÿ]{4,}", route_query.casefold())) - {
+        "como",
+        "cómo",
+        "what",
+        "does",
+        "section",
+        "cover",
+        "covers",
+        "tell",
+        "event",
+        "version",
+        "where",
+        "which",
+        "with",
+        "from",
+        "para",
+    }
+    for document in documents:
+        # A corpus route reserves the target for semantic ranking; it does not
+        # make every linked section an answer by assertion.
+        document.metadata.pop("identifier_anchor", None)
+        document.metadata.pop("identifier_anchor_score", None)
+        document.metadata["canonical_route_candidate"] = True
+        structure = document.metadata.get("structure_path") or ()
+        searchable = " ".join(
+            (
+                document.page_content,
+                " ".join(str(value) for value in structure)
+                if isinstance(structure, (list, tuple))
+                else str(structure),
+            )
+        )
+        route_match_score = _exact_term_ratio(route_terms, searchable)
+        # A shared word such as "section" or "event" is not an exact route
+        # match. Require a majority of the meaningful terms so broad route pools
+        # remain candidates without acquiring deterministic-answer authority.
+        if route_match_score >= 0.5:
+            document.metadata["canonical_route_match"] = True
+            document.metadata["canonical_route_match_score"] = route_match_score
 
 
 def _retain_explicit_identifier_anchors(
@@ -579,6 +747,10 @@ def _exact_jira_documents(question: str, documents: list[Document]) -> bool:
 class RetrievalNodesMixin:
     _settings: Settings
     _request: RagRequest
+    _query_planner_factory: type
+    _reranker: LocalMultilingualReranker
+    _retriever: ChromaAccessRetriever
+    _vocabulary: CorpusVocabulary
 
     """RetrievalNodes responsibilities."""
 
@@ -729,43 +901,59 @@ class RetrievalNodesMixin:
             tuple(
                 (provider.value, provider_types[provider.value]) for provider in selection.providers
             )
-            if federated
+            if federated and selection is not None
             else ()
         )
         federated_loader = getattr(self._retriever, "ainvoke_federated", None)
+        federated_many_loader = getattr(self._retriever, "ainvoke_federated_many", None)
+        scoped_many_loader = getattr(self._retriever, "ainvoke_scoped_many", None)
         initial_queries = tuple(dict.fromkeys(query for query, _scope in requests))
 
         async def retrieve_initial() -> tuple[
             list[tuple[str, tuple[str, ...]]], list[list[Document]]
         ]:
             if provider_scopes and federated_loader is not None:
-                grouped = await asyncio.gather(
-                    *(federated_loader(query, provider_scopes) for query in initial_queries)
+                grouped = (
+                    await federated_many_loader(tuple(initial_queries), provider_scopes)
+                    if federated_many_loader is not None
+                    else await asyncio.gather(
+                        *(federated_loader(query, provider_scopes) for query in initial_queries)
+                    )
                 )
-                aligned = [
+                aligned: list[tuple[str, tuple[str, ...]]] = [
                     (query, (provider,))
                     for query in initial_queries
                     for provider, _source_types in provider_scopes
                 ]
-                flattened = [documents for query_groups in grouped for documents in query_groups]
+                flattened: list[list[Document]] = [
+                    list(documents) for query_groups in grouped for documents in query_groups
+                ]
                 return aligned, flattened
-            return requests, list(
-                await asyncio.gather(
-                    *(self._retrieve_scope(query, scope) for query, scope in requests)
+            return requests, (
+                await scoped_many_loader(tuple(requests))
+                if scoped_many_loader is not None
+                else list(
+                    await asyncio.gather(
+                        *(self._retrieve_scope(query, scope) for query, scope in requests)
+                    )
                 )
             )
 
         base_results_task = asyncio.create_task(retrieve_initial())
         translated_results_task = None
         if translation_task is not None and translation_slot is not None:
+
             async def retrieve_translated():
                 try:
                     translated = await translation_task
                 except Exception:
                     return "", (), [], []
-                if not _safe_translation_variant(
-                    resolved_question, translated, self._vocabulary.entities
-                ) or translated in queries:
+                if (
+                    not _safe_translation_variant(
+                        resolved_question, translated, self._vocabulary.entities
+                    )
+                    or translated in queries
+                ):
                     return "", (), [], []
                 translated_queries = [translated]
                 terminology = retrieval_terminology_variant(translated)
@@ -778,8 +966,15 @@ class RetrievalNodesMixin:
                 ):
                     translated_queries.append(terminology)
                 if provider_scopes and federated_loader is not None:
-                    grouped = await asyncio.gather(
-                        *(federated_loader(query, provider_scopes) for query in translated_queries)
+                    grouped = (
+                        await federated_many_loader(tuple(translated_queries), provider_scopes)
+                        if federated_many_loader is not None
+                        else await asyncio.gather(
+                            *(
+                                federated_loader(query, provider_scopes)
+                                for query in translated_queries
+                            )
+                        )
                     )
                     aligned = [
                         (query, (provider,))
@@ -795,9 +990,13 @@ class RetrievalNodesMixin:
                         (query, scope) for query in translated_queries for scope in scopes
                     )
                 )
-                translated_results = list(
-                    await asyncio.gather(
-                        *(self._retrieve_scope(query, scope) for query, scope in additional)
+                translated_results = (
+                    await scoped_many_loader(tuple(additional))
+                    if scoped_many_loader is not None
+                    else list(
+                        await asyncio.gather(
+                            *(self._retrieve_scope(query, scope) for query, scope in additional)
+                        )
                     )
                 )
                 return translated, tuple(translated_queries), additional, translated_results
@@ -861,9 +1060,12 @@ class RetrievalNodesMixin:
             language=state.get("language", "und"),
         )
         if translated_results_task is not None and translation_slot is not None:
-            translated, translated_queries, additional, translated_results = (
-                await translated_results_task
-            )
+            (
+                translated,
+                translated_queries,
+                additional,
+                translated_results,
+            ) = await translated_results_task
             if translated:
                 queries[translation_slot] = translated
                 queries.extend(translated_queries[1:])
@@ -881,44 +1083,43 @@ class RetrievalNodesMixin:
             source_types,
         )
         structure_loader = getattr(self._retriever, "ainvoke_structure_identifiers", None)
-        route_anchored = (
-            await structure_loader(canonical_route_tokens, source_types)
-            if structure_loader is not None and canonical_route_tokens
-            else await exact_loader(canonical_route_tokens, source_types)
-            if exact_loader is not None and canonical_route_tokens
+        structured_route = (
+            await structure_loader(canonical_route_tokens, (), state.get("language", ""))
+            if canonical_route_tokens and structure_loader is not None
             else []
         )
+        structurally_matched = _matched_structure_route_tokens(
+            structured_route, canonical_route_tokens
+        )
+        unresolved_route_tokens = tuple(
+            token for token in canonical_route_tokens if token not in structurally_matched
+        )
+        exact_route_fallback = (
+            await exact_loader(unresolved_route_tokens, ())
+            if unresolved_route_tokens and exact_loader is not None and not structured_route
+            else []
+        )
+        route_anchored = deduplicate_candidate_bodies([*structured_route, *exact_route_fallback])
+        # Exact body lookup also finds the routing index because the index lists
+        # every target identifier. It is a control document, not evidence. If it
+        # enters this pool, literal overlap can make one language select the index
+        # while another selects the linked procedure.
+        route_anchored = [
+            document
+            for document in route_anchored
+            if not _is_canonical_route_control_document(document)
+        ]
+        _mark_canonical_route_candidates(resolved_question, route_anchored)
         for document in route_anchored:
-            # Canonical routes reserve the target sections for semantic
-            # ranking; they do not assert that every linked section answers
-            # this particular wording. Otherwise the first two route IDs win
-            # the final anchor slots by list order and displace the relevant
-            # route before the cross-encoder can choose it.
-            document.metadata.pop("identifier_anchor", None)
-            document.metadata.pop("identifier_anchor_score", None)
+            # These rows were loaded by the exact structure identifiers from the
+            # matched canonical-index entry, not by semantic similarity alone.
             document.metadata["canonical_route_candidate"] = True
-        route_query = retrieval_terminology_variant(resolved_question) or resolved_question
-        route_terms = set(re.findall(r"[a-z0-9à-ÿ]{4,}", route_query.casefold())) - {
-            "como",
-            "cómo",
-            "what",
-            "where",
-            "which",
-            "with",
-            "from",
-            "para",
-        }
-        for document in route_anchored:
-            searchable = " ".join(
-                (
-                    document.page_content,
-                    " ".join(str(value) for value in document.metadata.get("structure_path") or ()),
-                )
-            )
-            route_match_score = _exact_term_ratio(route_terms, searchable)
-            if route_match_score > 0:
+            if document.metadata.get("canonical_route_anchor") or not structured_route:
                 document.metadata["canonical_route_match"] = True
-                document.metadata["canonical_route_match_score"] = route_match_score
+                document.metadata["canonical_route_match_score"] = max(
+                    2.0,
+                    float(document.metadata.get("canonical_route_match_score") or 0),
+                )
         unique: dict[str, Document] = {}
         if state.get("preserve_candidates"):
             for document in state.get("candidates", []):
@@ -967,6 +1168,19 @@ class RetrievalNodesMixin:
             project_id=self._request.project_id,
             access_policy_ids=self._request.access_policy_ids,
         )
+        if canonical_route_tokens:
+            authorized = [
+                document
+                for document in authorized
+                if not _is_canonical_route_control_document(document)
+            ]
+            _mark_structure_route_candidates(authorized, canonical_route_tokens)
+            if structured_route:
+                authorized = [
+                    document
+                    for document in authorized
+                    if document.metadata.get("canonical_route_anchor")
+                ]
         authorized = [
             document
             for document in authorized
@@ -1002,6 +1216,19 @@ class RetrievalNodesMixin:
             project_id=self._request.project_id,
             access_policy_ids=self._request.access_policy_ids,
         )
+        if canonical_route_tokens:
+            lexical_candidates = [
+                document
+                for document in lexical_candidates
+                if not _is_canonical_route_control_document(document)
+            ]
+            _mark_structure_route_candidates(lexical_candidates, canonical_route_tokens)
+            if structured_route:
+                lexical_candidates = [
+                    document
+                    for document in lexical_candidates
+                    if document.metadata.get("canonical_route_anchor")
+                ]
         lexical_candidates = [
             document
             for document in lexical_candidates
@@ -1010,13 +1237,24 @@ class RetrievalNodesMixin:
         ]
         dense_ranked = sorted(
             authorized,
-            key=lambda value: float(value.metadata.get("retrieval_rrf_score", 0)),
-            reverse=True,
+            key=lambda value: (
+                -float(value.metadata.get("retrieval_rrf_score", 0)),
+                _candidate_id(value),
+            ),
         )
         fused_candidates = self._candidate_fusion.fuse(
             lexical_candidates,
             dense_ranked,
             limit=max(self._settings.max_candidates, self._settings.retrieval_top_k),
+        )
+        source_balanced_loader = getattr(self._retriever, "ainvoke_source_balanced", None)
+        source_balanced = (
+            await source_balanced_loader(
+                resolved_question,
+                balanced_source_ids(fused_candidates),
+            )
+            if source_balanced_loader is not None
+            else []
         )
         # RRF can omit an exact original-language match when generic records
         # recur across every translated/decomposed query. Reserve a small,
@@ -1028,9 +1266,17 @@ class RetrievalNodesMixin:
                 max(self._settings.max_candidates, self._settings.retrieval_top_k),
             ),
         )
-        fused_candidates = deduplicate_candidate_bodies(
-            [*route_anchored, *primary_authorized, *fused_candidates]
-        )[: max(self._settings.max_candidates, self._settings.retrieval_top_k)]
+        fused_candidates = progressive_rerank_candidates(
+            deduplicate_candidate_bodies(
+                [
+                    *route_anchored,
+                    *primary_authorized,
+                    *source_balanced,
+                    *fused_candidates,
+                ]
+            ),
+            max(self._settings.max_candidates, self._settings.retrieval_top_k),
+        )
         registry = SourcePolicyRegistry.from_categories(
             _document_source_type(document) for document in fused_candidates
         )
@@ -1065,8 +1311,10 @@ class RetrievalNodesMixin:
         ranked_responsive = deduplicate_candidate_bodies(
             sorted(
                 responsive,
-                key=lambda value: float(value.metadata.get("retrieval_fused_score", 0)),
-                reverse=True,
+                key=lambda value: (
+                    -float(value.metadata.get("retrieval_fused_score", 0)),
+                    _candidate_id(value),
+                ),
             )
         )
         candidates = _preserve_primary_query_candidates(
@@ -1158,7 +1406,31 @@ class RetrievalNodesMixin:
         record_candidate_scores(candidates)
         return {
             "queries": tuple(queries),
-            "source_types": source_types,
+            # An exact corpus-authored question route is more specific than a
+            # lexical intent guess (notably Spanish "código", which can mean a
+            # barcode or payment code rather than source code). Follow the
+            # declared route across authorized source types.
+            "source_types": () if canonical_route_tokens else source_types,
+            "query_intent": "DIRECT"
+            if canonical_route_tokens
+            else state.get("query_intent", "DIRECT"),
+            "resolved_request": cast(
+                ResolvedRequest,
+                resolve_request(
+                    state.get("resolved_question", self._request.question),
+                    intent="DIRECT",
+                    allowed_source_categories=tuple(
+                        dict.fromkeys(
+                            _document_source_type(document)
+                            for document in route_anchored
+                            if _document_source_type(document)
+                        )
+                    ),
+                    known_entities=self._vocabulary.entities,
+                )
+                if canonical_route_tokens
+                else state.get("resolved_request"),
+            ),
             "rerank_queries": planned_rerank_queries,
             "translation_slot": None,
             "candidates": candidates,
@@ -1415,7 +1687,7 @@ class RetrievalNodesMixin:
             "CODE_INVENTORY",
             "PROJECT_OVERVIEW",
         }:
-            candidates = progressive_rerank_candidates(
+            candidates = source_balanced_rerank_window(
                 candidates,
                 max(result_top_n, self._settings.cross_encoder_candidate_limit),
             )
@@ -1565,6 +1837,25 @@ class RetrievalNodesMixin:
         # the declaration. documentation_primary still governs the ordering
         # decisions below; it no longer governs anchor eligibility.
         documents = _preserve_identifier_anchors(documents, all_candidates, top_n=result_top_n)
+        canonical_matches = [
+            document
+            for document in all_candidates
+            if document.metadata.get("canonical_route_match")
+        ]
+        if canonical_matches:
+            # The canonical index has already authorized this route, and the
+            # selected section shares exact query terms. Preserve that evidence
+            # even when a terse incident phrase receives a low cross-encoder
+            # score; grounding and citation gates still validate the answer.
+            documents = _merge_ranked_documents(
+                documents,
+                sorted(
+                    canonical_matches,
+                    key=lambda item: float(item.metadata.get("canonical_route_match_score") or 0),
+                    reverse=True,
+                ),
+                top_n=result_top_n,
+            )
         if (
             self._settings.neighbor_expansion_enabled
             and documents
@@ -1662,6 +1953,23 @@ class RetrievalNodesMixin:
                 ]
         if state.get("reconstruct_parent_records"):
             documents = _single_record_evidence_order(documents)
+        if canonical_matches:
+            query_terms = _exact_terms(state.get("resolved_question", self._request.question))
+            preferred_language = state.get("language", "").casefold()
+            route_priority = sorted(
+                canonical_matches,
+                key=lambda document: (
+                    str(document.metadata.get("language") or "").casefold() == preferred_language,
+                    _exact_term_ratio(query_terms, document.page_content),
+                    float(document.metadata.get("rerank_score") or 0),
+                    float(document.metadata.get("canonical_route_match_score") or 0),
+                ),
+                reverse=True,
+            )
+            # Exact corpus routes are control-plane decisions. Keep the most
+            # topical same-language target in the final evidence window even if
+            # generic master pages score highly for the translated query.
+            documents = _merge_ranked_documents(route_priority[:2], documents, top_n=result_top_n)
         # Enumeration answers often live across consecutive chunks of one
         # registry. Preserve their relevance depth; for other questions, fill
         # the window by source depth so one source does not dominate by volume.
@@ -1936,7 +2244,7 @@ class RetrievalNodesMixin:
     async def _rerank_cross_source(
         self, query: str, candidates: list[Document], language: str = ""
     ) -> list[Document]:
-        """Rank documentation and code independently before a bounded merge."""
+        """Rank source families and preserve evidence for each named subject."""
 
         groups: list[list[Document]] = []
         for source_type in ("PAGE", "CODE"):
@@ -1967,7 +2275,43 @@ class RetrievalNodesMixin:
             for group in groups:
                 if rank < len(group):
                     merged.append(group[rank])
-        return merged
+        subjects = tuple(
+            entity
+            for entity in self._vocabulary.entities
+            if re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(entity)}(?![A-Za-z0-9_])",
+                query,
+                flags=re.IGNORECASE,
+            )
+        )
+        if len(subjects) < 2:
+            return merged
+
+        # A cross-source comparison also has a cross-*subject* obligation. The
+        # old PAGE/CODE balancing could select both families while every result
+        # described only one of the two applications. Reserve one independently
+        # ranked, explicitly classified source for each named subject before the
+        # normal family merge; downstream grounding still verifies every claim.
+        subject_anchors: list[Document] = []
+        for subject in subjects:
+            source_ids = _entity_overview_source_ids(subject, candidates)
+            scoped = [
+                document for document in candidates if _source_identity(document) in source_ids
+            ]
+            if not scoped:
+                continue
+            ranked = await self._reranker.rerank(
+                f"{subject} application responsibilities capabilities {query}",
+                scoped,
+                top_n=1,
+                query_language=language,
+            )
+            subject_anchors.extend(ranked)
+        return _merge_ranked_documents(
+            subject_anchors,
+            merged,
+            top_n=self._settings.mixed_source_top_n,
+        )
 
     async def _rerank_code_assisted(
         self,

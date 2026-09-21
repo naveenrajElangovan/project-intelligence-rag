@@ -36,9 +36,7 @@ ROW_EVENT_ID = re.compile(r"\|\s*(?P<id>\d{3})\s*\|")
 ENTITY_HEADING_B = re.compile(
     r"^#{2,4}\s+[\d.]+\s+`(?P<key>[A-Z][A-Z0-9_]*)`\s+\(id\s+(?P<id>\d+)\)"
 )
-CANONICAL_QUESTION_HEADING = re.compile(
-    r"^##\s+\[(?P<qid>QUESTION-[A-Z0-9-]+)\]\s+.+$"
-)
+CANONICAL_QUESTION_HEADING = re.compile(r"^##\s+\[(?P<qid>QUESTION-[A-Z0-9-]+)\]\s+.+$")
 CANONICAL_QUESTION = re.compile(r"^-\s+[\u201c\"](?P<question>.+?)[\u201d\"]\s*$")
 CANONICAL_ROUTE = re.compile(
     r"^(?:(?:Priority\s+)?Routes?|Rutas?(?:\s+prioritarias?)?):\s*(?P<routes>.*)$",
@@ -50,6 +48,7 @@ CANONICAL_SECTION_ID = re.compile(r"\[([A-Z][A-Z0-9-]+)\]")
 def entity_heading(line: str):
     return ENTITY_HEADING.match(line) or ENTITY_HEADING_B.match(line)
 
+
 TABLE_ROW = re.compile(r"^\s*\|")
 STEP_LINE = re.compile(r"^\s*\d+\.\s+\S")
 NAVIGATIONAL = re.compile(
@@ -60,8 +59,8 @@ NAVIGATIONAL = re.compile(
 
 # Structural thresholds. Chosen from the measured corpus and stated here so a
 # misclassification is a tunable number rather than a mystery.
-TABLE_DOMINANT_RATIO = 0.35   # table rows / total non-blank lines
-ENTITY_SECTION_MINIMUM = 5    # entity-shaped H3 headings before it is a contract
+TABLE_DOMINANT_RATIO = 0.35  # table rows / total non-blank lines
+ENTITY_SECTION_MINIMUM = 5  # entity-shaped H3 headings before it is a contract
 STEP_DOMINANT_RATIO = 0.08
 
 
@@ -120,7 +119,7 @@ def case(cid, suite, question, contains, note, role, extras=None):
     row = {
         "id": cid,
         "suite": suite,
-        "role": role,                       # answer_evidence | navigation
+        "role": role,  # answer_evidence | navigation
         "project_id": _PROJECT_ID,
         "question": question,
         "query_language": "en",
@@ -159,18 +158,25 @@ def build(corpus: Path, project_id: str) -> tuple[list[dict], list[tuple[str, st
                     continue
                 seen_entities.add(key)
                 for form in constant_forms(key):
-                    rows.append(case(
-                        f"entity-{form}".lower(), "identifier_lookup",
-                        f"What does the {form} event require?",
-                        [f"`{key}`", key],
-                        f"{path.name}:{index + 1} entity heading",
-                        role,
-                        {"expected_facts": [entity.group("id")] + (
-                            [entity.group("version")]
-                            if "version" in entity.groupdict() and entity.group("version")
-                            else []),
-                         "doc_category": category},
-                    ))
+                    rows.append(
+                        case(
+                            f"entity-{form}".lower(),
+                            "identifier_lookup",
+                            f"What does the {form} event require?",
+                            [f"`{key}`", key],
+                            f"{path.name}:{index + 1} entity heading",
+                            role,
+                            {
+                                "expected_facts": [entity.group("id")]
+                                + (
+                                    [entity.group("version")]
+                                    if "version" in entity.groupdict() and entity.group("version")
+                                    else []
+                                ),
+                                "doc_category": category,
+                            },
+                        )
+                    )
                 continue
 
             section = SECTION_HEADING.match(line)
@@ -179,38 +185,51 @@ def build(corpus: Path, project_id: str) -> tuple[list[dict], list[tuple[str, st
                 if sid in seen_sections:
                     continue
                 seen_sections.add(sid)
-                rows.append(case(
-                    f"section-{sid}".lower(), "section_lookup",
-                    f"What does section {sid} cover?", [f"[{sid}]"],
-                    f"{path.name}:{index + 1} section heading", role,
-                    {"doc_category": category},
-                ))
-                rows.append(case(
-                    f"section-{sid}-title".lower(), "section_lookup",
-                    title if title.endswith("?") else f"Tell me about {title}.",
-                    [f"[{sid}]"],
-                    f"{path.name}:{index + 1} section title", role,
-                    {"doc_category": category},
-                ))
+                rows.append(
+                    case(
+                        f"section-{sid}".lower(),
+                        "section_lookup",
+                        f"What does section {sid} cover?",
+                        [f"[{sid}]"],
+                        f"{path.name}:{index + 1} section heading",
+                        role,
+                        {"doc_category": category},
+                    )
+                )
+                rows.append(
+                    case(
+                        f"section-{sid}-title".lower(),
+                        "section_lookup",
+                        title if title.endswith("?") else f"Tell me about {title}.",
+                        [f"[{sid}]"],
+                        f"{path.name}:{index + 1} section title",
+                        role,
+                        {"doc_category": category},
+                    )
+                )
                 continue
 
             row = REGISTRY_ROW.match(line)
             if row:
                 key = row.group("key")
-                event_id = ROW_EVENT_ID.search(line[row.end() - 1:])
+                event_id = ROW_EVENT_ID.search(line[row.end() - 1 :])
                 if key in seen_registry or key in seen_entities or not event_id:
                     continue
                 seen_registry.add(key)
                 anchor = next((p for p in reversed(paths.get(index, [])) if p), None)
                 if not anchor:
                     continue
-                rows.append(case(
-                    f"registry-{key}".lower(), "registry_keys",
-                    f"Which event id and version does {key} have?",
-                    [key, key.removesuffix("_EVENT")],
-                    f"{path.name}:{index + 1} registry row", role,
-                    {"expected_facts": [event_id.group("id")], "doc_category": category},
-                ))
+                rows.append(
+                    case(
+                        f"registry-{key}".lower(),
+                        "registry_keys",
+                        f"Which event id and version does {key} have?",
+                        [key, key.removesuffix("_EVENT")],
+                        f"{path.name}:{index + 1} registry row",
+                        role,
+                        {"expected_facts": [event_id.group("id")], "doc_category": category},
+                    )
+                )
     return rows, classification
 
 
@@ -321,9 +340,7 @@ def parse_store_canonical_index(
 
 
 def build_store_canonical_suite(english: Path, spanish: Path) -> list[dict]:
-    rows = parse_store_canonical_index(english, "en") + parse_store_canonical_index(
-        spanish, "es"
-    )
+    rows = parse_store_canonical_index(english, "en") + parse_store_canonical_index(spanish, "es")
     counts = {
         language: sum(row["query_language"] == language for row in rows)
         for language in ("en", "es")
@@ -416,7 +433,9 @@ def build_registered_suites(
         )
     ]
     if not selected:
-        raise ValueError(f"No registered suites for project={project_id!r}, suite={suite_ids}, department={department!r}")
+        raise ValueError(
+            f"No registered suites for project={project_id!r}, suite={suite_ids}, department={department!r}"
+        )
     cases: list[dict[str, Any]] = []
     for suite in selected:
         source = suite["source"]
@@ -451,7 +470,10 @@ def build_registered_suites(
                             continue
                         row = {**row, "suite": suite["id"], "project_id": project_id}
                         row.setdefault("department", configured_department)
-                        row.setdefault("gold_granularity", (suite.get("gold") or {}).get("granularity", "chunk"))
+                        row.setdefault(
+                            "gold_granularity",
+                            (suite.get("gold") or {}).get("granularity", "chunk"),
+                        )
                         row.setdefault("suite_gates", suite.get("gates") or {})
                         cases.append(row)
     deduplicated = {str(row["id"]): row for row in cases}
@@ -485,15 +507,15 @@ def main() -> None:
             registry_path=arguments.registry,
         )
         output = arguments.out or Path(__file__).with_name(f"{arguments.project_id}.gold.jsonl")
-        output.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+        output.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8"
+        )
         print(f"wrote {len(rows)} registered cases to {output}")
         return
     if arguments.store_canonical_root:
         store_rows = build_store_canonical_suite(
-            arguments.store_canonical_root
-            / "en/topics/10_CANONICAL_QUESTION_INDEX.md",
-            arguments.store_canonical_root
-            / "es/topics/10_INDICE_DE_PREGUNTAS_CANONICAS.md",
+            arguments.store_canonical_root / "en/topics/10_CANONICAL_QUESTION_INDEX.md",
+            arguments.store_canonical_root / "es/topics/10_INDICE_DE_PREGUNTAS_CANONICAS.md",
         )
         arguments.store_out.write_text(
             "\n".join(json.dumps(row, ensure_ascii=False) for row in store_rows) + "\n",
@@ -503,7 +525,9 @@ def main() -> None:
         if not arguments.corpus:
             return
     if arguments.corpus is None or not arguments.project_id:
-        parser.error("--corpus and --project-id are required unless only --store-canonical-root is used")
+        parser.error(
+            "--corpus and --project-id are required unless only --store-canonical-root is used"
+        )
     rows, classification = build(arguments.corpus, arguments.project_id)
 
     print("INFERRED DOCUMENT CATEGORY")

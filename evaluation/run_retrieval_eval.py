@@ -18,14 +18,16 @@ from langchain_core.documents import Document
 from app.chroma_collections import project_collection_name, verify_project_collection
 from app.config import Settings
 from app.embedding import build_embedder
+from app.grounding_contract import resolve_request
 from app.models import RagRequest, RetrievalProfile
 from app.reranking import (
     _exact_code_anchor_match,
     build_reranker,
+    document_scoring_evidence,
     normalized_relevance_score,
     predict_local_scores,
     progressive_rerank_candidates,
-    scoring_evidence,
+    source_balanced_rerank_window,
 )
 from app.retrieval import ChromaAccessRetriever
 from app.workflow import AuthorizedRagWorkflow
@@ -34,10 +36,15 @@ from app.workflow_nodes.retrieval import (
     _canonical_route_directive,
     _exact_identifier_tokens,
     _forced_anchor_tokens,
+    _load_canonical_route_directive,
+    _mark_canonical_route_candidates,
     _prefilter_candidates,
+    _preserve_identifier_anchors,
     _retain_explicit_identifier_anchors,
     _source_volume_discounted_score,
 )
+from app.workflow_support.query_analysis import _document_source_type
+from app.workflow_support.conversation import _deterministic_conversation_rewrite
 from app.workflow_support.query_analysis import (
     _exact_term_ratio,
     _exact_terms,
@@ -46,9 +53,11 @@ from app.workflow_support.query_analysis import (
 from app.retrieval_pipeline import (
     BM25Retriever,
     ReciprocalRankFusion,
+    balanced_source_ids,
     deduplicate_candidate_bodies,
     validate_authorized_candidates,
 )
+
 try:
     from evaluation.build_gold_suites import build_registered_suites
     from evaluation.phoenix_client import publish_scores_to_phoenix
@@ -87,12 +96,13 @@ _MANIFEST_FIELDS = (
     "source_id",
     "doc_category",
     "entity_key",
+    "embedding_text",
 )
 # Bumped with the field list. A cached manifest captured under the old schema
 # has no entity_key, and reusing it would not fail -- it would silently resolve
 # fewer cases, which is exactly the class of error this preflight exists to
 # stop.
-_MANIFEST_VERSION = 5
+_MANIFEST_VERSION = 6
 _MINIMUM_GOLD_RESOLUTION_RATE = 0.95
 _PARAPHRASE_GROUPS_PATH = Path(__file__).with_name("paraphrase_groups.json")
 _DEFAULT_SUITES_PATH = Path(__file__).with_name("gold_suites.jsonl")
@@ -114,9 +124,7 @@ _RERANK_SWEEP = tuple(
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -154,19 +162,13 @@ def _apply_reviewed_references(
             continue
         if reference.get("query_language") != case.get("query_language"):
             raise ValueError(f"Reference language does not match case {case.get('id')}")
-        if reference.get("target_evidence_language") != case.get(
-            "target_evidence_language"
-        ):
-            raise ValueError(
-                f"Reference evidence language does not match case {case.get('id')}"
-            )
+        if reference.get("target_evidence_language") != case.get("target_evidence_language"):
+            raise ValueError(f"Reference evidence language does not match case {case.get('id')}")
         expected_question_hash = hashlib.sha256(
             str(case.get("question") or "").encode("utf-8")
         ).hexdigest()
         if reference.get("question_sha256") != expected_question_hash:
-            raise ValueError(
-                f"Reference question_sha256 does not match case {case.get('id')}"
-            )
+            raise ValueError(f"Reference question_sha256 does not match case {case.get('id')}")
         merged.append(
             {
                 **case,
@@ -189,18 +191,12 @@ def _reviewed_bilingual_ragas_cases(
         and case.get("retired") is not True
     ]
     missing = [
-        str(case.get("id"))
-        for case in expected
-        if case.get("reference_status") != "reviewed"
+        str(case.get("id")) for case in expected if case.get("reference_status") != "reviewed"
     ]
     if missing:
-        raise ValueError(
-            "Reviewed bilingual references are incomplete: "
-            + ", ".join(missing[:10])
-        )
+        raise ValueError("Reviewed bilingual references are incomplete: " + ", ".join(missing[:10]))
     directions = {
-        (case.get("query_language"), case.get("target_evidence_language"))
-        for case in expected
+        (case.get("query_language"), case.get("target_evidence_language")) for case in expected
     }
     required = {("en", "en"), ("es", "es"), ("en", "es"), ("es", "en")}
     if not required.issubset(directions):
@@ -234,8 +230,7 @@ def _load_evaluation_cases(path: Path) -> list[dict[str, Any]]:
     )
     if missing_reason:
         raise ValueError(
-            "Retired evaluation cases must record retired_reason: "
-            + ", ".join(missing_reason[:10])
+            "Retired evaluation cases must record retired_reason: " + ", ".join(missing_reason[:10])
         )
     identifiers = [str(case.get("id")) for case in cases]
     duplicates = sorted(
@@ -308,14 +303,9 @@ def _namespace_manifest(
     return chunks
 
 
-def _predicate_matches(
-    predicate: dict[str, Any], metadata: dict[str, str]
-) -> bool:
+def _predicate_matches(predicate: dict[str, Any], metadata: dict[str, str]) -> bool:
     if "all_of" in predicate:
-        return all(
-            _predicate_matches(item, metadata)
-            for item in predicate.get("all_of", [])
-        )
+        return all(_predicate_matches(item, metadata) for item in predicate.get("all_of", []))
     field = str(predicate.get("field") or "")
     actual = str(metadata.get(field) or "").casefold()
     if field not in _MANIFEST_FIELDS:
@@ -349,9 +339,7 @@ def _gold_section_chunk_ids(
     ]
 
 
-def _gold_ids(
-    case: dict[str, Any], manifest: dict[str, dict[str, str]]
-) -> list[str]:
+def _gold_ids(case: dict[str, Any], manifest: dict[str, dict[str, str]]) -> list[str]:
     predicates = case.get("gold_match", {}).get("any_of", [])
 
     matches: list[str] = []
@@ -433,14 +421,15 @@ def _validate_gold_resolution(
 ) -> dict[str, Any]:
     withdrawn = retired_cases(cases)
     answerable = [
-        case
-        for case in cases
-        if case.get("answerable") is True and case.get("retired") is not True
+        case for case in cases if case.get("answerable") is True and case.get("retired") is not True
     ]
     unresolved_cases = [case for case in answerable if not _gold_ids(case, manifest)]
     unresolved = [str(case.get("id")) for case in unresolved_cases]
     resolved = len(answerable) - len(unresolved)
-    rate = resolved / len(answerable) if answerable else 0.0
+    # Generation-only selections (for example one paraphrase group) have no
+    # retrieval-gold population. Their preflight is vacuously complete; a zero
+    # here incorrectly made the diagnostic CLI unusable.
+    rate = resolved / len(answerable) if answerable else 1.0
     diagnostics = _unresolved_diagnostics(unresolved_cases, manifest)
     report = {
         "answerable_cases": len(answerable),
@@ -453,8 +442,7 @@ def _validate_gold_resolution(
         # failure this preflight was added to catch.
         "retired_cases": len(withdrawn),
         "retired_case_reasons": {
-            str(case.get("id")): str(case.get("retired_reason") or "")
-            for case in withdrawn
+            str(case.get("id")): str(case.get("retired_reason") or "") for case in withdrawn
         },
     }
     if rate < minimum_rate:
@@ -516,15 +504,51 @@ class _RecordedCandidateWorkflow(AuthorizedRagWorkflow):
                 "Recorded evaluation candidates include documents outside the "
                 "generation request's access policies"
             )
-        _tokens, route_refusal_reason = _canonical_route_directive(
-            state.get("resolved_question", self._request.question), authorized
-        )
+        route_question = state.get("resolved_question", self._request.question)
+        if hasattr(self, "_retriever"):
+            route_tokens, route_refusal_reason = await _load_canonical_route_directive(
+                self._retriever,
+                route_question,
+                authorized,
+                tuple(state.get("source_types", ())),
+            )
+        else:
+            route_tokens, route_refusal_reason = _canonical_route_directive(
+                route_question, authorized
+            )
+        if route_tokens:
+            # Candidate rows contain the already-selected route sections but
+            # intentionally persist only stable Chroma metadata. Reapply the
+            # transient match flags from the authorized directive so generation
+            # exercises the same canonical fallback as the production workflow.
+            for document in authorized:
+                path = str(document.metadata.get("structure_path") or "")
+                if any(token.casefold() in path.casefold() for token in route_tokens):
+                    document.metadata["canonical_route_candidate"] = True
+                    document.metadata["canonical_route_match"] = True
+                    document.metadata["canonical_route_match_score"] = 2.0
         queries = tuple(state.get("queries", ()))
         return {
             "queries": queries,
-            "rerank_queries": tuple(
-                dict.fromkeys((*state.get("rerank_queries", ()), *queries))
+            "source_types": () if route_tokens else tuple(state.get("source_types", ())),
+            "query_intent": "DIRECT" if route_tokens else state.get("query_intent", "DIRECT"),
+            "resolved_request": (
+                resolve_request(
+                    route_question,
+                    intent="DIRECT",
+                    allowed_source_categories=tuple(
+                        dict.fromkeys(
+                            _document_source_type(document)
+                            for document in authorized
+                            if _document_source_type(document)
+                        )
+                    ),
+                    known_entities=getattr(getattr(self, "_vocabulary", None), "entities", ()),
+                )
+                if route_tokens
+                else state.get("resolved_request")
             ),
+            "rerank_queries": tuple(dict.fromkeys((*state.get("rerank_queries", ()), *queries))),
             "translation_slot": None,
             "candidates": authorized,
             "preserve_candidates": False,
@@ -549,6 +573,20 @@ async def _run_case(
     lexical_enabled: bool = True,
 ) -> dict[str, Any]:
     question = str(case["question"])
+    history = [
+        (str(item.get("role") or ""), str(item.get("content") or ""))
+        for item in case.get("conversation_history", [])
+        if isinstance(item, dict)
+    ]
+    if history:
+        question = (
+            _deterministic_conversation_rewrite(
+                question,
+                history,
+                str(case.get("query_language") or "und"),
+            )
+            or question
+        )
     fused = await _retrieve_fused(
         question,
         retriever=retriever,
@@ -561,13 +599,19 @@ async def _run_case(
         if str(case.get("suite") or "") == "registry_keys"
         else settings.cross_encoder_candidate_limit
     )
-    candidates = progressive_rerank_candidates(fused, candidate_limit)
+    candidates = (
+        progressive_rerank_candidates(fused, candidate_limit)
+        if str(case.get("suite") or "") == "registry_keys"
+        else source_balanced_rerank_window(fused, candidate_limit)
+    )
     reranked = await reranker.rerank(
         question,
         candidates,
         score_threshold=settings.rerank_score_threshold,
         top_n=settings.rerank_top_n,
+        query_language=str(case.get("query_language") or ""),
     )
+    reranked = _preserve_identifier_anchors(reranked, candidates, top_n=settings.rerank_top_n)
     return _result_row(case, manifest, fused, reranked, lexical_enabled)
 
 
@@ -584,14 +628,36 @@ async def _retrieve_fused(
     rare_terms = await retriever.ainvoke_rare_terms(question) if lexical_enabled else ()
     explicit_identifiers = _exact_identifier_tokens(question)
     exact_terms = tuple(dict.fromkeys([*explicit_identifiers, *rare_terms]))
-    anchors = (
-        await retriever.ainvoke_exact_identifiers(exact_terms)
-        if exact_terms
+    anchors = await retriever.ainvoke_exact_identifiers(exact_terms) if exact_terms else []
+    anchors = _retain_explicit_identifier_anchors(
+        anchors,
+        tuple(dict.fromkeys([*explicit_identifiers, *_forced_anchor_tokens(question)])),
+    )
+    route_tokens, _route_refusal_reason = await _load_canonical_route_directive(
+        retriever,
+        question,
+        [*lexical, *dense],
+        (),
+    )
+    route_groups = (
+        await asyncio.gather(
+            retriever.ainvoke_structure_identifiers(route_tokens),
+            retriever.ainvoke_exact_identifiers(route_tokens),
+        )
+        if route_tokens
         else []
     )
-    anchors = _retain_explicit_identifier_anchors(
-        anchors, _forced_anchor_tokens(question)
+    route_anchored = deduplicate_candidate_bodies(
+        [document for group in route_groups for document in group]
     )
+    _mark_canonical_route_candidates(question, route_anchored)
+    for document in route_anchored:
+        document.metadata["canonical_route_candidate"] = True
+        document.metadata["canonical_route_match"] = True
+        document.metadata["canonical_route_match_score"] = max(
+            2.0,
+            float(document.metadata.get("canonical_route_match_score") or 0),
+        )
     dense_by_id = {
         str(document.metadata.get("chunk_id") or id(document)): document
         for document in [*anchors, *dense]
@@ -602,25 +668,33 @@ async def _retrieve_fused(
         dense,
         limit=max(settings.max_candidates, settings.retrieval_top_k),
     )
-    query_terms = _exact_terms(question)
-    source_candidate_counts = Counter(
-        _source_identity(document) for document in fused
+    source_balanced = await retriever.ainvoke_source_balanced(
+        question,
+        balanced_source_ids(fused),
     )
+    fused = progressive_rerank_candidates(
+        deduplicate_candidate_bodies([*route_anchored, *source_balanced, *fused]),
+        max(settings.max_candidates, settings.retrieval_top_k),
+    )
+    query_terms = _exact_terms(question)
+    source_candidate_counts = Counter(_source_identity(document) for document in fused)
     for document in fused:
         ratio = _exact_term_ratio(query_terms, document.page_content)
         document.metadata["exact_term_ratio"] = ratio
-        boosted_score = float(
-            document.metadata.get("fusion_score") or 0.0
-        ) * (1 + settings.exact_term_boost * ratio)
+        boosted_score = float(document.metadata.get("fusion_score") or 0.0) * (
+            1 + settings.exact_term_boost * ratio
+        )
         source_identity = _source_identity(document)
-        document.metadata["source_candidate_count"] = source_candidate_counts[
-            source_identity
-        ]
+        document.metadata["source_candidate_count"] = source_candidate_counts[source_identity]
         document.metadata["retrieval_fused_score"] = _source_volume_discounted_score(
             boosted_score,
             source_candidate_count=source_candidate_counts[source_identity],
             strength=settings.source_volume_discount_strength,
         )
+        if document.metadata.get("canonical_route_candidate"):
+            document.metadata["retrieval_fused_score"] = max(
+                1.0, float(document.metadata["retrieval_fused_score"])
+            )
     responsive, _prefilter_reasons = _prefilter_candidates(
         fused,
         minimum_dense_score=settings.prefilter_min_dense_score,
@@ -629,9 +703,7 @@ async def _retrieve_fused(
     fused = deduplicate_candidate_bodies(
         sorted(
             responsive,
-            key=lambda value: float(
-                value.metadata.get("retrieval_fused_score") or 0.0
-            ),
+            key=lambda value: float(value.metadata.get("retrieval_fused_score") or 0.0),
             reverse=True,
         )
     )[: settings.max_candidates]
@@ -667,13 +739,11 @@ def _result_row(
         ],
         "cited_source_ids": [],
         "exposed_project_ids": [
-            str(document.metadata.get("project_id") or "")
-            for document in [*fused, *reranked]
+            str(document.metadata.get("project_id") or "") for document in [*fused, *reranked]
         ],
         "department": case.get("department") or "",
         "exposed_access_policy_ids": [
-            str(document.metadata.get("access_policy_id") or "")
-            for document in [*fused, *reranked]
+            str(document.metadata.get("access_policy_id") or "") for document in [*fused, *reranked]
         ],
         "answerable": bool(case.get("answerable")),
         "answered": answered,
@@ -683,9 +753,7 @@ def _result_row(
 
 def _document_identity(document: Any) -> str:
     return str(
-        document.metadata.get("chunk_id")
-        or document.metadata.get("source_id")
-        or id(document)
+        document.metadata.get("chunk_id") or document.metadata.get("source_id") or id(document)
     )
 
 
@@ -718,7 +786,9 @@ def _select_scored(
         eligible.append((score_value, document, source_id))
     selected: list[Any] = []
     source_counts: dict[str, int] = {}
-    for score_value, document, source_id in sorted(eligible, reverse=True, key=lambda item: item[0]):
+    for score_value, document, source_id in sorted(
+        eligible, reverse=True, key=lambda item: item[0]
+    ):
         if source_counts.get(source_id, 0) >= max_chunks_per_source:
             continue
         source_counts[source_id] = source_counts.get(source_id, 0) + 1
@@ -740,9 +810,7 @@ async def _run_reranker_sweep(
     output: Path,
     recorded_candidates: dict[str, list[Any]] | None = None,
 ) -> dict[str, dict[str, float | int]]:
-    rows_by_name: dict[str, list[dict[str, Any]]] = {
-        config[0]: [] for config in _RERANK_SWEEP
-    }
+    rows_by_name: dict[str, list[dict[str, Any]]] = {config[0]: [] for config in _RERANK_SWEEP}
     max_limit = max(max(config[1], config[2]) for config in _RERANK_SWEEP)
     prepared: list[tuple[dict[str, Any], str, list[Any], list[Any]]] = []
     score_cache_path = output.with_name(f"{output.stem}.scores.json")
@@ -778,8 +846,8 @@ async def _run_reranker_sweep(
             missing_pairs.append(
                 (
                     question,
-                    scoring_evidence(
-                        document.page_content,
+                    document_scoring_evidence(
+                        document,
                         linearize_tables_enabled=settings.linearize_table_evidence,
                     ),
                 )
@@ -897,15 +965,11 @@ def _rehydrate_recorded_candidates(
         ):
             values = dict(metadata or {})
             canonical_id = str(
-                values.get("canonical_chunk_id")
-                or values.get("chunk_id")
-                or chunk_id
+                values.get("canonical_chunk_id") or values.get("chunk_id") or chunk_id
             )
             if canonical_id in wanted:
                 values["chunk_id"] = canonical_id
-                by_id[canonical_id] = Document(
-                    page_content=str(content or ""), metadata=values
-                )
+                by_id[canonical_id] = Document(page_content=str(content or ""), metadata=values)
         offset += len(identifiers)
         if len(identifiers) < 500:
             break
@@ -975,19 +1039,14 @@ async def _generation_candidate_rows(
         )
         output.write_text(
             "".join(
-                json.dumps(by_id[identifier], sort_keys=True) + "\n"
-                for identifier in sorted(by_id)
+                json.dumps(by_id[identifier], sort_keys=True) + "\n" for identifier in sorted(by_id)
             ),
             encoding="utf-8",
         )
-        print(
-            f"generation_retrieval={position}/{len(cases)} id={case_id}", flush=True
-        )
+        print(f"generation_retrieval={position}/{len(cases)} id={case_id}", flush=True)
     missing = selected_ids - by_id.keys()
     if missing:
-        raise RuntimeError(
-            f"Generation retrieval pools are incomplete: {sorted(missing)[:5]}"
-        )
+        raise RuntimeError(f"Generation retrieval pools are incomplete: {sorted(missing)[:5]}")
     return [by_id[str(case.get("id"))] for case in cases]
 
 
@@ -1000,17 +1059,13 @@ async def _main(arguments: argparse.Namespace) -> None:
     settings = Settings(**connection_overrides)
     if arguments.schema_version is not None:
         if arguments.schema_version not in settings.supported_schema_versions:
-            raise ValueError(
-                f"Unsupported evaluation schema version: {arguments.schema_version}"
-            )
+            raise ValueError(f"Unsupported evaluation schema version: {arguments.schema_version}")
         settings = settings.model_copy(
             update={"supported_schema_versions": (arguments.schema_version,)}
         )
     if arguments.embedding_model is not None:
         if arguments.embedding_model not in settings.supported_embedding_models:
-            raise ValueError(
-                f"Unsupported evaluation embedding model: {arguments.embedding_model}"
-            )
+            raise ValueError(f"Unsupported evaluation embedding model: {arguments.embedding_model}")
         settings = settings.model_copy(
             update={"supported_embedding_models": (arguments.embedding_model,)}
         )
@@ -1039,9 +1094,9 @@ async def _main(arguments: argparse.Namespace) -> None:
     profile = RetrievalProfile.model_validate(profile_values)
     settings = settings.model_copy(update=profile.settings_overrides())
     physical_name = project_collection_name(arguments.collection, arguments.project_id)
-    collection = HttpClient(
-        host=arguments.chroma_host, port=arguments.chroma_port
-    ).get_collection(physical_name)
+    collection = HttpClient(host=arguments.chroma_host, port=arguments.chroma_port).get_collection(
+        physical_name
+    )
     verify_project_collection(collection, arguments.collection, arguments.project_id)
     manifest = _namespace_manifest(
         collection,
@@ -1095,13 +1150,39 @@ async def _main(arguments: argparse.Namespace) -> None:
             arguments.ragas_references,
             expected_dataset_version=arguments.dataset_version,
         )
+    reactivated_on = str(getattr(arguments, "reactivated_on", "") or "").strip()
+    if reactivated_on:
+        all_cases = [
+            case for case in all_cases if str(case.get("reactivated_on") or "") == reactivated_on
+        ]
+        if not all_cases:
+            raise ValueError(f"No evaluation cases were reactivated on {reactivated_on!r}")
+    requested_case_ids = tuple(dict.fromkeys(getattr(arguments, "case_ids", None) or ()))
+    if requested_case_ids:
+        requested = set(requested_case_ids)
+        # Paraphrase invariants are generation-only cases kept outside the
+        # retrieval gold files. They still need to be individually runnable so
+        # a divergent group can be diagnosed without another 458-case pass.
+        registered_ids = {str(case.get("id")) for case in all_cases}
+        requested_paraphrases = [
+            {**case, "evaluation_lane": "generation"}
+            for case in json.loads(_PARAPHRASE_GROUPS_PATH.read_text(encoding="utf-8"))
+            if str(case.get("id")) in requested and str(case.get("id")) not in registered_ids
+        ]
+        all_cases.extend(requested_paraphrases)
+        available_case_ids = {str(case.get("id")) for case in all_cases}
+        unknown_case_ids = set(requested_case_ids) - available_case_ids
+        if unknown_case_ids:
+            raise ValueError("Unknown evaluation case IDs: " + ", ".join(sorted(unknown_case_ids)))
+        all_cases = [case for case in all_cases if str(case.get("id")) in requested]
     cases = [
         case
         for case in all_cases
-        if case.get("evaluation_lane") != "generation"
-        and case.get("retired") is not True
+        if case.get("evaluation_lane") != "generation" and case.get("retired") is not True
     ]
-    wrong_project = [case.get("id") for case in all_cases if case.get("project_id") != arguments.project_id]
+    wrong_project = [
+        case.get("id") for case in all_cases if case.get("project_id") != arguments.project_id
+    ]
     if wrong_project:
         raise ValueError(
             f"Suite cases do not belong to {arguments.project_id}: {wrong_project[:5]}"
@@ -1164,21 +1245,33 @@ async def _main(arguments: argparse.Namespace) -> None:
     summary = score(rows, settings=settings, project_id=arguments.project_id)
     summary["suite_ids"] = [definition["id"] for definition in suite_definitions]
     summary["declared_gates"] = {
-        definition["id"]: definition.get("gates") or {}
-        for definition in suite_definitions
+        definition["id"]: definition.get("gates") or {} for definition in suite_definitions
     }
     summary_path = arguments.out.with_suffix(".json")
-    summary_path.write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
     _publish_retrieval_quality(summary, settings=settings, arguments=arguments)
     if arguments.generate:
         generation_out = arguments.generation_out or arguments.out.with_name(
             f"{arguments.out.stem}.generation.jsonl"
         )
-        generation_cases = _generation_sample(
-            all_cases, arguments.generate, project_id=arguments.project_id
+        generation_cases = (
+            [case for case in all_cases if case.get("retired") is not True]
+            if requested_case_ids
+            else _generation_sample(
+                all_cases,
+                arguments.generate,
+                project_id=arguments.project_id,
+                # An explicitly selected suite/file is a closed evaluation
+                # population. Global paraphrase invariants belong only to the
+                # default nightly population; injecting them here can displace
+                # every case from a small targeted gate.
+                include_paraphrases=(
+                    not bool(reactivated_on)
+                    and not bool(arguments.suite_ids)
+                    and arguments.suites is None
+                ),
+            )
         )
         candidate_rows = await _generation_candidate_rows(
             generation_cases,
@@ -1197,27 +1290,54 @@ async def _main(arguments: argparse.Namespace) -> None:
             settings=settings,
             project_id=arguments.project_id,
             output=generation_out,
-            recorded_candidates=_rehydrate_recorded_candidates(
-                candidate_rows, collection
+            recorded_candidates=_rehydrate_recorded_candidates(candidate_rows, collection),
+            recompute_case_ids=frozenset(
+                [
+                    *(arguments.recompute_generation_case_ids or ()),
+                    *(
+                        str(case.get("id"))
+                        for case in generation_cases
+                        if arguments.recompute_generation_negatives
+                        and case.get("answerable") is False
+                    ),
+                ]
             ),
         )
         generation_summary = score_generation(generation_rows)
+        contract_rows = [
+            row for row in generation_rows if row.get("suite") == "code_inventory_parameters"
+        ]
+        if contract_rows:
+            contract_passed = sum(bool(row.get("answer_contract_pass")) for row in contract_rows)
+            generation_summary["answer_contract"] = {
+                "passed": contract_passed,
+                "failed": len(contract_rows) - contract_passed,
+                "total": len(contract_rows),
+                "pass_rate": contract_passed / len(contract_rows),
+                "failed_case_ids": [
+                    str(row.get("id"))
+                    for row in contract_rows
+                    if not row.get("answer_contract_pass")
+                ],
+            }
         generation_out.with_suffix(".json").write_text(
             json.dumps(generation_summary, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         print("GENERATION_LANE", flush=True)
         print(json.dumps(generation_summary, indent=2, sort_keys=True))
-        _publish_generation_quality(
-            generation_summary, settings=settings, arguments=arguments
-        )
+        _publish_generation_quality(generation_summary, settings=settings, arguments=arguments)
+        if contract_rows and contract_passed != len(contract_rows):
+            raise RuntimeError(
+                "code_inventory_parameters answer contract failed: "
+                f"{contract_passed}/{len(contract_rows)} passed"
+            )
     if arguments.ragas_references:
         ragas_cases = _reviewed_bilingual_ragas_cases(all_cases)
         bilingual_generation_cases = [
             case
             for case in all_cases
-            if case.get("suite") == "bilingual_curated"
-            and case.get("retired") is not True
+            if case.get("suite") == "bilingual_curated" and case.get("retired") is not True
         ]
         generation_output = arguments.ragas_out.with_name(
             f"{arguments.ragas_out.stem}.generation.jsonl"
@@ -1231,9 +1351,7 @@ async def _main(arguments: argparse.Namespace) -> None:
             fusion=fusion,
             reranker=reranker,
             settings=settings,
-            output=generation_output.with_name(
-                f"{generation_output.stem}.candidates.jsonl"
-            ),
+            output=generation_output.with_name(f"{generation_output.stem}.candidates.jsonl"),
             lexical_enabled=not arguments.disable_lexical,
         )
         generation_rows = await _run_generation_lane(
@@ -1241,9 +1359,7 @@ async def _main(arguments: argparse.Namespace) -> None:
             settings=settings,
             project_id=arguments.project_id,
             output=generation_output,
-            recorded_candidates=_rehydrate_recorded_candidates(
-                candidate_rows, collection
-            ),
+            recorded_candidates=_rehydrate_recorded_candidates(candidate_rows, collection),
         )
         generation_summary = score_generation(generation_rows)
         generation_summary_path = generation_output.with_suffix(".json")
@@ -1265,9 +1381,7 @@ async def _main(arguments: argparse.Namespace) -> None:
         )
         print("BILINGUAL_GENERATION_DIAGNOSTICS", flush=True)
         print(json.dumps(generation_summary, indent=2, sort_keys=True))
-        _publish_generation_quality(
-            generation_summary, settings=settings, arguments=arguments
-        )
+        _publish_generation_quality(generation_summary, settings=settings, arguments=arguments)
 
 
 def _publish_retrieval_quality(
@@ -1410,15 +1524,21 @@ def _stratified_sample(cases: list[dict[str, Any]], size: int) -> list[dict[str,
 
 
 def _generation_sample(
-    cases: list[dict[str, Any]], size: int, *, project_id: str | None = None
+    cases: list[dict[str, Any]],
+    size: int,
+    *,
+    project_id: str | None = None,
+    include_paraphrases: bool = True,
 ) -> list[dict[str, Any]]:
     """Reserve nightly generation capacity for every paraphrase invariant."""
 
-    paraphrases = json.loads(_PARAPHRASE_GROUPS_PATH.read_text(encoding="utf-8"))
+    paraphrases = (
+        json.loads(_PARAPHRASE_GROUPS_PATH.read_text(encoding="utf-8"))
+        if include_paraphrases
+        else []
+    )
     if project_id is not None:
-        paraphrases = [
-            case for case in paraphrases if case.get("project_id") == project_id
-        ]
+        paraphrases = [case for case in paraphrases if case.get("project_id") == project_id]
     paraphrases = [
         {**case, "suite": "paraphrase_invariance", "evaluation_lane": "generation"}
         for case in paraphrases
@@ -1429,9 +1549,7 @@ def _generation_sample(
         # by suite. This makes every section/language visible in the generation
         # lane while retaining every must-refuse case.
         negatives = [case for case in cases if case.get("answerable") is False]
-        selected: dict[str, dict[str, Any]] = {
-            str(case["id"]): case for case in negatives
-        }
+        selected: dict[str, dict[str, Any]] = {str(case["id"]): case for case in negatives}
         groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for case in cases:
             if case.get("answerable") is not True:
@@ -1449,7 +1567,11 @@ def _generation_sample(
                 f"requires at least {len(section_sample) + len(paraphrases)}"
             )
         fillers = [case for case in cases if str(case.get("id")) not in selected]
-        return [*paraphrases, *section_sample, *_stratified_sample(fillers, remaining - len(section_sample))]
+        return [
+            *paraphrases,
+            *section_sample,
+            *_stratified_sample(fillers, remaining - len(section_sample)),
+        ]
     # Small developer lanes need both a usable bilingual negative gate and at
     # least one answerable example in every language represented by the suite.
     # The mandatory developer paraphrases are currently English, so ordinary
@@ -1481,21 +1603,17 @@ def _generation_sample(
     answerable_fillers = [
         case
         for case in cases
-        if case.get("answerable") is True
-        and str(case.get("id")) not in reserved_ids
+        if case.get("answerable") is True and str(case.get("id")) not in reserved_ids
     ]
     negative_fillers = [
         case
         for case in cases
-        if case.get("answerable") is False
-        and str(case.get("id")) not in reserved_ids
+        if case.get("answerable") is False and str(case.get("id")) not in reserved_ids
     ]
     filler_size = remaining - len(reserved)
     fillers = _stratified_sample(answerable_fillers, filler_size)
     if len(fillers) < filler_size:
-        fillers.extend(
-            _stratified_sample(negative_fillers, filler_size - len(fillers))
-        )
+        fillers.extend(_stratified_sample(negative_fillers, filler_size - len(fillers)))
     return [
         *paraphrases,
         *reserved,
@@ -1510,12 +1628,13 @@ async def _run_generation_lane(
     project_id: str,
     output: Path,
     recorded_candidates: dict[str, list[Document]],
+    recompute_case_ids: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     selected_ids = {str(case.get("id")) for case in cases}
     rows = [
         row
         for row in (_load_jsonl(output) if output.exists() else [])
-        if str(row.get("id")) in selected_ids
+        if str(row.get("id")) in selected_ids and str(row.get("id")) not in recompute_case_ids
     ]
     completed = {str(row.get("id")) for row in rows}
     for position, case in enumerate(cases, start=1):
@@ -1523,9 +1642,7 @@ async def _run_generation_lane(
             continue
         case_id = str(case.get("id"))
         if case_id not in recorded_candidates:
-            raise RuntimeError(
-                f"Generation case {case_id} has no retrieval-lane candidate pool"
-            )
+            raise RuntimeError(f"Generation case {case_id} has no retrieval-lane candidate pool")
         access_policy_ids = [f"project:{project_id}"]
         department = str(case.get("department") or "").strip()
         if department:
@@ -1540,6 +1657,8 @@ async def _run_generation_lane(
             question=str(case["question"]),
             accessPolicyIds=access_policy_ids,
             modelProfile="budget",
+            conversationHistory=case.get("conversation_history") or [],
+            conversationContext=case.get("conversation_context") or {},
         )
         evaluation_result = await _RecordedCandidateWorkflow(
             settings, request, recorded_candidates[case_id]
@@ -1589,6 +1708,61 @@ async def _run_generation_lane(
             "refusal_reason": refusal_reason,
             "expected_refusal_reason": case.get("expected_refusal_reason"),
         }
+        expected_terms = [str(value) for value in case.get("expected_answer_terms", [])]
+        forbidden_terms = [str(value) for value in case.get("forbidden_answer_terms", [])]
+        expected_subject = str(case.get("expected_context_subject") or "")
+        rendered_bullets = [
+            line.strip() for line in response.answer.splitlines() if line.strip().startswith("-")
+        ]
+        normalized_bullets = [
+            re.sub(r"\s*\[SOURCE\s+\d+\]", "", line, flags=re.IGNORECASE).strip()
+            for line in rendered_bullets
+        ]
+        terms_present = all(
+            value.casefold() in response.answer.casefold() for value in expected_terms
+        )
+        forbidden_absent = all(
+            value.casefold() not in response.answer.casefold() for value in forbidden_terms
+        )
+        unique_bullets = not case.get("require_unique_bullets") or (
+            bool(normalized_bullets) and len(normalized_bullets) == len(set(normalized_bullets))
+        )
+        context_subject = str(
+            getattr(response.conversation_context_update, "active_subject", "") or ""
+        )
+        standalone_question = str(
+            getattr(response.conversation_context_update, "standalone_question", "") or ""
+        )
+        resolved_intent = str(getattr(response.conversation_context_update, "intent", "") or "")
+        subject_preserved = not expected_subject or context_subject == expected_subject
+        expected_disposition = (
+            response.confidence == "NONE"
+            if case.get("answerable") is False
+            else response.confidence != "NONE"
+        )
+        row.update(
+            {
+                "expected_answer_terms": expected_terms,
+                "forbidden_answer_terms": forbidden_terms,
+                "expected_context_subject": expected_subject,
+                "actual_context_subject": context_subject,
+                "actual_standalone_question": standalone_question,
+                "actual_resolved_intent": resolved_intent,
+                "answer_terms_present": terms_present,
+                "forbidden_terms_absent": forbidden_absent,
+                "context_subject_preserved": subject_preserved,
+                "unique_inventory_bullets": unique_bullets,
+                "answer_contract_pass": all(
+                    (
+                        terms_present,
+                        forbidden_absent,
+                        subject_preserved,
+                        unique_bullets,
+                        expected_disposition,
+                    )
+                ),
+            }
+        )
         if case.get("reference") and case.get("reference_status") == "reviewed":
             row.update(
                 {
@@ -1616,7 +1790,10 @@ def main() -> None:
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--chroma-host", default="127.0.0.1")
     parser.add_argument("--chroma-port", type=int, default=8000)
-    parser.add_argument("--collection", default="project-intelligence")
+    parser.add_argument(
+        "--collection",
+        default=os.getenv("PI_RAG_CHROMA_COLLECTION", "project-intelligence"),
+    )
     parser.add_argument(
         "--schema-version",
         help="Use the schema version configured on the evaluated project's vector route.",
@@ -1642,6 +1819,30 @@ def main() -> None:
         help="Run full generation; documentation suites should budget four cases per section/language.",
     )
     parser.add_argument("--generation-out", type=Path)
+    parser.add_argument(
+        "--reactivated-on",
+        help="Evaluate only cases carrying this reactivated_on date.",
+    )
+    parser.add_argument(
+        "--case-id",
+        action="append",
+        dest="case_ids",
+        help="Evaluate one named case. Repeat to select multiple cases.",
+    )
+    parser.add_argument(
+        "--recompute-generation-case-id",
+        action="append",
+        dest="recompute_generation_case_ids",
+        help=(
+            "Recompute one generation checkpoint row while retaining all other selected rows. "
+            "Repeat to recompute multiple cases."
+        ),
+    )
+    parser.add_argument(
+        "--recompute-generation-negatives",
+        action="store_true",
+        help="Recompute every selected unanswerable generation checkpoint row.",
+    )
     parser.add_argument(
         "--ragas-references",
         type=Path,
@@ -1672,9 +1873,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--openinference-otlp-endpoint",
-        default=os.getenv(
-            "PI_RAG_OPENINFERENCE_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces"
-        ),
+        default=os.getenv("PI_RAG_OPENINFERENCE_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces"),
     )
     parser.add_argument("--quality-run-id", default=os.getenv("PI_RAG_QUALITY_RUN_ID", ""))
     parser.add_argument("--dataset-version", default=os.getenv("PI_RAG_DATASET_VERSION", "1"))
@@ -1689,7 +1888,23 @@ def main() -> None:
         type=Path,
         help="Reuse a recorded fused retrieval pool so only reranker settings vary.",
     )
-    asyncio.run(_main(parser.parse_args()))
+    arguments = parser.parse_args()
+    if arguments.out.suffix != ".jsonl":
+        parser.error("--out must end in .jsonl so its .json summary cannot overwrite rows")
+    if arguments.generation_out and arguments.generation_out.suffix != ".jsonl":
+        parser.error(
+            "--generation-out must end in .jsonl so its .json summary cannot overwrite rows"
+        )
+
+    async def run() -> None:
+        try:
+            await _main(arguments)
+        finally:
+            from app.model_gateway import close_model_gateway_clients
+
+            await close_model_gateway_clients()
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

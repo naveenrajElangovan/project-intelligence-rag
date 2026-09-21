@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 RUN useradd --create-home --uid 10001 appuser
-COPY --chown=10001:10001 requirements.txt .
+COPY --chown=10001:10001 pyproject.toml README.md ./
+COPY --chown=10001:10001 app ./app
 # torch is installed first, from PyTorch's CPU-only index. On Linux the default
 # PyPI wheel hard-depends on nvidia-cudnn-cu13, nvidia-cusparselt-cu13,
 # nvidia-nccl-cu13, nvidia-nvshmem-cu13 and triton -- about 1.1 GB of compressed
@@ -16,8 +17,7 @@ COPY --chown=10001:10001 requirements.txt .
 # so nothing is given up. Revert this line if the service is ever moved to a GPU
 # instance.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.11.0 \
- && pip install --no-cache-dir -r requirements.txt
-COPY --chown=10001:10001 app ./app
+ && pip install --no-cache-dir .
 COPY --chown=10001:10001 scripts ./scripts
 RUN python -m scripts.generate_sbom /opt/project-intelligence-rag.cdx.json
 USER appuser

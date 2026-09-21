@@ -41,6 +41,9 @@ _MORE = re.compile(
 )
 _FIXED = re.compile(r"\b(?:fixed|resolved|corregid[oa]s?|resuelt[oa]s?)\b", re.I)
 _ISSUE_KEY = re.compile(r"\b[A-Z][A-Z0-9_]*-\d+\b", re.I)
+_DOCUMENT_SECTION = re.compile(
+    r"\b(?:document(?:ation)?\s+)?sections?\b|\bsecci[oó]n(?:es)?\b", re.I
+)
 _REPORT = re.compile(
     r"\b(?:status report|project report|jira report|summary report|"
     r"reporte de estado|informe de estado|reporte del proyecto|informe de jira)\b",
@@ -187,7 +190,16 @@ def select_providers(
         )
         if pattern.search(question)
     ]
-    if _ISSUE_KEY.search(question) and ProviderName.JIRA not in requested_list:
+    document_section_reference = bool(
+        _ISSUE_KEY.search(question)
+        and _DOCUMENT_SECTION.search(question)
+        and not _JIRA_EXPLICIT.search(question)
+    )
+    if (
+        _ISSUE_KEY.search(question)
+        and not document_section_reference
+        and ProviderName.JIRA not in requested_list
+    ):
         requested_list.insert(0, ProviderName.JIRA)
     requested = tuple(requested_list)
     disabled = tuple(provider for provider in requested if provider not in enabled)
@@ -285,6 +297,8 @@ def select_providers(
 
 def _jira_structured_query(question: str, *, assume_jira: bool = False) -> StructuredQuery | None:
     keys = tuple(dict.fromkeys(value.upper() for value in _ISSUE_KEY.findall(question)))
+    if keys and _DOCUMENT_SECTION.search(question) and not _JIRA_EXPLICIT.search(question):
+        return None
     if not (_JIRA.search(question) or assume_jira or keys):
         return None
     if keys and (_GITHUB.search(question) or _CONFLUENCE.search(question)):

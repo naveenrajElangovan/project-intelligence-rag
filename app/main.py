@@ -124,8 +124,7 @@ async def _warm_or_report(name: str, awaitable) -> None:
         raise
     except Exception as failure:
         logging.getLogger("app.startup").warning(
-            "The %s warm-up failed (%s: %s); serving cold while its dependency "
-            "is unavailable.",
+            "The %s warm-up failed (%s: %s); serving cold while its dependency is unavailable.",
             name,
             type(failure).__name__,
             failure,
@@ -198,6 +197,9 @@ async def lifespan(_application: FastAPI):
                 await asyncio.wait_for(warm_task, timeout=5)
         if tracer_provider is not None:
             await asyncio.to_thread(tracer_provider.shutdown)
+        from app.model_gateway import close_model_gateway_clients
+
+        await close_model_gateway_clients()
 
 
 def create_app() -> FastAPI:
@@ -254,16 +256,14 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
     """Acquire capacity before retrieval or reject the request immediately."""
 
     loop = asyncio.get_running_loop()
-    # Preserve the conservative local clamp unless an operator explicitly opts
-    # into pipeline overlap. The accelerator and model have their own bounds, so
-    # the override changes admission only; it never widens either inference slot.
+    # Admission bounds whole requests; model and accelerator calls have their
+    # own independent semaphores. Coupling admission to the single local-model
+    # slot prevented request B from retrieving while request A was generating,
+    # even though those stages use different resources.
     capacity = settings.max_inflight_requests
     if settings.admission_capacity_override is not None:
         capacity = settings.admission_capacity_override
         capacity_path = "override"
-    elif settings.local_inference_enabled:
-        capacity = min(capacity, settings.local_max_concurrency)
-        capacity_path = "local-clamp"
     else:
         capacity_path = "configured-maximum"
     key = (id(loop), capacity)
@@ -277,19 +277,10 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
                 "bounded.",
                 capacity,
             )
-        elif capacity_path == "local-clamp":
-            LOGGER.info(
-                "Admission capacity is %d, clamped from PI_RAG_MAX_INFLIGHT_"
-                "REQUESTS=%d by PI_RAG_LOCAL_MAX_CONCURRENCY=%d. Requests beyond "
-                "it are shed with 503, not queued.",
-                capacity,
-                settings.max_inflight_requests,
-                settings.local_max_concurrency,
-            )
         else:
             LOGGER.info(
                 "Admission capacity is %d from PI_RAG_MAX_INFLIGHT_REQUESTS; "
-                "the local-inference clamp is inactive.",
+                "model and accelerator concurrency remain independently bounded.",
                 capacity,
             )
     semaphore = _REQUEST_SEMAPHORES[key]

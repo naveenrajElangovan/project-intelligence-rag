@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -13,8 +14,6 @@ from langchain_core.documents import Document
 
 from app.config import Settings
 from app.accelerator import accelerator_scores
-from app.workflow_support.filtering import preserve_non_empty
-from app.retry import with_transient_retry
 from app.table_evidence import linearize_tables
 
 
@@ -51,10 +50,7 @@ def cached_scores(
     `compute` receives the uncached pairs in order and returns their scores.
     """
 
-    keys = [
-        (model_ref, max_length, _digest(query), _digest(evidence))
-        for query, evidence in pairs
-    ]
+    keys = [(model_ref, max_length, _digest(query), _digest(evidence)) for query, evidence in pairs]
     scores: list[float | None] = [None] * len(pairs)
     pending: list[int] = []
     with _SCORE_CACHE_LOCK:
@@ -78,10 +74,13 @@ def cached_scores(
     return [value for value in scores if value is not None]
 
 
-def progressive_rerank_candidates(
-    documents: list[Document], limit: int
-) -> list[Document]:
-    """Narrow with cheap signals while retaining anchors and source diversity."""
+def progressive_rerank_candidates(documents: list[Document], limit: int) -> list[Document]:
+    """Narrow with cheap signals while retaining anchors and family balance.
+
+    Corpus growth must not let one source type consume the finite cross-encoder
+    window. Exact/canonical anchors remain protected; ordinary query-ranked
+    candidates compete inside dynamically discovered source-family windows.
+    """
 
     if limit <= 0 or len(documents) <= limit:
         return list(documents)
@@ -94,13 +93,18 @@ def progressive_rerank_candidates(
             (int(value) for value in (metadata.get("query_candidate_ranks") or {}).values()),
             default=0,
         )
+        source_rank = int(metadata.get("source_dense_rank") or 0)
+        # Source-local ranks are only comparable *inside* one source. Treat all
+        # of those bounded candidates as query-responsive peers and let their
+        # semantic score order them globally; otherwise every rank-one section
+        # from seven sources crowds out a strongly relevant rank-three section.
+        retrieval_rank = primary_rank or query_rank or (1 if source_rank else 0)
         return (
             1.0
-            if metadata.get("identifier_anchor")
-            or metadata.get("canonical_route_candidate")
+            if metadata.get("identifier_anchor") or metadata.get("canonical_route_candidate")
             else 0.0,
-            1.0 if primary_rank or query_rank else 0.0,
-            float(-(primary_rank or query_rank)) if primary_rank or query_rank else float("-inf"),
+            1.0 if retrieval_rank else 0.0,
+            float(-retrieval_rank) if retrieval_rank else float("-inf"),
             float(metadata.get("retrieval_fused_score", 0.0) or 0.0),
             float(metadata.get("fusion_score", 0.0) or 0.0),
             float(metadata.get("lexical_score", 0.0) or 0.0),
@@ -108,9 +112,20 @@ def progressive_rerank_candidates(
             float(-index),
         )
 
+    # Vector stores do not promise a stable order for equal-distance records.
+    # Establish an identity order before applying the stable score sort so tied
+    # candidates cannot change the eventual prompt between identical requests.
+    identity_ordered = sorted(
+        documents,
+        key=lambda document: str(
+            document.metadata.get("chunk_id")
+            or document.metadata.get("source_id")
+            or document.id
+            or document.page_content
+        ),
+    )
     ranked = [
-        document
-        for _, document in sorted(enumerate(documents), key=score, reverse=True)
+        document for _, document in sorted(enumerate(identity_ordered), key=score, reverse=True)
     ]
     selected: list[Document] = []
     selected_ids: set[str] = set()
@@ -127,25 +142,126 @@ def progressive_rerank_candidates(
             selected_ids.add(identity)
 
     for document in ranked:
-        if (
-            document.metadata.get("identifier_anchor")
-            or document.metadata.get("canonical_route_candidate")
-            or document.metadata.get("primary_query_rank")
-            or document.metadata.get("query_candidate_ranks")
+        if document.metadata.get("identifier_anchor") or document.metadata.get(
+            "canonical_route_candidate"
         ):
             add(document)
 
-    represented_types: set[str] = set()
+    family_sources: dict[str, dict[str, list[Document]]] = {}
     for document in ranked:
-        source_type = str(document.metadata.get("source_type", "UNKNOWN"))
-        if source_type not in represented_types:
+        source_type = str(document.metadata.get("source_type") or "UNKNOWN").upper()
+        source_identity = str(
+            document.metadata.get("source_id")
+            or document.metadata.get("reference")
+            or document.metadata.get("parent_id")
+            or document.metadata.get("chunk_id")
+            or document.id
+            or document.page_content
+        )
+        family_sources.setdefault(source_type, {}).setdefault(source_identity, []).append(document)
+
+    # Diversify within a family too, while keeping a two-chunk section burst.
+    # A strict one-per-source round robin separated adjacent chunks from the
+    # same relevant page/file until after the finite cross-encoder window; no
+    # diversity allowed one large source to monopolize it. Two preserves local
+    # section continuity while still advancing to independent sources quickly.
+    families: dict[str, list[Document]] = {}
+    for family, sources in family_sources.items():
+        diversified: list[Document] = []
+        depth = 0
+        source_burst = 2
+        while True:
+            added = False
+            for source_documents in sources.values():
+                window = source_documents[depth : depth + source_burst]
+                if window:
+                    diversified.extend(window)
+                    added = True
+            if not added:
+                break
+            depth += source_burst
+        families[family] = diversified
+
+    family_order = sorted(
+        families,
+        key=lambda family: score((0, families[family][0])),
+        reverse=True,
+    )
+
+    # A globally fused list can push even the best dense result from a smaller
+    # family beyond the cross-encoder window. Reserve only the rank-one leader
+    # from each retrieval channel/family. Broader family-rank priority is
+    # intentionally avoided because it can overwhelm exact structured matches.
+    for family in family_order:
+        for rank_field in ("dense_family_rank", "lexical_family_rank"):
+            leader = min(
+                (
+                    document
+                    for document in families[family]
+                    if int(document.metadata.get(rank_field) or 0) > 0
+                ),
+                key=lambda document: int(document.metadata.get(rank_field) or 0),
+                default=None,
+            )
+            if leader is not None and int(leader.metadata.get(rank_field) or 0) == 1:
+                add(leader)
+
+    # Preserve the strongest original/planned-query candidate in every family,
+    # rather than treating every member of a large family's query result as an
+    # unlimited reservation.
+    for family in family_order:
+        protected = next(
+            (
+                document
+                for document in families[family]
+                if document.metadata.get("primary_query_rank")
+                or document.metadata.get("query_candidate_ranks")
+            ),
+            None,
+        )
+        if protected is not None:
+            add(protected)
+
+    # Guarantee a modest floor rather than equal shares. The remaining slots
+    # stay relevance-driven, so a code question can remain code-heavy while a
+    # newly enlarged CODE corpus cannot erase PAGE/ISSUE/ATTACHMENT entirely.
+    family_floor = max(1, limit // (len(families) + 1))
+    for family in family_order:
+        for document in families[family][:family_floor]:
             add(document)
-            represented_types.add(source_type)
 
     for document in ranked:
         add(document)
 
     return selected
+
+
+def source_balanced_rerank_window(
+    documents: list[Document], configured_limit: int
+) -> list[Document]:
+    """Score the bounded expansion instead of truncating it back out.
+
+    Source-local candidates exist because a compound source's relevant section
+    fell outside global top-k. Applying the old fixed-width cheap truncation to
+    that expanded pool would recreate the displacement before the cross-encoder
+    can compare relevance. Upstream still caps the pool at ``max_candidates``;
+    final evidence width and all relevance thresholds remain unchanged.
+    """
+
+    if any(document.metadata.get("source_dense_rank") for document in documents):
+        return progressive_rerank_candidates(documents, len(documents))
+    return progressive_rerank_candidates(documents, configured_limit)
+
+
+def _structural_section(document: Document) -> str:
+    """Return the most specific stable section identity available for evidence."""
+
+    path = document.metadata.get("structure_path")
+    if isinstance(path, (list, tuple)):
+        return " / ".join(str(value).strip() for value in path if str(value).strip())
+    if isinstance(path, str) and path.strip():
+        return path.strip()
+    return str(document.metadata.get("structure_leaf") or "").strip()
 
 
 class LocalMultilingualReranker:
@@ -247,13 +363,19 @@ class LocalMultilingualReranker:
             # candidates in, zero out. Everywhere else an empty result is a
             # deliberate refusal and must stay one.
             self.last_threshold_bypassed = True
-            scored = sorted(all_scored, key=lambda item: item[0], reverse=True)[
-                :result_limit
-            ]
+            scored = sorted(all_scored, key=lambda item: (-item[0], item[2]))[:result_limit]
 
         ranked: list[Document] = []
         source_counts: dict[str, int] = {}
-        for score, document, source_id in sorted(scored, key=lambda item: item[0], reverse=True):
+        ordered_scored = sorted(
+            scored,
+            key=lambda item: (
+                -item[0],
+                item[2],
+                str(item[1].metadata.get("chunk_id") or item[1].id or ""),
+            ),
+        )
+        for score, document, source_id in ordered_scored:
             if source_counts.get(source_id, 0) >= source_limit:
                 self.last_capped_by_source_limit += 1
                 continue
@@ -262,19 +384,72 @@ class LocalMultilingualReranker:
             ranked.append(document)
             if len(ranked) >= result_limit:
                 break
-        if scored:
-            uncapped = [document for _, document, _ in scored][:result_limit]
-            ranked, self.last_source_cap_bypassed = preserve_non_empty(
-                uncapped, ranked
-            )
+        if scored and len(ranked) < result_limit:
+            # A source cap is a diversity guard, not a reason to return an
+            # unnecessarily short result window. Large pages commonly contain
+            # several independently addressable sections; dropping every
+            # section after the first `source_limit` chunks made corpus growth
+            # suppress relevant evidence even though it had passed the
+            # unchanged rerank threshold. Fill only otherwise-empty slots, first
+            # from missing source families and then from previously unseen
+            # structural sections. Existing ranked evidence is never displaced.
+            ranked_ids = {
+                str(document.metadata.get("chunk_id") or document.id or document.page_content)
+                for document in ranked
+            }
+            represented_families = {
+                str(document.metadata.get("source_type") or "UNKNOWN").upper()
+                for document in ranked
+            }
+            represented_sections = {
+                (
+                    str(
+                        document.metadata.get("source_id")
+                        or document.metadata.get("reference")
+                        or document.metadata.get("chunk_id")
+                    ),
+                    _structural_section(document),
+                )
+                for document in ranked
+                if _structural_section(document)
+            }
+
+            def backfill(score: float, document: Document, source_id: str) -> None:
+                identity = str(
+                    document.metadata.get("chunk_id") or document.id or document.page_content
+                )
+                if identity in ranked_ids or len(ranked) >= result_limit:
+                    return
+                if source_counts.get(source_id, 0) >= source_limit:
+                    self.last_source_cap_bypassed = True
+                source_counts[source_id] = source_counts.get(source_id, 0) + 1
+                document.metadata["rerank_score"] = score
+                ranked.append(document)
+                ranked_ids.add(identity)
+                represented_families.add(
+                    str(document.metadata.get("source_type") or "UNKNOWN").upper()
+                )
+                section = _structural_section(document)
+                if section:
+                    represented_sections.add((source_id, section))
+
+            for score, document, source_id in ordered_scored:
+                family = str(document.metadata.get("source_type") or "UNKNOWN").upper()
+                if family not in represented_families:
+                    backfill(score, document, source_id)
+
+            for score, document, source_id in ordered_scored:
+                section = _structural_section(document)
+                if section and (source_id, section) not in represented_sections:
+                    backfill(score, document, source_id)
         return ranked
 
     def _predict(self, query: str, documents: list[Document]):
         pairs = [
             (
                 query,
-                scoring_evidence(
-                    document.page_content,
+                document_scoring_evidence(
+                    document,
                     linearize_tables_enabled=self._linearize_table_evidence,
                 ),
             )
@@ -319,8 +494,8 @@ class RemoteMultilingualReranker(LocalMultilingualReranker):
         pairs = [
             (
                 query,
-                scoring_evidence(
-                    document.page_content,
+                document_scoring_evidence(
+                    document,
                     linearize_tables_enabled=self._linearize_table_evidence,
                 ),
             )
@@ -353,31 +528,32 @@ def _is_cross_language(query_language: str, document: Document) -> bool:
 
     question = str(query_language or "").casefold()
     evidence = str(document.metadata.get("language") or "").casefold()
-    return (
-        question in _LANGUAGES
-        and evidence in _LANGUAGES
-        and question != evidence
-    )
+    return question in _LANGUAGES and evidence in _LANGUAGES and question != evidence
 
 
-def build_reranker(settings: Settings):
-    reranker_type = (
-        RemoteMultilingualReranker
-        if settings.local_accelerator_url
-        else LocalMultilingualReranker
-    )
-    remote = (
-        {
-            "base_url": settings.local_accelerator_url,
-            "api_key": settings.internal_api_key,
-            "timeout_seconds": settings.local_accelerator_timeout_seconds,
-            "attempts": settings.local_accelerator_retry_attempts,
-            "max_concurrency": settings.accelerator_max_concurrency,
-        }
-        if settings.local_accelerator_url
-        else {}
-    )
-    return reranker_type(
+def build_reranker(settings: Settings) -> LocalMultilingualReranker:
+    if settings.local_accelerator_url:
+        return RemoteMultilingualReranker(
+            settings.local_rerank_model,
+            device=settings.local_rerank_device,
+            model_path=settings.local_models_path,
+            revision=settings.local_rerank_revision,
+            top_n=settings.rerank_top_n,
+            score_threshold=settings.rerank_score_threshold,
+            exact_code_score_threshold=settings.exact_code_rerank_score_threshold,
+            exact_code_retrieval_score_floor=settings.exact_code_retrieval_score_floor,
+            cross_language_score_threshold=settings.rerank_cross_language_score_threshold,
+            max_chunks_per_source=settings.max_chunks_per_source,
+            batch_size=settings.local_rerank_batch_size,
+            max_length=settings.local_rerank_max_length,
+            linearize_table_evidence=settings.linearize_table_evidence,
+            base_url=settings.local_accelerator_url,
+            api_key=settings.internal_api_key,
+            timeout_seconds=settings.local_accelerator_timeout_seconds,
+            attempts=settings.local_accelerator_retry_attempts,
+            max_concurrency=settings.accelerator_max_concurrency,
+        )
+    return LocalMultilingualReranker(
         settings.local_rerank_model,
         device=settings.local_rerank_device,
         model_path=settings.local_models_path,
@@ -391,13 +567,10 @@ def build_reranker(settings: Settings):
         batch_size=settings.local_rerank_batch_size,
         max_length=settings.local_rerank_max_length,
         linearize_table_evidence=settings.linearize_table_evidence,
-        **remote,
     )
 
 
-def _load_local_model(
-    model_ref: str, device: str, revision: str, max_length: int
-):
+def _load_local_model(model_ref: str, device: str, revision: str, max_length: int):
     expanded = Path(model_ref).expanduser()
     resolved = str(expanded) if expanded.exists() else model_ref
     key = (resolved + "@" + revision + f"#max_length={max_length}", device)
@@ -442,12 +615,50 @@ def predict_local_scores(
         return []
     model = _load_local_model(model_ref, device, revision, max_length)
     with _LOCAL_INFERENCE_LOCK:
-        return model.predict(
-            pairs,
-            batch_size=min(batch_size, len(pairs)),
-            show_progress_bar=False,
-            activation_fn=_identity_activation(),
-        )
+        effective_batch_size = min(batch_size, len(pairs))
+        try:
+            scores = model.predict(
+                pairs,
+                batch_size=effective_batch_size,
+                show_progress_bar=False,
+                activation_fn=_identity_activation(),
+            )
+        except RuntimeError as failure:
+            # Metal can retain allocations owned by other local models even
+            # after our normal per-call cache release. Recover once with a
+            # smaller bounded batch; an unrelated runtime error, or a second
+            # allocation failure, remains visible to the caller.
+            if not _is_mps_out_of_memory(failure, device) or effective_batch_size <= 1:
+                raise
+            _release_mps_cache()
+            scores = model.predict(
+                pairs,
+                batch_size=max(1, effective_batch_size // 2),
+                show_progress_bar=False,
+                activation_fn=_identity_activation(),
+            )
+        if device.casefold().startswith("mps"):
+            # SentenceTransformers returns CPU-backed scores. Release cached
+            # Metal allocations between long evaluation cases so a complete
+            # suite cannot accumulate allocator state until it OOMs.
+            _release_mps_cache()
+        return scores
+
+
+def _is_mps_out_of_memory(failure: RuntimeError, device: str) -> bool:
+    return (
+        device.casefold().startswith("mps")
+        and "mps backend out of memory" in str(failure).casefold()
+    )
+
+
+def _release_mps_cache() -> None:
+    import gc
+    import torch
+
+    torch.mps.synchronize()
+    gc.collect()
+    torch.mps.empty_cache()
 
 
 def normalized_relevance_score(raw_score: float) -> float:
@@ -468,9 +679,9 @@ def _identity_activation():
 
 
 def sanitize_evidence(value: str) -> str:
-    return "".join(
-        character for character in value if character in "\n\t" or ord(character) >= 32
-    )[:16000]
+    return "".join(character for character in value if character in "\n\t" or ord(character) >= 32)[
+        :16000
+    ]
 
 
 def scoring_evidence(value: str, *, linearize_tables_enabled: bool = True) -> str:
@@ -487,6 +698,44 @@ def scoring_evidence(value: str, *, linearize_tables_enabled: bool = True) -> st
     # Re-apply the bound after linearisation. Repeating a header on every row
     # grows the text, so sizing only the input leaves the output unbounded.
     return sanitize_evidence(linearize_tables(cleaned))
+
+
+def document_scoring_evidence(document: Document, *, linearize_tables_enabled: bool = True) -> str:
+    """Add authoritative document context to the passage scored by the reranker.
+
+    Structured chunks intentionally keep headings in metadata so the body is not
+    repeated in every window.  Scoring only ``page_content`` discarded those
+    headings and made equivalent reindexes sensitive to HNSW tie ordering among
+    similar chunks.  Title and section path are source data, not query-derived
+    hints, and make the cross-encoder comparison stable across regenerated IDs.
+    """
+
+    title = str(document.metadata.get("title") or "").strip()
+    raw_path = document.metadata.get("structure_path")
+    path_values: list[str] = []
+    if isinstance(raw_path, (list, tuple)):
+        path_values = [str(value).strip() for value in raw_path if str(value).strip()]
+    elif isinstance(raw_path, str) and raw_path.strip():
+        try:
+            decoded = json.loads(raw_path)
+        except json.JSONDecodeError:
+            decoded = raw_path
+        if isinstance(decoded, list):
+            path_values = [str(value).strip() for value in decoded if str(value).strip()]
+        else:
+            path_values = [str(decoded).strip()]
+
+    context: list[str] = []
+    if title:
+        context.append(f"Title: {title}")
+    section = " > ".join(value for value in path_values if value != title)
+    if section:
+        context.append(f"Section: {section}")
+    body = scoring_evidence(
+        document.page_content,
+        linearize_tables_enabled=linearize_tables_enabled,
+    )
+    return sanitize_evidence("\n".join((*context, body)))
 
 
 def _exact_code_anchor_match(query: str, document: Document) -> bool:

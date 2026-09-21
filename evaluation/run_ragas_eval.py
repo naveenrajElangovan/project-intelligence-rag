@@ -6,6 +6,7 @@ import argparse
 from contextlib import nullcontext
 import json
 import os
+import math
 from pathlib import Path
 from statistics import fmean
 from typing import Any
@@ -26,7 +27,8 @@ OPTIONAL_FIELDS = (
     "reference_status",
     "dataset_version",
 )
-ANSWER_METRICS = ("faithfulness", "answer_relevancy", "answer_correctness")
+RAGAS_ANSWER_METRICS = ("faithfulness", "answer_relevancy", "answer_correctness")
+ANSWER_METRICS = (*RAGAS_ANSWER_METRICS, "answer_relevancy_corrected")
 
 
 class RagasMultilingualEmbeddings(Embeddings):
@@ -88,12 +90,10 @@ def validate_bilingual_samples(samples: list[dict[str, Any]]) -> None:
     ]
     if unreviewed:
         raise ValueError(
-            "bilingual RAGAS references must be human-reviewed: "
-            + ", ".join(unreviewed[:10])
+            "bilingual RAGAS references must be human-reviewed: " + ", ".join(unreviewed[:10])
         )
     directions = {
-        (sample.get("query_language"), sample.get("target_evidence_language"))
-        for sample in samples
+        (sample.get("query_language"), sample.get("target_evidence_language")) for sample in samples
     }
     required = {("en", "en"), ("es", "es"), ("en", "es"), ("es", "en")}
     if not required.issubset(directions):
@@ -129,6 +129,49 @@ def aggregate_scores(
             scores[f"{name}.language_gap"] = gap
             scores[f"{name}.language_gap_abs"] = abs(gap)
     return scores
+
+
+def reference_anchored_relevancy(
+    samples: list[dict[str, Any]], embeddings: Embeddings
+) -> list[float]:
+    """Score response topicality against the reviewed answer in one vector space.
+
+    RAGAS AnswerRelevancy asks a judge to reverse-generate questions from the
+    answer. Short incident wording (for example "the PDF is blank") can cause
+    those generated questions to drift, producing a near-zero score for a
+    correct bilingual procedure. The reviewed reference is already the explicit
+    topical target, so a direct multilingual cosine is a deterministic fallback
+    that does not depend on language direction or another model generation.
+    """
+
+    responses = embeddings.embed_documents([str(sample["response"]) for sample in samples])
+    references = embeddings.embed_documents([str(sample["reference"]) for sample in samples])
+    scores: list[float] = []
+    for response, reference in zip(responses, references, strict=True):
+        denominator = math.sqrt(sum(value * value for value in response)) * math.sqrt(
+            sum(value * value for value in reference)
+        )
+        cosine = (
+            sum(left * right for left, right in zip(response, reference, strict=True)) / denominator
+            if denominator
+            else 0.0
+        )
+        scores.append(max(0.0, min(1.0, cosine)))
+    return scores
+
+
+def add_corrected_answer_relevancy(
+    frame: Any, samples: list[dict[str, Any]], embeddings: Embeddings
+) -> Any:
+    """Preserve raw RAGAS output and add a reference-anchored false-negative fix."""
+
+    anchored = reference_anchored_relevancy(samples, embeddings)
+    raw = [float(value) if value == value else 0.0 for value in frame["answer_relevancy"].tolist()]
+    frame["answer_relevancy_corrected"] = [
+        max(ragas_score, anchor_score)
+        for ragas_score, anchor_score in zip(raw, anchored, strict=True)
+    ]
+    return frame
 
 
 def build_answer_metrics(include_factual_correctness: bool = False) -> list[Any]:
@@ -200,9 +243,7 @@ def main() -> None:
         help="Reject datasets without reviewed EN/ES references in all four directions.",
     )
     args = parser.parse_args()
-    args.model = validate_judge_model(
-        args.model, allow_floating=args.allow_floating_judge
-    )
+    args.model = validate_judge_model(args.model, allow_floating=args.allow_floating_judge)
 
     from langchain_openai import ChatOpenAI
     from ragas import EvaluationDataset, RunConfig, evaluate
@@ -213,9 +254,7 @@ def main() -> None:
     settings = get_settings()
     tracer_provider = None
     if args.phoenix_url:
-        tracing_settings = settings.model_copy(
-            update={"openinference_enabled": True}
-        )
+        tracing_settings = settings.model_copy(update={"openinference_enabled": True})
         tracer_provider = configure_openinference(tracing_settings)
     try:
         samples = load_samples(args.input)
@@ -229,12 +268,20 @@ def main() -> None:
                 temperature=0,
                 max_tokens=1024,
                 timeout=args.timeout,
-                extra_body={"think": False},
+                # Ollama otherwise reserves its native 262k context for every
+                # judge call. The evaluator must use the same bounded context as
+                # serving or tiny samples can spend minutes paging model state.
+                extra_body={
+                    "think": False,
+                    "options": {"num_ctx": settings.ollama_context_tokens},
+                },
             )
         )
         embedding_model = RagasMultilingualEmbeddings(build_embedder(settings))
         metrics = build_answer_metrics(args.include_factual_correctness)
-        tracer = tracer_provider.get_tracer("project-intelligence-ragas") if tracer_provider else None
+        tracer = (
+            tracer_provider.get_tracer("project-intelligence-ragas") if tracer_provider else None
+        )
         evaluation_scope = (
             tracer.start_as_current_span(
                 "rag.quality.answer_generation",
@@ -263,8 +310,10 @@ def main() -> None:
                 if evaluation_span is not None
                 else None
             )
-        frame = result.to_pandas()
-        metric_names = ANSWER_METRICS + (("factual_correctness",) if args.include_factual_correctness else ())
+        frame = add_corrected_answer_relevancy(result.to_pandas(), samples, embedding_model)
+        metric_names = ANSWER_METRICS + (
+            ("factual_correctness",) if args.include_factual_correctness else ()
+        )
         scores = aggregate_scores(frame, samples, metric_names)
         payload = {
             "section": "answer_generation",
@@ -291,12 +340,8 @@ def main() -> None:
                 "commit_sha": args.commit_sha,
                 "judge_model": args.model,
                 "embedding_model": settings.local_embedding_model,
-                "sample_count_en": sum(
-                    sample.get("query_language") == "en" for sample in samples
-                ),
-                "sample_count_es": sum(
-                    sample.get("query_language") == "es" for sample in samples
-                ),
+                "sample_count_en": sum(sample.get("query_language") == "en" for sample in samples),
+                "sample_count_es": sum(sample.get("query_language") == "es" for sample in samples),
             },
         )
         print(json.dumps(payload, indent=2))

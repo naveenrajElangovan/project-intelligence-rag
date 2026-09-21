@@ -19,5 +19,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("labels", type=Path)
     arguments = parser.parse_args()
-    rows = [json.loads(line) for line in arguments.labels.read_text(encoding="utf-8").splitlines() if line]
+    rows = [
+        json.loads(line)
+        for line in arguments.labels.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
     print(json.dumps({"rerank_threshold": calibrate(rows)}))

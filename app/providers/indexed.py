@@ -161,6 +161,7 @@ class IndexedProviderAdapter(ProviderAdapter):
                 unique[key] = document
         ordered = sorted(unique.values(), key=_jira_sort_key)
         if query.operation == StructuredOperation.OVERVIEW:
+
             def distribution(field: str) -> dict[str, int]:
                 counts: dict[str, int] = {}
                 for document in ordered:
@@ -170,8 +171,7 @@ class IndexedProviderAdapter(ProviderAdapter):
                 return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0].casefold())))
 
             child_count = sum(
-                bool(str(document.metadata.get("parent_issue_key") or ""))
-                for document in ordered
+                bool(str(document.metadata.get("parent_issue_key") or "")) for document in ordered
             )
             overview = {
                 "statuses": distribution("status"),
@@ -204,17 +204,17 @@ class IndexedProviderAdapter(ProviderAdapter):
                     total=len(ordered),
                     rows=tuple(_row(document) for document in ordered),
                     evidence=tuple(
-                        _envelope(self.name, self._project_id, document)
-                        for document in ordered
+                        _envelope(self.name, self._project_id, document) for document in ordered
                     ),
                     degradation=() if complete else ("SNAPSHOT_TRUNCATED",),
                 )
-            requested_keys = {
-                value.upper() for value in effective_filters.get("issue_key", ())
-            }
+            requested_keys = {value.upper() for value in effective_filters.get("issue_key", ())}
             children_by_identity: dict[str, Document] = {}
             for document in current:
-                if str(document.metadata.get("parent_issue_key") or "").upper() not in requested_keys:
+                if (
+                    str(document.metadata.get("parent_issue_key") or "").upper()
+                    not in requested_keys
+                ):
                     continue
                 identity = str(document.metadata.get("cloud_id") or "") + ":" + _identity(document)
                 children_by_identity[identity] = document
@@ -225,7 +225,9 @@ class IndexedProviderAdapter(ProviderAdapter):
                 issue_key = str(document.metadata.get("issue_key") or "").upper()
                 kind = str(
                     document.metadata.get("jira_chunk_kind")
-                    or ("ATTACHMENT" if document.metadata.get("source_type") == "ATTACHMENT" else "")
+                    or (
+                        "ATTACHMENT" if document.metadata.get("source_type") == "ATTACHMENT" else ""
+                    )
                 ).upper()
                 if issue_key not in requested_keys or not kind or kind == "CURRENT":
                     continue
@@ -238,9 +240,7 @@ class IndexedProviderAdapter(ProviderAdapter):
                 )
                 section_identities.setdefault(issue_key, {}).setdefault(kind, set()).add(identity)
                 if kind == "DESCRIPTION":
-                    descriptions.setdefault(
-                        issue_key, []
-                    ).append(document)
+                    descriptions.setdefault(issue_key, []).append(document)
             rows: list[dict[str, object]] = []
             for document in ordered:
                 row = _row(document)
@@ -304,6 +304,9 @@ class IndexedProviderAdapter(ProviderAdapter):
     async def _jira_exact_current(self, query: StructuredQuery, loader: object) -> StructuredResult:
         """Read scalar current-state facts without scanning the complete Jira inventory."""
 
+        if not callable(loader):
+            raise TypeError("Jira exact-current loader must be callable")
+
         requested_keys = tuple(
             dict.fromkeys(value.upper() for value in query.filters.get("issue_key", ()))
         )
@@ -334,6 +337,8 @@ class IndexedProviderAdapter(ProviderAdapter):
         )
 
     async def _jira_sections(self, query: StructuredQuery, loader: object) -> StructuredResult:
+        if not callable(loader):
+            raise TypeError("Jira section loader must be callable")
         section_kinds = tuple(
             dict.fromkeys(
                 value.upper()
@@ -414,9 +419,7 @@ class IndexedProviderAdapter(ProviderAdapter):
                 "section_kind": str(
                     group[0].metadata.get("jira_chunk_kind")
                     or (
-                        "ATTACHMENT"
-                        if group[0].metadata.get("source_type") == "ATTACHMENT"
-                        else ""
+                        "ATTACHMENT" if group[0].metadata.get("source_type") == "ATTACHMENT" else ""
                     )
                 ).upper(),
             }
@@ -525,7 +528,9 @@ def _resolve_topic_filter(
         for label in _values(document.metadata.get("labels"))
     }
     exact_labels = tuple(
-        dict.fromkeys(observed_labels[topic] for topic in normalized_topics if topic in observed_labels)
+        dict.fromkeys(
+            observed_labels[topic] for topic in normalized_topics if topic in observed_labels
+        )
     )
     if exact_labels:
         resolved = dict(filters)
@@ -549,14 +554,15 @@ def _resolve_topic_filter(
         for document in documents
     )
     label_frequency = Counter(
-        label
-        for document in documents
-        for label in _values(document.metadata.get("labels"))
+        label for document in documents for label in _values(document.metadata.get("labels"))
     )
     cooccurrence = Counter(
         label
         for document in documents
-        if all(topic in _normalized(str(document.metadata.get("title") or "")) for topic in normalized_topics)
+        if all(
+            topic in _normalized(str(document.metadata.get("title") or ""))
+            for topic in normalized_topics
+        )
         for label in _values(document.metadata.get("labels"))
     )
     candidates = sorted(

@@ -1,17 +1,13 @@
 from __future__ import annotations
-import asyncio
-import hashlib
-from pathlib import Path
-import re
-import unicodedata
 from collections.abc import AsyncIterator
-from typing import TypedDict
-from langchain_core.documents import Document
 from app.config import Settings
-from app.llm import (BilingualQueryPlanner, ConversationQueryResolver, GroundedAnswer,
-                     LangChainGroundedAnswerGenerator, LangChainSafeResponseGenerator, TokenUsage,
-                     insufficient_evidence_answer, query_aware_refusal_answer, refusal_answer)
-from app.models import ConversationContextUpdate, RagRequest, RagResponse, SourceReference
+from app.llm import (
+    BilingualQueryPlanner,
+    ConversationQueryResolver,
+    LangChainGroundedAnswerGenerator,
+    LangChainSafeResponseGenerator,
+)
+from app.models import RagRequest, RagResponse
 from app.catalog_answers import deterministic_catalog_response
 from app.grounding import LocalCitationGroundingVerifier
 from app.embedding import build_embedder
@@ -19,92 +15,91 @@ from app.reranking import build_reranker
 from app.retrieval import ChromaAccessRetriever
 from app.vocabulary import CorpusVocabulary
 from app.retrieval_pipeline import ReciprocalRankFusion, authorized_project_policies
-from app.telemetry import request_complete, stage_complete, started
+from app.telemetry import started
 from app.workflow_support.json_transform import json_transform_response
 from app.workflow_support.execution import invoke_bounded_graph
 from app.workflow_support.streaming import graph_update_events, verified_answer_events
 from app.workflow_graph import compiled_workflow_graph
 from app.workflow_support.citations import (
-    _citations_valid, _remove_unsupported_claims, _normalized_sentence,
-    _material_sentence_count,
-    _citation_failure_reason,
-    _normalize_citations,
-    _answer_without_source_markers,
     _all_material_sentences_cited,
+    _citation_failure_reason,
+    _citations_valid,
+    _material_sentence_count,
+    _normalize_citations,
+    _normalized_sentence,
     _overview_style_repair_needed,
+    _remove_unsupported_claims,
+    _answer_without_source_markers,
 )
 from app.workflow_support.query_analysis import (
-    detect_query_language, resolve_response_language,
-    _identifiers,
-    _safe_query_variant,
-    _multi_part_question,
-    _exact_terms,
-    _exact_term_ratio,
+    detect_query_language,
     _add_usage,
-    _dedupe_source_documents,
-    _source_diverse_order,
-    _implementation_evidence_order,
-    _inventory_documents,
-    _normalized_words,
-    _source_route_intent,
-    _intent_source_scope,
-    _required_evidence_source_types,
-    _document_source_type,
-    _source_type_count,
-    _source_authority_valid,
-    _entity_overview_entity,
-    _feature_inventory_entity,
     _code_inventory_requested,
-    _project_overview_requested,
-    _normalized_identifier,
-    _low_information_project_document,
-    _project_overview_topic,
-    _project_overview_evidence_order,
-    _overview_repair_kwargs,
-    _source_identity,
-    _feature_title_anchor,
-    _contains_ordered_phrase,
-    _exact_feature_title_match,
-    _exact_feature_source_ids,
-    _entity_overview_source_ids,
     _code_location_query,
+    _contains_ordered_phrase,
+    _document_source_type,
+    _entity_overview_entity,
+    _entity_overview_source_ids,
+    _exact_feature_source_ids,
+    _exact_feature_title_match,
+    _exact_term_ratio,
+    _exact_terms,
+    _feature_inventory_entity,
+    _feature_title_anchor,
+    _identifiers,
+    _implementation_evidence_order,
+    _intent_source_scope,
+    _inventory_documents,
+    _low_information_project_document,
+    _multi_part_question,
+    _normalized_identifier,
+    _normalized_words,
+    _overview_repair_kwargs,
+    _project_overview_evidence_order,
+    _project_overview_requested,
+    _project_overview_topic,
+    _required_evidence_source_types,
+    _safe_query_variant,
+    _source_authority_valid,
+    _source_diverse_order,
+    _source_identity,
+    _source_route_intent,
+    _source_type_count,
 )
 from app.workflow_support.completeness import (
     _answer_requirements,
     _code_answer_complete,
     _code_output_requested,
-    _missing_answer_requirements,
     _completeness_repair_query,
+    _document_satisfies_requirement,
+    _identifier_components,
     _include_repair_evidence,
     _merge_ranked_documents,
-    _document_satisfies_requirement,
-    _singular_key,
-    _identifier_components,
-    _text_satisfies_identifier_requirement,
+    _missing_answer_requirements,
     _missing_evidence_requirements,
+    _singular_key,
+    _text_satisfies_identifier_requirement,
 )
 from app.workflow_support.deterministic_answers import (
-    _deterministic_identifier_answer,
-    _deterministic_delivery_answer,
-    _jira_identifiers,
-    _edit_distance_at_most_one,
-    _deterministic_code_location_answer,
-    _code_location_terms,
-    _code_location_values,
-    _code_location_label_score,
-    _code_location_document_score,
-    _deterministic_feature_inventory_answer,
-    _feature_name_from_title,
-    _feature_inventory_answer_verified,
+    _code_inventory_answer_verified,
     _code_inventory_documents,
     _code_inventory_label,
+    _code_location_document_score,
+    _code_location_label_score,
+    _code_location_terms,
+    _code_location_values,
     _deterministic_code_inventory_answer,
-    _code_inventory_answer_verified,
+    _deterministic_code_location_answer,
+    _deterministic_delivery_answer,
+    _deterministic_feature_inventory_answer,
+    _deterministic_identifier_answer,
+    _edit_distance_at_most_one,
+    _feature_inventory_answer_verified,
+    _feature_name_from_title,
+    _jira_identifiers,
 )
 from app.workflow_support.presentation import (
-    _degradation_reasons,
     _expand_candidate_neighbors,
-    _highest_rerank_score,
     _stream_progress,
     _answer_deltas,
 )
@@ -115,16 +110,115 @@ from app.workflow_nodes.retrieval import RetrievalNodesMixin
 from app.workflow_nodes.state import RagState
 from app.workflow_support.conversation import (
     _conversation_context_subject,
-    build_conversation_context_update,
     _conversation_resolution_needed,
     _conversation_subject,
     _deterministic_conversation_rewrite,
     _safe_conversation_rewrite,
 )
-from app.workflow_support.fail_closed import apply_output_gate, clarification_response, resolved_request_for_state
+from app.workflow_support.fail_closed import (
+    apply_output_gate,
+    clarification_response,
+    clarification_response_with_canonical_index,
+)
 from app.workflow_evaluation import EvaluationWorkflowMixin
-class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, PlanningNodesMixin, RetrievalNodesMixin, AnswerNodesMixin):
+from app.workflow_response import WorkflowResponseMixin
+
+__all__ = [
+    "AuthorizedRagWorkflow",
+    "LangChainSafeResponseGenerator",
+    "_add_usage",
+    "_all_material_sentences_cited",
+    "_answer_deltas",
+    "_answer_requirements",
+    "_answer_without_source_markers",
+    "_citation_failure_reason",
+    "_citations_valid",
+    "_code_answer_complete",
+    "_code_inventory_answer_verified",
+    "_code_inventory_documents",
+    "_code_inventory_label",
+    "_code_inventory_requested",
+    "_code_location_document_score",
+    "_code_location_label_score",
+    "_code_location_query",
+    "_code_location_terms",
+    "_code_location_values",
+    "_code_output_requested",
+    "_completeness_repair_query",
+    "_contains_ordered_phrase",
+    "_conversation_context_subject",
+    "_conversation_resolution_needed",
+    "_conversation_subject",
+    "_deterministic_code_inventory_answer",
+    "_deterministic_code_location_answer",
+    "_deterministic_conversation_rewrite",
+    "_deterministic_delivery_answer",
+    "_deterministic_feature_inventory_answer",
+    "_deterministic_identifier_answer",
+    "_document_satisfies_requirement",
+    "_document_source_type",
+    "_edit_distance_at_most_one",
+    "_entity_overview_entity",
+    "_entity_overview_source_ids",
+    "_exact_feature_source_ids",
+    "_exact_feature_title_match",
+    "_exact_term_ratio",
+    "_exact_terms",
+    "_expand_candidate_neighbors",
+    "_feature_inventory_answer_verified",
+    "_feature_inventory_entity",
+    "_feature_name_from_title",
+    "_feature_title_anchor",
+    "_identifiers",
+    "_identifier_components",
+    "_implementation_evidence_order",
+    "_include_repair_evidence",
+    "_intent_source_scope",
+    "_inventory_documents",
+    "_jira_identifiers",
+    "_low_information_project_document",
+    "_material_sentence_count",
+    "_merge_ranked_documents",
+    "_missing_answer_requirements",
+    "_missing_evidence_requirements",
+    "_multi_part_question",
+    "_normalize_citations",
+    "_normalized_identifier",
+    "_normalized_sentence",
+    "_normalized_words",
+    "_overview_repair_kwargs",
+    "_overview_style_repair_needed",
+    "_project_overview_evidence_order",
+    "_project_overview_requested",
+    "_project_overview_topic",
+    "_remove_unsupported_claims",
+    "_required_evidence_source_types",
+    "_safe_conversation_rewrite",
+    "_safe_query_variant",
+    "_singular_key",
+    "_source_authority_valid",
+    "_source_diverse_order",
+    "_source_identity",
+    "_source_route_intent",
+    "_source_type_count",
+    "_stream_progress",
+    "_text_satisfies_identifier_requirement",
+    "clarification_response",
+    "apply_output_gate",
+    "detect_query_language",
+]
+
+
+class AuthorizedRagWorkflow(
+    WorkflowResponseMixin,
+    EvaluationWorkflowMixin,
+    ProviderNodesMixin,
+    PlanningNodesMixin,
+    RetrievalNodesMixin,
+    AnswerNodesMixin,
+):
     """Bounded graph whose authorization inputs are immutable and never LLM-generated."""
+
     def __init__(self, settings: Settings, request: RagRequest) -> None:
         if request.retrieval_profile is not None:
             settings = settings.model_copy(update=request.retrieval_profile.settings_overrides())
@@ -140,9 +234,12 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
         request = request.model_copy(update={"access_policy_ids": list(policies)})
         self._request = request
         if request.collection_name not in (
-            settings.chroma_collection, *settings.additional_chroma_collections
+            settings.chroma_collection,
+            *settings.additional_chroma_collections,
         ):
-            raise ValueError("The project collection does not match the configured Chroma collection.")
+            raise ValueError(
+                "The project collection does not match the configured Chroma collection."
+            )
         self._retriever = ChromaAccessRetriever.create(
             chroma_host=settings.chroma_host,
             chroma_port=settings.chroma_port,
@@ -188,17 +285,20 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
         )
         if deterministic is not None:
             return deterministic
-        clarification = clarification_response(
+        clarification = await clarification_response_with_canonical_index(
             self._request,
             self._vocabulary.entities,
             getattr(self._vocabulary, "source_types", ()),
+            getattr(self, "_retriever", None),
         )
         if clarification is not None:
             return clarification
         state = await invoke_bounded_graph(
-            self._graph, {"request": self._request, "_workflow": self},
+            self._graph,
+            {"request": self._request, "_workflow": self},
             project_id=self._request.project_id,
-            max_retrieval_attempts=self._settings.max_retrieval_attempts, began=began,
+            max_retrieval_attempts=self._settings.max_retrieval_attempts,
+            began=began,
         )
         return await self._response_from_state(state, began)
 
@@ -223,10 +323,11 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
                 "response": deterministic.model_dump(by_alias=True),
             }
             return
-        clarification = clarification_response(
+        clarification = await clarification_response_with_canonical_index(
             self._request,
             self._vocabulary.entities,
             getattr(self._vocabulary, "source_types", ()),
+            getattr(self, "_retriever", None),
         )
         if clarification is not None:
             async for event in verified_answer_events(clarification.answer):
@@ -245,206 +346,3 @@ class AuthorizedRagWorkflow(EvaluationWorkflowMixin, ProviderNodesMixin, Plannin
             "type": "complete",
             "response": response.model_dump(by_alias=True),
         }
-
-    async def _response_from_state(self, state: RagState, began: float) -> RagResponse:
-        """Convert final graph state into an audited public response."""
-        provider_response = state.get("provider_response")
-        if provider_response is not None:
-            request_complete(
-                began=began,
-                outcome="ANSWERED" if provider_response.status == "ANSWERED" else "NO_ANSWER",
-                confidence=provider_response.confidence,
-                model_profile=self._request.model_profile,
-                language=resolve_response_language(self._request.question, default=self._settings.default_response_language),
-                reason_code=provider_response.failure_reason or provider_response.resolved_intent,
-            )
-            return provider_response
-        documents = state.get("documents", [])
-        from app.quality_tracing import record_selected_evidence
-
-        record_selected_evidence(documents, self._settings)
-        generated = state.get("generated")
-        resolved = resolved_request_for_state(
-            state, self._request, self._vocabulary.entities
-        )
-        apply_output_gate(state, self._request, resolved, generated)
-        generated = state.get("generated")
-        if not documents or generated is None or state.get("grounded") is False:
-            language = state.get("language") or resolve_response_language(self._request.question, default=self._settings.default_response_language)
-            refusal_began = started()
-            refusal = insufficient_evidence_answer(language)
-            reason_code = "STATIC_FALLBACK"
-            usage = TokenUsage()
-            model_provider = "none"
-            model_name = "none"
-            unverified = bool(documents) and state.get("grounded") is False and not {state.get("grounding_reason"), state.get("context_quality")} & {"INCOMPLETE_EVIDENCE", "INSUFFICIENT"}
-            population_miss = bool(state.get("coverage_expected")) and bool(
-                state.get("population_retrieval_miss")
-            )
-            gate_reason = str(state.get("grounding_reason") or "") if state.get("output_gate_applied") else ""
-            generated_refusal_reason = generated.refusal_reason if generated is not None and generated.outcome == "REFUSAL" else None
-            refusal_reason = (
-                "ENTITY_MISMATCH"
-                if state.get("entity_mismatch_requested")
-                else generated_refusal_reason
-                if generated_refusal_reason
-                else gate_reason
-                if gate_reason in {
-                    "UNRESOLVED_SOURCE_CONFLICT",
-                    "SOURCE_SCOPE_VIOLATION",
-                    "PERMISSIONS_NOT_SATISFIED",
-                    "FRESHNESS_NOT_VERIFIABLE",
-                    "REQUESTED_COVERAGE_INCOMPLETE",
-                    "UNSUPPORTED_CLAIM",
-                    "INVALID_DERIVATION", "INSUFFICIENT_ANSWER_SUBSTANCE",
-                }
-                else "POPULATION_RETRIEVAL_MISS"
-                if population_miss
-                else "UNVERIFIED_EVIDENCE"
-                if unverified
-                else "INSUFFICIENT_EVIDENCE"
-            )
-            refusal = query_aware_refusal_answer(self._request.question, refusal_reason, language)
-            if refusal_reason == "ENTITY_MISMATCH":
-                requested = str(state.get("entity_mismatch_requested") or "")
-                suggested = str(state.get("entity_mismatch_suggested") or "")
-                refusal = (
-                    f"¿Quisiste decir {suggested} en lugar de {requested}?"
-                    if language == "es"
-                    else f"Did you mean {suggested} rather than {requested}?"
-                )
-                reason_code = "ENTITY_MISMATCH"
-            try:
-                if refusal_reason == "ENTITY_MISMATCH":
-                    raise ValueError("deterministic clarification")
-                if self._settings.generated_refusals_enabled:
-                    responder = LangChainSafeResponseGenerator(self._settings, self._request.model_profile)
-                    refusal = await responder.generate(self._request.question, language, refusal_reason)
-                    usage = responder.last_usage
-                    model_provider = self._settings.llm_provider
-                    model_name = responder.model_name
-                    reason_code = f"GENERATED_{refusal_reason}"
-                else:
-                    refusal, reason_code = refusal_answer(refusal_reason, language), f"TEMPLATED_{refusal_reason}"
-            except Exception:
-                pass
-            stage_complete(
-                "generate_safe_response",
-                self._request.project_id,
-                refusal_began,
-                input_count=len(documents),
-                output_count=1,
-                reason_code=reason_code,
-                model_provider=model_provider,
-                model_name=model_name,
-                model_profile=self._request.model_profile,
-                language=language,
-                **usage.model_dump(),
-            )
-            # When material was retrieved and only verification failed, naming the
-            # pages that were read turns a dead end into a place to look.
-            unverified_sources = (
-                [
-                    SourceReference(
-                        type=str(document.metadata.get("source_type") or "DOCUMENT"),
-                        title=str(document.metadata.get("title") or "Untitled source"),
-                        reference=str(document.metadata.get("reference") or ""),
-                        url=str(document.metadata.get("source_url") or "") or None,
-                        locator=str(document.metadata.get("locator") or "") or None,
-                        language=str(document.metadata.get("language") or "") or None,
-                    )
-                    for document in _dedupe_source_documents(documents[:3])
-                ]
-                if unverified
-                and refusal_reason
-                not in {"PERMISSIONS_NOT_SATISFIED", "SOURCE_SCOPE_VIOLATION"}
-                else []
-            )
-            response = RagResponse(
-                status=(
-                    "NEEDS_CLARIFICATION"
-                    if refusal_reason == "ENTITY_MISMATCH"
-                    else "SOURCE_CONFLICT"
-                    if refusal_reason == "UNRESOLVED_SOURCE_CONFLICT"
-                    else "ACCESS_DENIED"
-                    if refusal_reason == "PERMISSIONS_NOT_SATISFIED"
-                    else "INSUFFICIENT_EVIDENCE"
-                ),
-                answer=refusal,
-                confidence="NONE",
-                project_id=self._request.project_id,
-                sources=unverified_sources,
-                missing_information=[],
-                evidence_status="UNVERIFIED" if unverified else "INSUFFICIENT",
-                context_quality=state.get("context_quality", "INSUFFICIENT"),
-                context_relevance=float(state.get("context_relevance", 0.0)),
-                context_completeness=float(state.get("context_completeness", 0.0)),
-                degradation=_degradation_reasons(state, unverified=unverified),
-                refusal_reason=refusal_reason,
-                conversation_context_update=None,
-                failureReason=refusal_reason,
-                resolvedIntent=resolved.intent,
-                resolvedEntities=resolved.referenced_entities,
-                coverage="PARTIAL" if documents else "NOT_APPLICABLE",
-            )
-            request_complete(
-                began=began,
-                outcome="NO_ANSWER",
-                confidence="NONE",
-                model_profile=self._request.model_profile,
-                language=language,
-                reason_code=refusal_reason,
-            )
-            return response
-        score = _highest_rerank_score(documents)
-        cited_documents = _dedupe_source_documents(
-            [
-                documents[index - 1]
-                for index in dict.fromkeys(generated.citations)
-                if 1 <= index <= len(documents)
-            ]
-        )
-        response = RagResponse(
-            status="ANSWERED",
-            answer=_answer_without_source_markers(generated.answer),
-            confidence="HIGH" if score >= 0.7 else "MEDIUM",
-            project_id=self._request.project_id,
-            sources=[
-                SourceReference(
-                    type=str(document.metadata.get("source_type") or "DOCUMENT"),
-                    title=str(document.metadata.get("title") or "Untitled source"),
-                    reference=str(document.metadata.get("reference") or ""),
-                    url=str(document.metadata.get("source_url") or "") or None,
-                    locator=str(document.metadata.get("locator") or "") or None,
-                    language=str(document.metadata.get("language") or "") or None,
-                )
-                for document in cited_documents
-            ],
-            missing_information=generated.missing_information,
-            evidence_status="SUFFICIENT",
-            context_quality=state.get("context_quality", "SUFFICIENT"),
-            degradation=_degradation_reasons(state),
-            context_relevance=float(state.get("context_relevance", score)),
-            context_completeness=float(state.get("context_completeness", 1.0)),
-            conversation_context_update=self._conversation_context_update(state),
-            failureReason=None,
-            resolvedIntent=resolved.intent,
-            resolvedEntities=resolved.referenced_entities,
-            coverage="PARTIAL" if state.get("coverage_partial") or generated.missing_information else "COMPLETE",
-        )
-        request_complete(
-            began=began,
-            outcome="ANSWERED",
-            confidence=response.confidence,
-            model_profile=self._request.model_profile,
-            language=state.get("language", "mixed"),
-        )
-        return response
-
-    def _conversation_context_update(self, state: RagState) -> ConversationContextUpdate:
-        """Return bounded semantic memory without promoting chat text to evidence."""
-
-        return build_conversation_context_update(
-            self._request, state,
-            tuple(getattr(getattr(self, "_vocabulary", None), "entities", ()) or ()),
-        )

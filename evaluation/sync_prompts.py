@@ -25,7 +25,11 @@ def prompt_templates(path: Path) -> Iterator[tuple[str, str]]:
                 continue
             if child.func.attr != "from_messages":
                 continue
-            strings = [value.value for value in ast.walk(child) if isinstance(value, ast.Constant) and isinstance(value.value, str)]
+            strings = [
+                value.value
+                for value in ast.walk(child)
+                if isinstance(value, ast.Constant) and isinstance(value.value, str)
+            ]
             if not strings:
                 continue
             ordinal += 1
@@ -39,13 +43,25 @@ def main() -> None:
     parser.add_argument("--tag", choices=("candidate", "staging", "production"), required=True)
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--model-provider", default="OLLAMA")
-    parser.add_argument("--phoenix-url", default=os.getenv("PI_RAG_PHOENIX_URL", "http://127.0.0.1:6006"))
+    parser.add_argument(
+        "--phoenix-url", default=os.getenv("PI_RAG_PHOENIX_URL", "http://127.0.0.1:6006")
+    )
     parser.add_argument("--api-key", default=os.getenv("PI_RAG_PHOENIX_API_KEY", ""))
     args = parser.parse_args()
     sha = git_sha(args.source.resolve().parent.parent)
     client = PhoenixClient(args.phoenix_url, args.api_key)
     for name, template in prompt_templates(args.source):
-        client.create_prompt(prompt_payload(name=name, template=template, owner=args.owner, sha=sha, tag=args.tag, model_name=args.model_name, model_provider=args.model_provider))
+        client.create_prompt(
+            prompt_payload(
+                name=name,
+                template=template,
+                owner=args.owner,
+                sha=sha,
+                tag=args.tag,
+                model_name=args.model_name,
+                model_provider=args.model_provider,
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -36,12 +36,10 @@ def _catalog_artifact(
     if not products:
         return None
     releases = {
-        str(document.metadata.get("catalog_release_id") or "")
-        for document in products.values()
+        str(document.metadata.get("catalog_release_id") or "") for document in products.values()
     }
     counts = {
-        int(document.metadata.get("catalog_item_count") or 0)
-        for document in products.values()
+        int(document.metadata.get("catalog_item_count") or 0) for document in products.values()
     }
     hashes = {
         str(document.metadata.get("source_content_hash") or "").lower()
@@ -110,9 +108,7 @@ def catalog_response_fields(
     fallback_answer: str,
     catalog_releases_enabled: bool = False,
 ) -> tuple[str, list[ArtifactReference]]:
-    catalog = _catalog_artifact(
-        project_id, question, documents, enabled=catalog_releases_enabled
-    )
+    catalog = _catalog_artifact(project_id, question, documents, enabled=catalog_releases_enabled)
     if catalog is None:
         return fallback_answer, []
     artifact, totals, release_id = catalog
@@ -132,9 +128,7 @@ async def deterministic_catalog_response(
 ) -> RagResponse | None:
     """Bypass model generation for exhaustive product-catalog requests."""
 
-    if not _complete_product_catalog_requested(
-        request.catalog_releases_enabled, request.question
-    ):
+    if not _complete_product_catalog_requested(request.catalog_releases_enabled, request.question):
         return None
     loader = getattr(retriever, "ainvoke_population", None)
     documents = await loader("product", (), ()) if loader is not None else []
@@ -144,7 +138,11 @@ async def deterministic_catalog_response(
         documents,
         enabled=request.catalog_releases_enabled,
     )
-    language = "es" if re.search(r"\b(?:cu[aá]les|productos|cat[aá]logo)\b", request.question.casefold()) else "en"
+    language = (
+        "es"
+        if re.search(r"\b(?:cu[aá]les|productos|cat[aá]logo)\b", request.question.casefold())
+        else "en"
+    )
     if catalog is None:
         answer = (
             "No hay una versión aprobada y completa del catálogo disponible para descargar."

@@ -1,6 +1,6 @@
 {
   "projectId": "T3B-COMPANY",
-  "schemaVersion": "4",
+  "schemaVersion": "3",
   "terminologyAuthority": "es",
   "sharedPolicy": "project:T3B-COMPANY",
   "departments": [

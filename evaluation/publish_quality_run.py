@@ -50,17 +50,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--otlp-endpoint",
-        default=os.getenv(
-            "PI_RAG_OPENINFERENCE_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces"
-        ),
+        default=os.getenv("PI_RAG_OPENINFERENCE_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces"),
     )
     args = parser.parse_args()
 
     if args.status == "failed" and not args.failed_stage:
         parser.error("--failed-stage is required when --status failed")
-    if args.status == "completed" and (
-        args.retrieval is None or args.answer_generation is None
-    ):
+    if args.status == "completed" and (args.retrieval is None or args.answer_generation is None):
         parser.error("completed runs require --retrieval and --answer-generation")
 
     settings = get_settings().model_copy(
@@ -103,9 +99,7 @@ def main() -> None:
     if not isinstance(answer_scores, dict):
         raise ValueError("answer-generation result has no scores object")
     retrieval_scores = retrieval_dashboard_scores(retrieval)
-    normalized_answer_scores = {
-        str(name): float(value) for name, value in answer_scores.items()
-    }
+    normalized_answer_scores = {str(name): float(value) for name, value in answer_scores.items()}
     if args.previous_retrieval and args.previous_retrieval.exists():
         previous = retrieval_dashboard_scores(_read(args.previous_retrieval))
         retrieval_scores.update(
@@ -143,15 +137,9 @@ def main() -> None:
         "retrieval_sample_count_es": int(
             (retrieval.get("by_query_language", {}) or {}).get("es", {}).get("cases", 0)
         ),
-        "answer_sample_count_en": int(
-            (answer.get("sample_counts", {}) or {}).get("en", 0)
-        ),
-        "answer_sample_count_es": int(
-            (answer.get("sample_counts", {}) or {}).get("es", 0)
-        ),
-        "generation_diagnostic_sample_count": int(
-            (generation_diagnostics or {}).get("cases", 0)
-        ),
+        "answer_sample_count_en": int((answer.get("sample_counts", {}) or {}).get("en", 0)),
+        "answer_sample_count_es": int((answer.get("sample_counts", {}) or {}).get("es", 0)),
+        "generation_diagnostic_sample_count": int((generation_diagnostics or {}).get("cases", 0)),
     }
     try:
         tracer = provider.get_tracer("project-intelligence-quality")
@@ -170,9 +158,7 @@ def main() -> None:
                 "rag.quality.retrieval",
                 attributes={"quality.section": "retrieval", "auth.boundary": boundary},
             ) as retrieval_span:
-                retrieval_span_id = format(
-                    retrieval_span.get_span_context().span_id, "016x"
-                )
+                retrieval_span_id = format(retrieval_span.get_span_context().span_id, "016x")
             with tracer.start_as_current_span(
                 "rag.quality.answer_generation",
                 attributes={"quality.section": "answer_generation", "auth.boundary": boundary},
@@ -207,9 +193,7 @@ def main() -> None:
                 section="answer_generation",
                 annotator_kind="CODE",
                 metadata=common_metadata,
-                sample_counts=generation_dashboard_sample_counts(
-                    generation_diagnostics
-                ),
+                sample_counts=generation_dashboard_sample_counts(generation_diagnostics),
             )
     finally:
         provider.shutdown()

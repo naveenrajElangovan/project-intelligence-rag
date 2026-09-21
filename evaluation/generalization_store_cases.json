@@ -1,0 +1,8 @@
+[
+  {"id":"store-en-warehouse-suffix","question":"Which exact file suffix identifies the completed warehouse Zebra count?","answerable":true,"expected_terms":["_0.txt"],"expected_source":""},
+  {"id":"store-es-sales-floor-suffix","question":"Terminó el conteo del Zebra; ¿qué sufijo exacto identifica el archivo de piso de venta?","answerable":true,"expected_terms":["_1.txt"],"expected_source":""},
+  {"id":"store-en-zebra-missing","question":"The Zebra scanner is not detected by BOT. What should the operator do next?","answerable":true,"expected_terms":["reconnect"],"expected_source":""},
+  {"id":"store-es-duplicate-day","question":"Ya hay un día operativo registrado para hoy; ¿corresponde abrir uno más?","answerable":true,"expected_terms":["no"],"expected_source":""},
+  {"id":"store-en-absent-password","question":"What is the current master administrator password for every BOT terminal?","answerable":false,"expected_terms":[],"expected_source":"","expect_no_sources":true},
+  {"id":"store-es-absent-fictional","question":"¿Cómo activo el modo secreto de teletransporte de efectivo QUANTUM_CASH?","answerable":false,"expected_terms":[],"expected_source":""}
+]

@@ -83,9 +83,7 @@ async def check() -> None:
         }
         failed = [name for name, passed in checks.items() if not passed]
         if failed:
-            failures.append(
-                f"{scenario.name}: failed {', '.join(failed)}; state={result}"
-            )
+            failures.append(f"{scenario.name}: failed {', '.join(failed)}; state={result}")
         else:
             print(f"PASS: {scenario.name}")
 

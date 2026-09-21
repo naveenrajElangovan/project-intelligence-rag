@@ -1,11 +1,13 @@
 import asyncio
 import json
+import logging
 import math
 import re
 import threading
 import time
 import httpx
 from collections import OrderedDict
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +29,9 @@ from app.telemetry import (
     retrieval_fallback,
 )
 from app.vocabulary import CorpusVocabulary, VOCABULARY_RECORD_KIND
+
+
+LOGGER = logging.getLogger("project_intelligence.rag.retrieval")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,17 +85,21 @@ _VOCABULARY_CACHE: OrderedDict[tuple[object, ...], _CachedVocabulary] = OrderedD
 _VOCABULARY_CACHE_LOCK = threading.Lock()
 
 
+def _int_field(value: object) -> int:
+    """Convert scalar index metadata to an integer without accepting containers."""
+    return int(value) if isinstance(value, (bool, int, float, str)) else 0
+
+
 def _authorized_policy_filter(
     access_policy_ids: tuple[str, ...],
 ) -> dict[str, object]:
     policies = tuple(dict.fromkeys(value for value in access_policy_ids if value))
     if not policies:
         raise PermissionError("At least one authorized access policy is required.")
-    return {
-        "access_policy_id": (
-            {"$eq": policies[0]} if len(policies) == 1 else {"$in": list(policies)}
-        )
-    }
+    policy_match: dict[str, object] = (
+        {"$eq": policies[0]} if len(policies) == 1 else {"$in": list(policies)}
+    )
+    return {"access_policy_id": policy_match}
 
 
 def document_visible_policies(
@@ -283,15 +292,101 @@ class ChromaAccessRetriever(BaseRetriever):
 
     def _search(self, query: str, source_types: tuple[str, ...]) -> list[Document]:
         vector = self.embedder.embed_query(query)
-        return self._search_with_vector(vector, source_types)
+        return self._search_source_families_with_vector(vector, source_types)
+
+    def _source_families(self, source_types: tuple[str, ...]) -> tuple[str, ...]:
+        """Return explicit or corpus-declared source families for fair retrieval.
+
+        A mixed vector query has one finite top-k window. Without separate family
+        windows, adding a large CODE corpus can evict every PAGE, ISSUE, or future
+        source type before fusion and reranking can assess it. The vocabulary is
+        ingestion-owned and dynamic, so this remains provider and repository
+        neutral as the corpus grows.
+        """
+
+        explicit = tuple(
+            dict.fromkeys(value.strip().upper() for value in source_types if value.strip())
+        )
+        if explicit:
+            return explicit
+        return tuple(dict.fromkeys(self.corpus_vocabulary().source_types))
+
+    @staticmethod
+    def _interleave_source_families(
+        groups: Sequence[Sequence[Document]], *, limit: int
+    ) -> list[Document]:
+        """Merge already-ranked family windows without giving corpus size a vote."""
+
+        if limit <= 0:
+            return []
+        materialized = [list(group) for group in groups if group]
+        if len(materialized) <= 1:
+            return materialized[0][:limit] if materialized else []
+        selected: list[Document] = []
+        depth = 0
+        while len(selected) < limit:
+            added = False
+            for group in materialized:
+                if depth < len(group):
+                    selected.append(group[depth])
+                    added = True
+                    if len(selected) == limit:
+                        break
+            if not added:
+                break
+            depth += 1
+        return selected
+
+    def _search_source_families_with_vector(
+        self, vector: list[float], source_types: tuple[str, ...]
+    ) -> list[Document]:
+        families = self._source_families(source_types)
+        if len(families) <= 1:
+            return self._search_with_vector(vector, families or source_types)
+        # Start with one over-fetched mixed query. Querying every family
+        # separately made a growing corpus multiply provider work and, after a
+        # timeout, left orphaned filtered searches blocking Chroma's one local
+        # process. A family below the guaranteed floor receives one supplemental
+        # filtered read; well-represented families need no extra provider work.
+        mixed = self._search_with_vector(
+            vector,
+            (),
+            result_limit=self.top_k,
+        )
+        grouped = {family: [] for family in families}
+        for document in mixed:
+            family = str(document.metadata.get("source_type") or "").upper()
+            if family in grouped and len(grouped[family]) < self.top_k:
+                grouped[family].append(document)
+        family_floor = 1
+        for family in families:
+            if len(grouped[family]) < family_floor:
+                grouped[family] = self._search_with_vector(
+                    vector,
+                    (family,),
+                    result_limit=self.top_k,
+                )
+        groups = [grouped[family] for family in families]
+        for group in groups:
+            for rank, document in enumerate(group, start=1):
+                document.metadata["dense_family_rank"] = rank
+        # `top_k` is the window per family, not a global window that the largest
+        # family can monopolize. Downstream fusion and the cross-encoder retain
+        # their existing 50/16 bounds.
+        return self._interleave_source_families(
+            groups,
+            limit=self.top_k * len(groups),
+        )
 
     def _search_with_vector(
         self,
         vector: list[float],
         source_types: tuple[str, ...],
         providers: tuple[str, ...] = (),
+        *,
+        result_limit: int | None = None,
     ) -> list[Document]:
-        filters: list[dict[str, dict[str, str | list[str]]]] = [
+        filters: list[dict[str, object]] = [
             {"project_id": {"$eq": self.project_id}},
             _authorized_policy_filter(self.access_policy_ids),
             # The vocabulary record is control metadata, not evidence. Filtering
@@ -318,8 +413,12 @@ class ChromaAccessRetriever(BaseRetriever):
                 if len(normalized_providers) == 1
                 else {"provider": {"$in": list(normalized_providers)}}
             )
-        metadata_filter = {"$and": filters}
-        hits = self._search_local_vector(vector, metadata_filter)
+        metadata_filter: dict[str, object] = {"$and": filters}
+        hits = self._search_local_vector(
+            vector,
+            metadata_filter,
+            result_limit=result_limit,
+        )
         documents: list[Document] = []
         drops: dict[str, int] = {}
         for chunk_id, score, hit_fields in hits:
@@ -341,13 +440,17 @@ class ChromaAccessRetriever(BaseRetriever):
         return documents
 
     def _search_local_vector(
-        self, vector: list[float], metadata_filter: dict[str, object]
+        self,
+        vector: list[float],
+        metadata_filter: dict[str, object],
+        *,
+        result_limit: int | None = None,
     ) -> list[tuple[str, float, dict[str, object]]]:
         """Query Chroma with a precomputed local vector."""
 
         response = self.index.query(
             query_embeddings=[vector],
-            n_results=self.top_k,
+            n_results=result_limit or self.top_k,
             where=metadata_filter,
             include=["documents", "metadatas", "distances"],
         )
@@ -363,7 +466,10 @@ class ChromaAccessRetriever(BaseRetriever):
             fields = dict(metadata or {})
             fields[self.text_field] = text or ""
             hits.append((str(chunk_id), max(0.0, 1.0 - float(distance or 0.0)), fields))
-        return hits
+        # HNSW may return equal-distance neighbors in a different order between
+        # identical reads. Rank fusion consumes this order, so stabilize ties at
+        # the vector boundary before rank-derived scores are assigned.
+        return sorted(hits, key=lambda item: (-item[1], item[0]))
 
     def _record_usage(self, usage: object, *, embedded_locally: bool) -> None:
         if not isinstance(usage, dict):
@@ -451,7 +557,7 @@ class ChromaAccessRetriever(BaseRetriever):
                 "field_path": str(fields.get("field_path") or ""),
                 "source_span": str(fields.get("source_span") or ""),
                 "normalized_value": str(fields.get("normalized_value") or ""),
-                "authority": int(fields.get("authority") or 0),
+                "authority": _int_field(fields.get("authority")),
                 "observed_at": str(fields.get("observed_at") or ""),
                 "embedding_model": str(fields.get("embedding_model") or ""),
                 "visual_eligible": bool(fields.get("visual_eligible", False)),
@@ -459,10 +565,10 @@ class ChromaAccessRetriever(BaseRetriever):
                 "visual_asset_ids": _list_field(fields.get("visual_asset_ids")),
                 "visual_asset_types": _list_field(fields.get("visual_asset_types")),
                 "visual_asset_captions": _list_field(fields.get("visual_asset_captions")),
-                "page_number": int(fields.get("page_number") or 0) or None,
+                "page_number": _int_field(fields.get("page_number")) or None,
                 "caption": " ".join(str(value) for value in _list_field(fields.get("captions"))),
                 "chunk_id": str(fields.get("canonical_chunk_id") or chunk_id),
-                "chunk_ordinal": int(fields.get("chunk_ordinal") or 0),
+                "chunk_ordinal": _int_field(fields.get("chunk_ordinal")),
                 "parent_id": str(fields.get("parent_id") or fields.get("source_id") or ""),
                 "content_hash": str(fields.get("content_hash") or ""),
                 "structure_path": _list_field(fields.get("structure_path")),
@@ -479,8 +585,8 @@ class ChromaAccessRetriever(BaseRetriever):
                 "important_kwd": _list_field(fields.get("important_kwd")),
                 "project_key": str(fields.get("project_key") or ""),
                 "chunk_kind": str(fields.get("chunk_kind") or ""),
-                "chunk_char_count": int(fields.get("chunk_char_count") or 0),
-                "chunk_token_count": int(fields.get("chunk_token_count") or 0),
+                "chunk_char_count": _int_field(fields.get("chunk_char_count")),
+                "chunk_token_count": _int_field(fields.get("chunk_token_count")),
                 "issue_key": str(fields.get("issue_key") or ""),
                 **{
                     name: str(fields.get(name) or "")
@@ -519,10 +625,15 @@ class ChromaAccessRetriever(BaseRetriever):
                 "entity": str(fields.get("entity") or "").casefold(),
                 "entity_key": str(fields.get("entity_key") or ""),
                 "record_kind": str(fields.get("record_kind") or ""),
+                "chunk_profile": str(fields.get("chunk_profile") or ""),
+                "declaring_symbol": str(fields.get("declaring_symbol") or ""),
+                "field_name": str(fields.get("field_name") or ""),
+                "serialized_field": str(fields.get("serialized_field") or ""),
+                "field_type": str(fields.get("field_type") or ""),
                 "source_content_hash": str(fields.get("source_content_hash") or ""),
                 "product_sku": str(fields.get("product_sku") or ""),
                 "catalog_release_id": str(fields.get("catalog_release_id") or ""),
-                "catalog_item_count": int(fields.get("catalog_item_count") or 0),
+                "catalog_item_count": _int_field(fields.get("catalog_item_count")),
                 "catalog_category_totals": fields.get("catalog_category_totals") or {},
                 "category_code": str(fields.get("category_code") or ""),
             },
@@ -561,7 +672,18 @@ class ChromaAccessRetriever(BaseRetriever):
                 CorpusVocabulary.from_record(dict(metadata or {}), str(document or ""))
                 for document, metadata in zip(documents, metadatas, strict=True)
             )
-        except Exception:
+        except Exception as error:
+            # Vocabulary expansion is optional, but losing it affects bilingual
+            # planning and must remain observable instead of looking like a
+            # legitimately empty corpus vocabulary.
+            LOGGER.warning(
+                "corpus_vocabulary_load_failed",
+                extra={
+                    "project_id": self.project_id,
+                    "collection_name": self.collection_name,
+                    "error_type": type(error).__name__,
+                },
+            )
             vocabulary = CorpusVocabulary()
         expires_at = now + self.vocabulary_cache_ttl_seconds
         with _VOCABULARY_CACHE_LOCK:
@@ -592,7 +714,9 @@ class ChromaAccessRetriever(BaseRetriever):
             # accepts: no bound that leaves an orphan burning the GPU.
             vector = await asyncio.to_thread(self.embedder.embed_query, query)
             documents, retry_count = await with_transient_retry(
-                lambda: asyncio.to_thread(self._search_with_vector, vector, source_types),
+                lambda: asyncio.to_thread(
+                    self._search_source_families_with_vector, vector, source_types
+                ),
                 attempts=self.retry_attempts,
                 timeout_seconds=self.timeout_seconds,
             )
@@ -615,6 +739,85 @@ class ChromaAccessRetriever(BaseRetriever):
                 retry_count = 0
             else:
                 raise
+        with self._usage_lock:
+            self._retry_total += retry_count
+        for document in documents:
+            document.metadata["retrieval_retry_count"] = retry_count
+        return documents
+
+    async def ainvoke_scoped_many(
+        self, requests: tuple[tuple[str, tuple[str, ...]], ...]
+    ) -> list[list[Document]]:
+        """Embed planned query variants in one forward pass, then search concurrently."""
+
+        if not requests:
+            return []
+        try:
+            vectors = await asyncio.to_thread(
+                self.embedder.embed_queries,
+                [query for query, _source_types in requests],
+            )
+        except (AttributeError, NotImplementedError):
+            return list(
+                await asyncio.gather(
+                    *(self.ainvoke_scoped(query, source_types) for query, source_types in requests)
+                )
+            )
+        return list(
+            await asyncio.gather(
+                *(
+                    self._ainvoke_precomputed(query, vector, source_types)
+                    for (query, source_types), vector in zip(requests, vectors, strict=True)
+                )
+            )
+        )
+
+    async def _ainvoke_precomputed(
+        self,
+        query: str,
+        vector: list[float],
+        source_types: tuple[str, ...],
+        providers: tuple[str, ...] = (),
+    ) -> list[Document]:
+        try:
+            documents, retry_count = await with_transient_retry(
+                lambda: asyncio.to_thread(
+                    self._search_with_vector,
+                    vector,
+                    source_types,
+                    providers,
+                ),
+                attempts=self.retry_attempts,
+                timeout_seconds=self.timeout_seconds,
+            )
+        except Exception as error:
+            failure = classify_retrieval_failure(error)
+            retrieval_failure(
+                project_id=self.project_id,
+                provider="chroma",
+                failure_code=failure.code,
+                status_code=failure.status_code,
+                retryable=failure.retryable,
+                configured_attempts=self.retry_attempts,
+                model_name=self.required_embedding_model or "unknown",
+                source_scope=(",".join(providers) + ":" if providers else "")
+                + (",".join(source_types) or "MIXED"),
+            )
+            if not self.lexical_fallback_enabled:
+                raise
+            fallback = await asyncio.to_thread(
+                self._lexical_fallback,
+                query,
+                source_types,
+                failure.code,
+            )
+            documents = [
+                document
+                for document in fallback
+                if not providers
+                or str(document.metadata.get("provider") or "").upper() in providers
+            ]
+            retry_count = 0
         with self._usage_lock:
             self._retry_total += retry_count
         for document in documents:
@@ -685,10 +888,59 @@ class ChromaAccessRetriever(BaseRetriever):
             )
         )
 
+    async def ainvoke_federated_many(
+        self,
+        queries: tuple[str, ...],
+        provider_scopes: tuple[tuple[str, tuple[str, ...]], ...],
+    ) -> list[list[list[Document]]]:
+        """Batch all query embeddings while retaining a window for each provider."""
+
+        if not queries:
+            return []
+        try:
+            vectors = await asyncio.to_thread(self.embedder.embed_queries, list(queries))
+        except (AttributeError, NotImplementedError):
+            return list(
+                await asyncio.gather(
+                    *(self.ainvoke_federated(query, provider_scopes) for query in queries)
+                )
+            )
+
+        async def retrieve_query(query: str, vector: list[float]) -> list[list[Document]]:
+            return list(
+                await asyncio.gather(
+                    *(
+                        self._ainvoke_precomputed(
+                            query,
+                            vector,
+                            source_types,
+                            (provider,),
+                        )
+                        for provider, source_types in provider_scopes
+                    )
+                )
+            )
+
+        return list(
+            await asyncio.gather(
+                *(
+                    retrieve_query(query, vector)
+                    for query, vector in zip(queries, vectors, strict=True)
+                )
+            )
+        )
+
     async def ainvoke_exact_identifiers(
         self, identifiers: tuple[str, ...], source_types: tuple[str, ...] = ()
     ) -> list[Document]:
         return await asyncio.to_thread(self._exact_identifier_documents, identifiers, source_types)
+
+    async def ainvoke_entity_fields(
+        self, identifiers: tuple[str, ...], source_types: tuple[str, ...] = ()
+    ) -> list[Document]:
+        """Load every authorized structured field record for an exact entity."""
+
+        return await asyncio.to_thread(self._entity_field_documents, identifiers, source_types)
 
     async def ainvoke_jira_sections(self, question: str) -> list[Document]:
         return await asyncio.to_thread(self._jira_section_documents, question)
@@ -714,7 +966,8 @@ class ChromaAccessRetriever(BaseRetriever):
         response = self.index.get(
             where={"$and": filters}, limit=64, include=["documents", "metadatas"]
         )
-        documents, drops = [], {}
+        documents: list[Document] = []
+        drops: dict[str, int] = {}
         for identity, text, metadata in zip(
             response.get("ids", []),
             response.get("documents", []),
@@ -729,12 +982,18 @@ class ChromaAccessRetriever(BaseRetriever):
         return documents
 
     async def ainvoke_structure_identifiers(
-        self, identifiers: tuple[str, ...], source_types: tuple[str, ...] = ()
+        self,
+        identifiers: tuple[str, ...],
+        source_types: tuple[str, ...] = (),
+        preferred_language: str = "",
     ) -> list[Document]:
         """Load authorized chunks whose section path contains an exact route ID."""
 
         return await asyncio.to_thread(
-            self._structure_identifier_documents, identifiers, source_types
+            self._structure_identifier_documents,
+            identifiers,
+            source_types,
+            preferred_language,
         )
 
     async def ainvoke_canonical_questions(
@@ -781,6 +1040,44 @@ class ChromaAccessRetriever(BaseRetriever):
         if not normalized_ids:
             return []
         return await asyncio.to_thread(self._source_sibling_documents, normalized_ids, source_types)
+
+    async def ainvoke_source_balanced(
+        self,
+        query: str,
+        source_ids: tuple[str, ...],
+        *,
+        per_source: int = 3,
+    ) -> list[Document]:
+        """Return a small semantic window inside each already-retrieved source.
+
+        Global top-k search balances source *families*, but a newly enlarged
+        family can still push the relevant section of a long page or file out
+        of the candidate window.  Reusing the query inside a bounded set of
+        sources gives each represented source the same opportunity without
+        admitting a source that the normal retrieval path did not find.
+        """
+
+        normalized_ids = tuple(
+            dict.fromkeys(value.strip() for value in source_ids if value.strip())
+        )
+        if not normalized_ids or per_source <= 0:
+            return []
+        vector = await asyncio.to_thread(self.embedder.embed_query, query)
+        documents, retry_count = await with_transient_retry(
+            lambda: asyncio.to_thread(
+                self._source_balanced_documents,
+                vector,
+                normalized_ids,
+                per_source,
+            ),
+            attempts=self.retry_attempts,
+            timeout_seconds=self.timeout_seconds,
+        )
+        with self._usage_lock:
+            self._retry_total += retry_count
+        for document in documents:
+            document.metadata["retrieval_retry_count"] = retry_count
+        return documents
 
     async def ainvoke_population(
         self,
@@ -847,6 +1144,39 @@ class ChromaAccessRetriever(BaseRetriever):
             ),
         )
 
+    def _source_balanced_documents(
+        self,
+        vector: list[float],
+        source_ids: tuple[str, ...],
+        per_source: int,
+    ) -> list[Document]:
+        documents: list[Document] = []
+        for source_id in source_ids:
+            metadata_filter: dict[str, object] = {
+                "$and": [
+                    {"project_id": {"$eq": self.project_id}},
+                    _authorized_policy_filter(self.access_policy_ids),
+                    {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
+                    {"source_id": {"$eq": source_id}},
+                ]
+            }
+            drops: dict[str, int] = {}
+            for rank, (chunk_id, score, fields) in enumerate(
+                self._search_local_vector(
+                    vector,
+                    metadata_filter,
+                    result_limit=per_source,
+                ),
+                start=1,
+            ):
+                document = self._document_from_fields(fields, chunk_id, score, drops)
+                if document is None:
+                    continue
+                document.metadata["source_dense_rank"] = rank
+                document.metadata["retrieval_channel"] = "source_balanced_dense"
+                documents.append(document)
+        return documents
+
     def _exact_identifier_documents(
         self, identifiers: tuple[str, ...], source_types: tuple[str, ...]
     ) -> list[Document]:
@@ -879,6 +1209,9 @@ class ChromaAccessRetriever(BaseRetriever):
                     "entity_key",
                     "issue_key",
                     "reference",
+                    "title",
+                    "file_name",
+                    "filename",
                 )
             ]
         }
@@ -923,8 +1256,58 @@ class ChromaAccessRetriever(BaseRetriever):
             reverse=True,
         )[:12]
 
-    def _structure_identifier_documents(
+    def _entity_field_documents(
         self, identifiers: tuple[str, ...], source_types: tuple[str, ...]
+    ) -> list[Document]:
+        if not identifiers:
+            return []
+        filters: list[dict[str, object]] = [
+            {"project_id": {"$eq": self.project_id}},
+            _authorized_policy_filter(self.access_policy_ids),
+            {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
+            {"chunk_profile": {"$eq": "data-class-field"}},
+            {"entity_key": {"$in": list(identifiers)}},
+        ]
+        normalized_types = tuple(
+            dict.fromkeys(value.strip().upper() for value in source_types if value.strip())
+        )
+        if normalized_types:
+            filters.append(
+                {"source_type": {"$eq": normalized_types[0]}}
+                if len(normalized_types) == 1
+                else {"source_type": {"$in": list(normalized_types)}}
+            )
+        response = self.index.get(
+            where={"$and": filters},
+            include=["documents", "metadatas"],
+        )
+        documents: list[Document] = []
+        drops: dict[str, int] = {}
+        for chunk_id, text, metadata in zip(
+            response.get("ids", []),
+            response.get("documents", []),
+            response.get("metadatas", []),
+            strict=True,
+        ):
+            fields = dict(metadata or {})
+            fields[self.text_field] = text or ""
+            document = self._document_from_fields(fields, str(chunk_id), 1.0, drops)
+            if document is not None:
+                document.metadata["identifier_anchor"] = True
+                documents.append(document)
+        return sorted(
+            documents,
+            key=lambda document: (
+                str(document.metadata.get("source_id") or ""),
+                int(document.metadata.get("chunk_ordinal") or 0),
+            ),
+        )
+
+    def _structure_identifier_documents(
+        self,
+        identifiers: tuple[str, ...],
+        source_types: tuple[str, ...],
+        preferred_language: str = "",
     ) -> list[Document]:
         """Resolve canonical index routes stored in chunk structure metadata.
 
@@ -968,8 +1351,11 @@ class ChromaAccessRetriever(BaseRetriever):
             document = self._document_from_fields(fields, str(chunk_id), 1.0, drops)
             if document is None:
                 continue
-            structure_path = " ".join(
-                str(value) for value in document.metadata.get("structure_path") or ()
+            raw_structure_path = document.metadata.get("structure_path") or ()
+            structure_path = (
+                raw_structure_path
+                if isinstance(raw_structure_path, str)
+                else " ".join(str(value) for value in raw_structure_path)
             ).upper()
             matched = [
                 identifier
@@ -983,15 +1369,47 @@ class ChromaAccessRetriever(BaseRetriever):
                 continue
             document.metadata["identifier_anchor"] = True
             document.metadata["canonical_route_anchor"] = True
+            document.metadata["canonical_route_identifiers"] = tuple(matched)
             document.metadata["identifier_anchor_score"] = max(
                 _identifier_anchor_score(identifier, document) for identifier in matched
             )
             found.append(document)
-        return sorted(
+        ranked = sorted(
             found,
-            key=lambda item: float(item.metadata.get("identifier_anchor_score") or 0),
+            key=lambda item: (
+                str(item.metadata.get("language") or "").casefold()
+                == preferred_language.casefold(),
+                float(item.metadata.get("identifier_anchor_score") or 0),
+            ),
             reverse=True,
-        )[:12]
+        )
+        selected: list[Document] = []
+        selected_ids: set[str] = set()
+        # Chroma may return several chunks for an early section. Cover every
+        # declared route ID once before duplicates consume the bounded window.
+        for identifier in identifiers:
+            for document in ranked:
+                identity = str(document.metadata.get("chunk_id") or id(document))
+                matched_value = document.metadata.get("canonical_route_identifiers") or ()
+                route_matches = (
+                    matched_value if isinstance(matched_value, (list, tuple, set)) else ()
+                )
+                if identifier not in route_matches or identity in selected_ids:
+                    continue
+                selected.append(document)
+                selected_ids.add(identity)
+                break
+            if len(selected) >= 12:
+                return selected
+        for document in ranked:
+            identity = str(document.metadata.get("chunk_id") or id(document))
+            if identity in selected_ids:
+                continue
+            selected.append(document)
+            selected_ids.add(identity)
+            if len(selected) >= 12:
+                break
+        return selected
 
     def _canonical_question_documents(
         self, question: str, source_types: tuple[str, ...]
@@ -1029,6 +1447,62 @@ class ChromaAccessRetriever(BaseRetriever):
             found.append(document)
             if len(found) >= 24:
                 break
+        if found:
+            return found
+
+        # Startup warm-up and large multi-policy corpora can leave the bounded
+        # lexical view temporarily incomplete. Canonical routing is correctness,
+        # not an optimization, so fall back to one authorization-filtered exact
+        # Chroma read instead of silently treating the question as unrouted.
+        filters: list[dict[str, object]] = [
+            {"project_id": {"$eq": self.project_id}},
+            _authorized_policy_filter(self.access_policy_ids),
+            {"canonical_chunk_id": {"$ne": VOCABULARY_RECORD_KIND}},
+        ]
+        normalized_types = tuple(
+            dict.fromkeys(value.strip().upper() for value in source_types if value.strip())
+        )
+        if normalized_types:
+            filters.append(
+                {"source_type": {"$eq": normalized_types[0]}}
+                if len(normalized_types) == 1
+                else {"source_type": {"$in": list(normalized_types)}}
+            )
+        response = self.index.get(
+            where={"$and": filters},
+            where_document={"$contains": value},
+            limit=24,
+            include=["documents", "metadatas"],
+        )
+        drops: dict[str, int] = {}
+        for chunk_id, text, metadata in zip(
+            response.get("ids", []),
+            response.get("documents", []),
+            response.get("metadatas", []),
+            strict=True,
+        ):
+            fields = dict(metadata or {})
+            fields[self.text_field] = text or ""
+            loaded_document = self._document_from_fields(fields, str(chunk_id), 1.0, drops)
+            if loaded_document is None:
+                continue
+            document = loaded_document
+            structure_value = document.metadata.get("structure_path") or ""
+            structure = (
+                " ".join(str(item) for item in structure_value)
+                if isinstance(structure_value, (list, tuple))
+                else str(structure_value)
+            )
+            if "QUESTION-" not in structure.upper():
+                continue
+            quoted_questions = {
+                " ".join(re.findall(r"[a-z0-9à-ÿ]+", match.casefold()))
+                for match in re.findall(r'["“]([^"”]{3,200})["”]', document.page_content)
+            }
+            if normalized_question not in quoted_questions:
+                continue
+            document.metadata["canonical_question_index"] = True
+            found.append(document)
         return found
 
     def _lexical_fallback(
@@ -1050,8 +1524,25 @@ class ChromaAccessRetriever(BaseRetriever):
         return ranked[: self.top_k]
 
     def _lexical_candidates(self, query: str, source_types: tuple[str, ...]) -> list[Document]:
-        cached = self._cached_authorized_corpus(source_types, allow_stale=True)
-        ranked = _rank_cached_corpus(query, cached)
+        families = self._source_families(source_types)
+        window = max(self.top_k, 100)
+        if len(families) > 1:
+            # Build/read the bounded mixed corpus once. Family views are then
+            # derived from that parent in memory by `_cached_authorized_corpus`;
+            # issuing one cold Chroma scan per family would multiply startup
+            # latency as new source types are added.
+            self._cached_authorized_corpus((), allow_stale=True)
+            groups = []
+            for family in families:
+                cached = self._cached_authorized_corpus((family,), allow_stale=True)
+                group = _rank_cached_corpus(query, cached)[:window]
+                for rank, document in enumerate(group, start=1):
+                    document.metadata["lexical_family_rank"] = rank
+                groups.append(group)
+            ranked = self._interleave_source_families(groups, limit=window)
+        else:
+            cached = self._cached_authorized_corpus(families or source_types, allow_stale=True)
+            ranked = _rank_cached_corpus(query, cached)[:window]
         for document in ranked:
             document.metadata["retrieval_channel"] = "lexical"
         # BM25 length normalization favors compact table rows over long prose
@@ -1059,7 +1550,7 @@ class ChromaAccessRetriever(BaseRetriever):
         # window so the hybrid anchor selector can preserve an explanatory
         # source before semantic reranking. This performs no additional Chroma
         # read and does not widen the final evidence window.
-        return ranked[: max(self.top_k, 100)]
+        return ranked[:window]
 
     def _rare_query_terms(self, query: str, source_types: tuple[str, ...]) -> tuple[str, ...]:
         cached = self._cached_authorized_corpus(source_types, allow_stale=True)
@@ -1091,6 +1582,17 @@ class ChromaAccessRetriever(BaseRetriever):
     ) -> list[Document]:
         normalized_entity = entity.strip().casefold()
         normalized_labels = tuple(value.strip().casefold() for value in labels if value.strip())
+        label_variants = tuple(
+            dict.fromkeys(
+                variant
+                for label in normalized_labels
+                for variant in (
+                    label,
+                    label[:-1] if len(label) > 3 and label.endswith("s") else "",
+                )
+                if variant
+            )
+        )
         population: dict[str, Document] = {}
         for cached in self._cached_authorized_corpus(source_types).documents:
             document = _clone_document(cached)
@@ -1112,12 +1614,22 @@ class ChromaAccessRetriever(BaseRetriever):
                     " ".join(str(value) for value in metadata.get("structure_path", [])),
                 )
             ).casefold()
-            if normalized_labels and not any(label in searchable for label in normalized_labels):
+            if label_variants and not any(label in searchable for label in label_variants):
                 continue
             entity_key = str(metadata.get("entity_key") or "").strip()
             if entity_key:
                 population.setdefault(entity_key, document)
-        return [population[key] for key in sorted(population)]
+        # Broad family labels are ingestion classifications, not members of an
+        # exhaustive registry. Keep them only when no concrete member exists;
+        # otherwise an answer would incorrectly enumerate a family name beside
+        # its concrete event members.
+        concrete = {
+            key: document
+            for key, document in population.items()
+            if key.casefold() != normalized_entity
+        }
+        selected = concrete or population
+        return [selected[key] for key in sorted(selected)]
 
     def _cached_authorized_corpus(
         self, source_types: tuple[str, ...], *, allow_stale: bool = False
@@ -1157,8 +1669,7 @@ class ChromaAccessRetriever(BaseRetriever):
                     tuple(
                         document
                         for document in parent.documents
-                        if str(document.metadata.get("source_type") or "").upper()
-                        in allowed_types
+                        if str(document.metadata.get("source_type") or "").upper() in allowed_types
                     ),
                     truncated=parent.truncated,
                     expires_at=parent.expires_at,
@@ -1201,9 +1712,7 @@ class ChromaAccessRetriever(BaseRetriever):
             if key in _FALLBACK_CORPUS_REFRESHING:
                 return
             _FALLBACK_CORPUS_REFRESHING.add(key)
-        _FALLBACK_REFRESH_EXECUTOR.submit(
-            self._refresh_fallback_corpus, key, source_types
-        )
+        _FALLBACK_REFRESH_EXECUTOR.submit(self._refresh_fallback_corpus, key, source_types)
 
     def _refresh_fallback_corpus(
         self, key: tuple[object, ...], source_types: tuple[str, ...]
@@ -1240,7 +1749,7 @@ class ChromaAccessRetriever(BaseRetriever):
         # channel actively harmful for documentation questions. Fill the bounded
         # cache one source family at a time, with user-facing evidence first.
         priority = {"PAGE": 0, "ATTACHMENT": 1, "ISSUE": 2, "CODE": 3}
-        source_partitions: tuple[str | None, ...]
+        source_partitions: tuple[str, ...]
         if len(normalized_types) == 1:
             source_partitions = (normalized_types[0],)
         else:
@@ -1252,8 +1761,7 @@ class ChromaAccessRetriever(BaseRetriever):
         truncated = False
         for source_type in source_partitions:
             filters = list(base_filters)
-            if source_type is not None:
-                filters.append({"source_type": {"$eq": source_type}})
+            filters.append({"source_type": {"$eq": source_type}})
             offset = 0
             page_size = 500
             while len(records) < self.lexical_fallback_max_records:
@@ -1316,7 +1824,7 @@ def _clone_document(document: Document) -> Document:
 
 
 def _lexical_index(
-    documents: list[Document],
+    documents: Sequence[Document],
 ) -> tuple[dict[str, int], tuple[dict[str, int], ...], tuple[int, ...]]:
     document_frequency: dict[str, int] = {}
     term_frequencies: list[dict[str, int]] = []
@@ -1381,6 +1889,21 @@ def _identifier_anchor_score(identifier: str, document: Document) -> float:
     body = document.page_content
     title = str(document.metadata.get("title") or "")
     score = float(body.upper().count(identifier.upper()))
+    normalized_identifier = identifier.strip().casefold()
+    exact_metadata_values = (
+        document.metadata.get("canonical_entity_id"),
+        document.metadata.get("entity_key"),
+        document.metadata.get("issue_key"),
+        document.metadata.get("symbol"),
+        document.metadata.get("title"),
+        document.metadata.get("file_name"),
+        document.metadata.get("filename"),
+    )
+    if normalized_identifier and any(
+        str(value or "").strip().casefold() == normalized_identifier
+        for value in exact_metadata_values
+    ):
+        score += 500
     structure_path = " ".join(str(value) for value in document.metadata.get("structure_path") or ())
     if re.search(
         rf"(?<![A-Z0-9_-]){re.escape(identifier.upper())}(?![A-Z0-9_-])",

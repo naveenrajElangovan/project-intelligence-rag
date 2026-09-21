@@ -54,9 +54,7 @@ def subtokens(token: str) -> list[str]:
             continue
         parts.extend(_CAMEL.split(chunk))
     folded = [
-        part.casefold()
-        for part in parts
-        if len(part) >= _MINIMUM_PART and not part.isdigit()
+        part.casefold() for part in parts if len(part) >= _MINIMUM_PART and not part.isdigit()
     ]
     # A single part means the token was already one plain word; re-emitting it
     # would double its term frequency and quietly distort BM25.

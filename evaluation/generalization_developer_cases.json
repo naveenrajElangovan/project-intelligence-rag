@@ -1,0 +1,8 @@
+[
+  {"id":"developer-en-login-event","question":"What numeric event ID does the constant LOGIN_POS_EVENT declare?","answerable":true,"expected_terms":["101"],"expected_source":""},
+  {"id":"developer-es-close-event","question":"¿Qué identificador numérico declara POS_CLOSE_SHIFT_EVENT?","answerable":true,"expected_terms":["104"],"expected_source":""},
+  {"id":"developer-en-money-units","question":"In which units are monetary amounts carried across the event contract?","answerable":true,"expected_terms":["cent"],"expected_source":""},
+  {"id":"developer-es-login-wire","question":"¿Cuál es el nombre transmitido por cable para LOGIN_POS_EVENT?","answerable":true,"expected_terms":["POS_LOGIN"],"expected_source":""},
+  {"id":"developer-en-absent-memoy","question":"What is memoy here?","answerable":false,"expected_terms":[],"expected_source":""},
+  {"id":"developer-es-absent-fictional","question":"¿Qué clase implementa el algoritmo inexistente LunarPayrollQuantumizer?","answerable":false,"expected_terms":[],"expected_source":""}
+]

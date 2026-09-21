@@ -90,31 +90,23 @@ class PhoenixClient:
         self, dataset_id: str, *, version_id: str | None = None
     ) -> dict[str, Any]:
         suffix = f"?version_id={quote(version_id, safe='')}" if version_id else ""
-        return self._request(
-            "GET", f"/v1/datasets/{quote(dataset_id, safe='')}/examples{suffix}"
-        )
+        return self._request("GET", f"/v1/datasets/{quote(dataset_id, safe='')}/examples{suffix}")
 
     def list_datasets(self, *, name: str | None = None) -> dict[str, Any]:
         suffix = f"?name={quote(name, safe='')}" if name else ""
         return self._request("GET", f"/v1/datasets{suffix}")
 
-    def create_experiment(
-        self, dataset_id: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def create_experiment(self, dataset_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "POST", f"/v1/datasets/{quote(dataset_id, safe='')}/experiments", payload
         )
 
-    def create_experiment_run(
-        self, experiment_id: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def create_experiment_run(self, experiment_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request(
             "POST", f"/v1/experiments/{quote(experiment_id, safe='')}/runs", payload
         )
 
-    def upsert_experiment_evaluation(
-        self, payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def upsert_experiment_evaluation(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/v1/experiment_evaluations", payload)
 
     def create_prompt(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +131,9 @@ def publish_scores_to_phoenix(
         return
     annotations = []
     for name, value in scores.items():
-        metric_sample_count = sample_counts.get(name, sample_count) if sample_counts else sample_count
+        metric_sample_count = (
+            sample_counts.get(name, sample_count) if sample_counts else sample_count
+        )
         annotations.append(
             {
                 "name": f"{section}.{name}",

@@ -16,6 +16,22 @@
       "gates": {"cross_project_leakage": 0, "cross_department_leakage": 0}
     },
     {
+      "id": "code_inventory_parameters",
+      "project_id": "T2.0",
+      "departments": [],
+      "source": {
+        "kind": "qa_pairs",
+        "paths": ["evaluation/developer_gold_suites.jsonl"],
+        "languages": ["en"]
+      },
+      "gold": {"granularity": "chunk", "anchor_field": "entity_key"},
+      "gates": {
+        "answer_contract_pass_rate": 1.0,
+        "cross_project_leakage": 0,
+        "cross_department_leakage": 0
+      }
+    },
+    {
       "id": "store_canonical_questions",
       "project_id": "T2.0-STORE",
       "departments": ["STORE_OPERATIONS"],

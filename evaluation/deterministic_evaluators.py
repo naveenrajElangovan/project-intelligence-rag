@@ -54,23 +54,69 @@ def evaluate_case(case: dict[str, Any]) -> list[EvaluationResult]:
         requested_language == "en" and not spanish_signal
     )
     answerable = bool(case.get("answerable", True))
-    refusal = status in {"ACCESS_DENIED", "INSUFFICIENT_EVIDENCE", "NEEDS_CLARIFICATION", "SOURCE_CONFLICT"}
+    refusal = status in {
+        "ACCESS_DENIED",
+        "INSUFFICIENT_EVIDENCE",
+        "NEEDS_CLARIFICATION",
+        "SOURCE_CONFLICT",
+    }
     latency_ms = float(case.get("latency_ms") or 0)
     budget_ms = float(case.get("latency_budget_ms") or 0)
-    dependency_failure = str(case.get("failure_reason") or "").startswith(("HTTP", "CONNECT", "TIMEOUT", "DEPENDENCY"))
+    dependency_failure = str(case.get("failure_reason") or "").startswith(
+        ("HTTP", "CONNECT", "TIMEOUT", "DEPENDENCY")
+    )
 
     def result(name: str, passed: bool, explanation: str) -> EvaluationResult:
         return EvaluationResult(name, float(passed), "PASS" if passed else "FAIL", explanation)
 
     coverage = 1.0 if not expected else len(expected & observed) / len(expected)
     return [
-        result("authorization_leakage", not leaked, "No cross-project candidates observed." if not leaked else f"Cross-project candidates: {sorted(leaked)}"),
-        result("citation_validity", citation_valid, "Citation markers resolve to returned sources." if citation_valid else "A citation is missing or does not resolve."),
-        result("requested_language", language_valid, f"Response matches requested language {requested_language}." if language_valid else f"Response does not match requested language {requested_language}."),
-        result("response_completeness", bool(answer.strip()) and status != "", "Response has a typed status and non-empty user text."),
+        result(
+            "authorization_leakage",
+            not leaked,
+            "No cross-project candidates observed."
+            if not leaked
+            else f"Cross-project candidates: {sorted(leaked)}",
+        ),
+        result(
+            "citation_validity",
+            citation_valid,
+            "Citation markers resolve to returned sources."
+            if citation_valid
+            else "A citation is missing or does not resolve.",
+        ),
+        result(
+            "requested_language",
+            language_valid,
+            f"Response matches requested language {requested_language}."
+            if language_valid
+            else f"Response does not match requested language {requested_language}.",
+        ),
+        result(
+            "response_completeness",
+            bool(answer.strip()) and status != "",
+            "Response has a typed status and non-empty user text.",
+        ),
         result("refusal_typing", refusal == (status != "ANSWERED"), "Refusal and status agree."),
-        EvaluationResult("source_coverage", coverage, "PASS" if coverage == 1 else "FAIL", f"Matched {len(expected & observed)} of {len(expected)} expected sources."),
-        result("latency_budget", not budget_ms or latency_ms <= budget_ms, f"Latency {latency_ms:.0f} ms; budget {budget_ms:.0f} ms."),
-        result("dependency_classification", not dependency_failure or status != "ANSWERED", "Dependency failures are not mislabeled as answered."),
-        result("refusal_appropriateness", refusal == (not answerable), "Refusal agrees with reviewed answerability."),
+        EvaluationResult(
+            "source_coverage",
+            coverage,
+            "PASS" if coverage == 1 else "FAIL",
+            f"Matched {len(expected & observed)} of {len(expected)} expected sources.",
+        ),
+        result(
+            "latency_budget",
+            not budget_ms or latency_ms <= budget_ms,
+            f"Latency {latency_ms:.0f} ms; budget {budget_ms:.0f} ms.",
+        ),
+        result(
+            "dependency_classification",
+            not dependency_failure or status != "ANSWERED",
+            "Dependency failures are not mislabeled as answered.",
+        ),
+        result(
+            "refusal_appropriateness",
+            refusal == (not answerable),
+            "Refusal agrees with reviewed answerability.",
+        ),
     ]

@@ -1,24 +1,29 @@
 repos:
   - repo: local
     hooks:
-      - id: ruff-lint-ratchet
-        name: Ruff lint ratchet
+      - id: ruff-lint
+        name: Ruff lint
         entry: make lint
         language: system
         pass_filenames: false
-      - id: ruff-format-ratchet
-        name: Ruff format ratchet
+      - id: ruff-format
+        name: Ruff format check
         entry: make format-check
         language: system
         pass_filenames: false
-      - id: mypy-ratchet
-        name: mypy strict modules and repository ratchet
+      - id: mypy
+        name: mypy application check
         entry: make type-check
         language: system
         pass_filenames: false
       - id: import-boundaries
         name: Import architecture contracts
         entry: make imports
+        language: system
+        pass_filenames: false
+      - id: dependency-usage
+        name: Dependency usage
+        entry: make dependencies
         language: system
         pass_filenames: false
       - id: tests-and-coverage

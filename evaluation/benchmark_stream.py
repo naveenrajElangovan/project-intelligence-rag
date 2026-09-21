@@ -76,10 +76,7 @@ def main() -> None:
                         result = event.get("response") or {}
                         confidence = str(result.get("confidence") or "NONE")
             total_seconds = time.perf_counter() - began
-            gaps = [
-                later - earlier
-                for earlier, later in zip(delta_times, delta_times[1:])
-            ]
+            gaps = [later - earlier for earlier, later in zip(delta_times, delta_times[1:])]
             runs.append(
                 {
                     "first_event_ms": (first_event_seconds or total_seconds) * 1000,
@@ -92,19 +89,13 @@ def main() -> None:
                 }
             )
     first_answers = [float(run["first_answer_ms"]) for run in runs]
-    all_gaps = [
-        float(gap)
-        for run in runs
-        for gap in run["inter_delta_gaps_ms"]
-    ]
+    all_gaps = [float(gap) for run in runs for gap in run["inter_delta_gaps_ms"]]
     print(
         json.dumps(
             {
                 "runs": len(runs),
                 "time_to_first_token_p95_ms": round(_percentile(first_answers, 0.95), 2),
-                "inter_delta_gap_p50_ms": round(statistics.median(all_gaps), 2)
-                if all_gaps
-                else 0,
+                "inter_delta_gap_p50_ms": round(statistics.median(all_gaps), 2) if all_gaps else 0,
                 "inter_delta_gap_p95_ms": round(_percentile(all_gaps, 0.95), 2),
                 "burst_gap_fraction_under_5ms": round(
                     sum(gap < 5 for gap in all_gaps) / len(all_gaps), 3

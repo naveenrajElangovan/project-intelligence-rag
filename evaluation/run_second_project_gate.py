@@ -38,10 +38,46 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
     )
     try:
         records = (
-            ("atlas-routing", "Routing handbook", "Atlas plans delivery routes and dispatches vehicles.", "PAGE", "atlas", "feature-page"),
-            ("atlas-telemetry", "Fleet observations", "Atlas records route telemetry for operators.", "PAGE", "atlas", "feature-page"),
-            ("nova-ledger", "Settlement ledger", "Nova reconciles settlement ledger entries.", "PAGE", "nova", "workflow"),
-            ("nova-engine", "engine.go", "package ledger implements settlement reconciliation", "CODE", "nova", "narrative"),
+            (
+                "atlas-routing",
+                "Routing handbook",
+                "Atlas plans delivery routes and dispatches vehicles.",
+                "PAGE",
+                "atlas",
+                "feature-page",
+            ),
+            (
+                "atlas-telemetry",
+                "Fleet observations",
+                "Atlas records route telemetry for operators.",
+                "PAGE",
+                "atlas",
+                "feature-page",
+            ),
+            (
+                "nova-ledger",
+                "Settlement ledger",
+                "Nova reconciles settlement ledger entries.",
+                "PAGE",
+                "nova",
+                "workflow",
+            ),
+            (
+                "nova-engine",
+                "engine.go",
+                "package ledger implements settlement reconciliation",
+                "CODE",
+                "nova",
+                "narrative",
+            ),
+            (
+                "nova-bug",
+                "NOVA-17",
+                "Settlement is blocked by an open reconciliation bug.",
+                "ISSUE",
+                "nova",
+                "delivery",
+            ),
         )
         vocabulary_id = "__vocabulary__"
         vocabulary = {
@@ -50,7 +86,7 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
             "entities": ["atlas", "nova"],
             "doc_categories": ["feature-page", "workflow", "narrative"],
             "providers": ["CONFLUENCE", "GITHUB"],
-            "source_types": ["PAGE", "CODE"],
+            "source_types": ["PAGE", "CODE", "ISSUE"],
             "code_extensions": [".go", ".rs"],
             "languages": ["en"],
         }
@@ -64,7 +100,13 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
                 "schema_version": settings.supported_schema_versions[0],
                 "embedding_model": settings.supported_embedding_models[0],
                 "source_type": source_type,
-                "provider": "GITHUB" if source_type == "CODE" else "CONFLUENCE",
+                "provider": (
+                    "GITHUB"
+                    if source_type == "CODE"
+                    else "JIRA"
+                    if source_type == "ISSUE"
+                    else "CONFLUENCE"
+                ),
                 "title": title,
                 "source_id": f"fixture:{chunk_id}",
                 "structure_path": json.dumps([title]),
@@ -85,7 +127,11 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
                 "title": "Project vocabulary",
                 "source_id": "fixture:vocabulary",
                 "record_kind": vocabulary_id,
-                **{key: json.dumps(value) for key, value in vocabulary.items() if isinstance(value, list)},
+                **{
+                    key: json.dumps(value)
+                    for key, value in vocabulary.items()
+                    if isinstance(value, list)
+                },
             }
         )
         embedder = build_embedder(settings)
@@ -120,18 +166,29 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
                 "Which bugs block settlement?",
             )
         }
+        expected_routes = {
+            "What does route planning do?": "CODE_ASSISTED",
+            "Which class implements settlement?": "IMPLEMENTATION",
+            "Compare the handbook with the implementation": "CROSS_SOURCE",
+            "Which bugs block settlement?": "DELIVERY",
+        }
+        leaked = [
+            document
+            for document in overview
+            if document.metadata.get("project_id") != arguments.project_id
+            or document.metadata.get("access_policy_id") != f"project:{arguments.project_id}"
+        ]
         result = {
             "project_id": arguments.project_id,
             "entity_vocabulary_size": len(loaded.entities),
-            "entity_overview": _entity_overview_entity(
-                "Tell me about Atlas", loaded.entities
-            ),
+            "entity_overview": _entity_overview_entity("Tell me about Atlas", loaded.entities),
             "feature_inventory": _feature_inventory_entity(
                 "List all Atlas features", loaded.entities
             ),
             "retrieved": len(overview),
             "inventory": len(inventory),
-            "routes": sorted(set(routes.values())),
+            "routes": routes,
+            "cross_project_leakage": len(leaked),
             "entity_capability": "enabled" if loaded.entities else "disabled",
         }
         if (
@@ -139,7 +196,8 @@ async def run(arguments: argparse.Namespace) -> dict[str, object]:
             or result["feature_inventory"] != "atlas"
             or not overview
             or not inventory
-            or len(set(routes.values())) != 4
+            or routes != expected_routes
+            or leaked
             or result["entity_capability"] != "enabled"
         ):
             raise RuntimeError(f"Second-project gate failed: {result}")

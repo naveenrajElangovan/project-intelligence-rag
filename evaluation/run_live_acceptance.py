@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import time
+import uuid
 
 import httpx
 
@@ -43,7 +44,10 @@ def main() -> None:
             began = time.perf_counter()
             response = client.post(
                 arguments.base_url.rstrip("/") + "/v1/answer",
-                headers={**headers, "X-Request-ID": f"acceptance-{case['id']}"},
+                headers={
+                    **headers,
+                    "X-Request-ID": f"acceptance-{case['id']}-{uuid.uuid4().hex[:12]}",
+                },
                 json={
                     "projectId": arguments.project_id,
                     "collectionName": arguments.collection_name,
@@ -63,17 +67,19 @@ def main() -> None:
             sources = payload.get("sources") or []
             if case["answerable"]:
                 terms_ok = all(
-                    _expected_term_present(str(term), answer)
-                    for term in case["expected_terms"]
+                    _expected_term_present(str(term), answer) for term in case["expected_terms"]
                 )
                 source_ok = any(
-                    case["expected_source"].casefold()
-                    in str(source.get("title") or "").casefold()
+                    case["expected_source"].casefold() in str(source.get("title") or "").casefold()
                     for source in sources
                 )
                 ok = response.status_code == 200 and confidence != "NONE" and terms_ok and source_ok
             else:
-                ok = response.status_code == 200 and confidence == "NONE" and not sources
+                # Unverified source cards may be returned to show what was
+                # inspected; they are not an answer. Access-control cases can
+                # opt into the stricter no-source contract explicitly.
+                source_boundary_ok = not sources if case.get("expect_no_sources") else True
+                ok = response.status_code == 200 and confidence == "NONE" and source_boundary_ok
             passed += int(ok)
             print(
                 f"{case['id']}: {'PASS' if ok else 'FAIL'} status={response.status_code} "

@@ -62,15 +62,9 @@ def score(
     department_leakage = 0
     for row in answerable:
         gold = set(row.get("gold_chunk_ids", []))
-        retrieved = list(row.get("retrieved_chunk_ids", []))[
-            : settings.retrieval_top_k
-        ]
+        retrieved = list(row.get("retrieved_chunk_ids", []))[: settings.retrieval_top_k]
         reranked = list(row.get("reranked_chunk_ids", []))[:rerank_k]
-        section_groups = [
-            set(group)
-            for group in row.get("gold_section_chunk_ids", [])
-            if group
-        ]
+        section_groups = [set(group) for group in row.get("gold_section_chunk_ids", []) if group]
         if not section_groups and gold:
             # Backward-compatible interpretation for older result rows: one
             # section whose chunks are the complete gold set.
@@ -98,26 +92,19 @@ def score(
             )
             ideal = [1] * min(len(gold), rerank_k)
             ndcgs.append(_dcg(relevance) / _dcg(ideal))
-        leakage += int(
-            any(
-                project != project_id
-                for project in row.get("exposed_project_ids", [])
-            )
-        )
+        leakage += int(any(project != project_id for project in row.get("exposed_project_ids", [])))
         authorized_policies = set(row.get("authorized_access_policy_ids", []))
         if authorized_policies:
             department_leakage += int(
                 any(
-                    str(policy).startswith("department:")
-                    and policy not in authorized_policies
+                    str(policy).startswith("department:") and policy not in authorized_policies
                     for policy in row.get("exposed_access_policy_ids", [])
                 )
             )
     surviving_gold_answers = sum(
         bool(row.get("answered"))
         for row in answerable
-        if row.get("gold_chunk_ids")
-        and row.get("role", "answer_evidence") == "answer_evidence"
+        if row.get("gold_chunk_ids") and row.get("role", "answer_evidence") == "answer_evidence"
     )
     summary: dict[str, object] = {
         "cases": len(rows),
@@ -138,20 +125,12 @@ def score(
         precision_name: sum(precisions) / len(precisions) if precisions else 0,
         recall_name: sum(recalls) / len(recalls) if recalls else 0,
         f"{recall_name}_gold_size_ceiling": (
-            sum(chunk_recall_ceilings) / len(chunk_recall_ceilings)
-            if chunk_recall_ceilings
-            else 0
+            sum(chunk_recall_ceilings) / len(chunk_recall_ceilings) if chunk_recall_ceilings else 0
         ),
         hit_rate_name: sum(hit_rates) / len(hit_rates) if hit_rates else 0,
-        mrr_name: (
-            sum(reciprocal_ranks) / len(reciprocal_ranks)
-            if reciprocal_ranks
-            else 0
-        ),
+        mrr_name: (sum(reciprocal_ranks) / len(reciprocal_ranks) if reciprocal_ranks else 0),
         ndcg_name: sum(ndcgs) / len(ndcgs) if ndcgs else 0,
-        "gold_resolution_rate": (
-            resolved_gold_cases / len(answerable) if answerable else 0
-        ),
+        "gold_resolution_rate": (resolved_gold_cases / len(answerable) if answerable else 0),
         "gold_survival_rate": (
             surviving_gold_answers / answer_evidence_cases if answer_evidence_cases else 0
         ),
@@ -159,17 +138,11 @@ def score(
         "cross_department_leakage": department_leakage,
         "project_id": project_id,
     }
-    languages = sorted(
-        {str(row.get("query_language") or "und") for row in rows}
-    )
+    languages = sorted({str(row.get("query_language") or "und") for row in rows})
     if _include_language_splits and languages != ["und"]:
         by_language = {
             language: score(
-                [
-                    row
-                    for row in rows
-                    if str(row.get("query_language") or "und") == language
-                ],
+                [row for row in rows if str(row.get("query_language") or "und") == language],
                 settings=settings,
                 project_id=project_id,
                 _include_language_splits=False,
@@ -192,11 +165,7 @@ def score(
     if _include_department_splits:
         summary["by_department"] = {
             department: score(
-                [
-                    row
-                    for row in rows
-                    if str(row.get("department") or "shared") == department
-                ],
+                [row for row in rows if str(row.get("department") or "shared") == department],
                 settings=settings,
                 project_id=project_id,
                 _include_department_splits=False,
@@ -233,7 +202,9 @@ def retrieval_dashboard_scores(summary: dict[str, object]) -> dict[str, float]:
             if isinstance(languages, dict):
                 for language, values in languages.items():
                     if isinstance(values, dict):
-                        result[f"{name}.department.{department}.{language}"] = float(values.get(name, 0.0))
+                        result[f"{name}.department.{department}.{language}"] = float(
+                            values.get(name, 0.0)
+                        )
     return result
 
 
@@ -272,7 +243,9 @@ def retrieval_dashboard_sample_counts(summary: dict[str, object]) -> dict[str, i
 
 
 def score_generation(
-    rows: list[dict[str, object]], *, _include_language_splits: bool = True,
+    rows: list[dict[str, object]],
+    *,
+    _include_language_splits: bool = True,
     _include_department_splits: bool = True,
 ) -> dict[str, object]:
     """Score only outcomes produced by generate, citation, and grounding gates."""
@@ -282,8 +255,10 @@ def score_generation(
     accepted = sum(bool(row.get("grounding_accepted")) for row in answerable)
     citations_valid = sum(int(row.get("valid_citation_count") or 0) for row in rows)
     citations_total = sum(len(row.get("cited_source_ids", [])) for row in rows)
+
     def typed_refusal(row: dict[str, object]) -> bool:
         return bool(str(row.get("refusal_reason") or "").strip())
+
     legacy_false_positives = sum(bool(row.get("answered")) for row in no_answer)
     false_positives = sum(not typed_refusal(row) for row in no_answer)
     no_answer_without_fallback = [
@@ -292,9 +267,7 @@ def score_generation(
     false_positives_without_fallback = sum(
         not typed_refusal(row) for row in no_answer_without_fallback
     )
-    canonical_fallback_rows = [
-        row for row in rows if row.get("canonical_fallback_used")
-    ]
+    canonical_fallback_rows = [row for row in rows if row.get("canonical_fallback_used")]
     canonical_fallback_reasons = dict(
         sorted(
             Counter(
@@ -309,8 +282,7 @@ def score_generation(
     legacy_refusals = sum(not bool(row.get("answered")) for row in rows)
     reason_cases = [row for row in no_answer if row.get("expected_refusal_reason")]
     correct_reasons = sum(
-        row.get("refusal_reason") == row.get("expected_refusal_reason")
-        for row in reason_cases
+        row.get("refusal_reason") == row.get("expected_refusal_reason") for row in reason_cases
     )
     paraphrase_groups: dict[object, set[tuple[object, ...]]] = {}
     for row in rows:
@@ -324,17 +296,13 @@ def score_generation(
                 row.get("refusal_reason"),
             )
         )
-    divergent_groups = sum(
-        len(signatures) > 1 for signatures in paraphrase_groups.values()
-    )
+    divergent_groups = sum(len(signatures) > 1 for signatures in paraphrase_groups.values())
     summary: dict[str, object] = {
         "cases": len(rows),
         "answerable_cases": len(answerable),
         "no_answer_cases": len(no_answer),
         "citation_count": citations_total,
-        "uncited_claims_dropped": sum(
-            int(row.get("uncited_claims_dropped") or 0) for row in rows
-        ),
+        "uncited_claims_dropped": sum(int(row.get("uncited_claims_dropped") or 0) for row in rows),
         "refusal_cases": refusals,
         "refusal_reason_cases": len(reason_cases),
         "grounding_acceptance_rate": accepted / len(answerable) if answerable else 0,
@@ -363,17 +331,11 @@ def score_generation(
             else 0
         ),
     }
-    languages = sorted(
-        {str(row.get("query_language") or "und") for row in rows}
-    )
+    languages = sorted({str(row.get("query_language") or "und") for row in rows})
     if _include_language_splits and languages != ["und"]:
         by_language = {
             language: score_generation(
-                [
-                    row
-                    for row in rows
-                    if str(row.get("query_language") or "und") == language
-                ],
+                [row for row in rows if str(row.get("query_language") or "und") == language],
                 _include_language_splits=False,
                 _include_department_splits=False,
             )
@@ -393,11 +355,7 @@ def score_generation(
     if _include_department_splits:
         summary["by_department"] = {
             department: score_generation(
-                [
-                    row
-                    for row in rows
-                    if str(row.get("department") or "shared") == department
-                ],
+                [row for row in rows if str(row.get("department") or "shared") == department],
                 _include_department_splits=False,
             )
             for department in departments
@@ -432,7 +390,9 @@ def generation_dashboard_scores(summary: dict[str, object]) -> dict[str, float]:
             if isinstance(languages, dict):
                 for language, values in languages.items():
                     if isinstance(values, dict):
-                        result[f"{name}.department.{department}.{language}"] = float(values.get(name, 0.0))
+                        result[f"{name}.department.{department}.{language}"] = float(
+                            values.get(name, 0.0)
+                        )
     return result
 
 
@@ -468,7 +428,11 @@ if __name__ == "__main__":
     parser.add_argument("results", type=Path)
     parser.add_argument("--project-id", required=True)
     arguments = parser.parse_args()
-    rows = [json.loads(line) for line in arguments.results.read_text(encoding="utf-8").splitlines() if line]
+    rows = [
+        json.loads(line)
+        for line in arguments.results.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
     print(
         json.dumps(
             score(rows, settings=Settings(), project_id=arguments.project_id),

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 from langgraph.errors import GraphRecursionError
 
 from app.telemetry import stage_complete, started
+from app.workflow_state import RagState
 from app.workflow_support.presentation import _answer_deltas, _stream_progress
 
 
@@ -27,7 +28,7 @@ async def verified_answer_events(
 
 async def graph_update_events(
     workflow: Any,
-    state: dict[str, Any],
+    state: RagState,
     status: dict[str, bool],
 ) -> AsyncIterator[dict[str, object]]:
     """Reduce private graph patches and expose only safe progress or answer events."""
@@ -47,11 +48,7 @@ async def graph_update_events(
             config={"recursion_limit": recursion_limit},
             stream_mode=["updates", "custom"],
         ):
-            if (
-                isinstance(update, tuple)
-                and len(update) == 2
-                and update[0] == "custom"
-            ):
+            if isinstance(update, tuple) and len(update) == 2 and update[0] == "custom":
                 # Custom generation events may contain provisional factual text.
                 # Whole-answer validation has not run yet, so none are releasable.
                 continue
@@ -61,10 +58,8 @@ async def graph_update_events(
                 continue
             for node_name, patch in update.items():
                 if isinstance(patch, dict):
-                    state.update(patch)
-                progress = _stream_progress(
-                    node_name, state.get("language", "en"), state
-                )
+                    state.update(cast(RagState, patch))
+                progress = _stream_progress(node_name, state.get("language", "en"), state)
                 if progress is not None:
                     yield progress
     except GraphRecursionError:

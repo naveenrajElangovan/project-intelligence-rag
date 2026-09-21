@@ -148,7 +148,7 @@ if curl --fail --silent http://127.0.0.1:8003/health >/dev/null 2>&1; then
     # and compare the wrong tree against this service's start time.
     # Only what the running process actually loaded. `scripts/` shapes the next
     # launch, not the current one — this launcher is executing the new copy right
-    # now — and editing requirements.txt does not change the installed venv. A
+    # now — and editing pyproject.toml does not change the installed venv. A
     # check that fires on those trains you to set the override, which costs more
     # than the check is worth.
     STALE=""

@@ -58,7 +58,7 @@ def configure_openinference(settings: Settings) -> Any | None:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    resource_attributes = {
+    resource_attributes: dict[str, str | bool | int | float] = {
         "service.name": "project-intelligence-rag",
         "service.namespace": "project-intelligence",
         "openinference.project.name": settings.openinference_project_name,

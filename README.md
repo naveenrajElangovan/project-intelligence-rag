@@ -54,7 +54,7 @@ Run locally:
 ```bash
 cp .env.example .env
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e '.[dev,eval]'
 .venv/bin/uvicorn app.main:app --reload --port 8003
 ```
 
@@ -63,6 +63,8 @@ On the validated Apple Silicon laptop, use `./scripts/start_local_macos.sh` and
 
 The implemented design, diagrams, security boundaries, code map, deployment topology, and failure
 behavior are documented in the single [current RAG architecture](docs/CURRENT_ARCHITECTURE.md).
+Current verified gates and residuals are in [quality status](docs/QUALITY_STATUS.md),
+and every evaluation tool is indexed in [the evaluation entrypoint](evaluation/README.md).
 
 The complete service boundaries are documented in the
 [backend architecture](../project-intelligence-backend/docs/CURRENT_ARCHITECTURE.md),
@@ -70,7 +72,7 @@ The complete service boundaries are documented in the
 [Atlassian integration architecture](../project-intelligence-atlassian/docs/ARCHITECTURE.md), and
 [observability architecture](../project-intelligence-observability/docs/ARCHITECTURE.md).
 Provider selection, exact Jira aggregates, LiteLLM model routing, operational controls, and live
-verification are documented in [provider routing and Jira aggregates](docs/PROVIDER_ROUTING_AND_JIRA_AGGREGATES.md).
+verification are documented in [the current architecture](docs/CURRENT_ARCHITECTURE.md).
 The company-facing privacy, LLM data-use, threat-model, and production approval guidance is in the
 [enterprise security architecture](../project-intelligence-backend/PROJECT_INTELLIGENCE_SECURITY_ARCHITECTURE.md).
 Backend authorization and ingestion procedures live in their respective repositories.
@@ -101,7 +103,7 @@ run it against a curated JSONL file containing `user_input`, `response`,
 `retrieved_contexts`, and `reference`:
 
 ```bash
-.venv/bin/pip install -r requirements-eval.txt
+.venv/bin/pip install -e '.[eval]'
 .venv/bin/python -m evaluation.run_ragas_eval \
   --input evaluation/ragas_dataset.example.jsonl
 ```

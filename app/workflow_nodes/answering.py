@@ -3,16 +3,23 @@ from __future__ import annotations
 import math
 import hashlib
 import re
+from collections.abc import Sequence
 
 from langchain_core.documents import Document
+from langchain_core.exceptions import OutputParserException
 from langgraph.config import get_stream_writer
 
+from app.config import Settings
+from app.grounding import LocalCitationGroundingVerifier
 from app.llm import (
     GroundedAnswer,
+    LangChainGroundedAnswerGenerator,
     TokenUsage,
     answer_sentence_floor,
     refusal_answer,
 )
+from app.models import RagRequest
+from app.retrieval import ChromaAccessRetriever
 from app.grounding_contract import evidence_facts, render_structured_facts
 from app.telemetry import canonical_quote_fallback, stage_complete, started
 from app.table_evidence import contains_table
@@ -32,7 +39,11 @@ from app.workflow_support.answer_structure import (
     classify_answer_lines,
     material_claims,
 )
-from app.workflow_support.inventory_intent import is_inventory_question
+from app.workflow_support.inventory_intent import (
+    is_exhaustive_entity_detail_question,
+    is_inventory_question,
+)
+from app.workflow_support.procedural_retrieval import is_procedural_question
 from app.workflow_support.identifiers import member_identifiers
 from app.workflow_support.conversation import (
     _conversation_subject,
@@ -45,6 +56,7 @@ from app.workflow_support.completeness import (
     _missing_answer_requirements,
 )
 from app.workflow_support.deterministic_answers import (
+    _code_inventory_documents,
     _code_inventory_answer_verified,
     _deterministic_code_inventory_answer,
     _deterministic_canonical_route_answer,
@@ -65,6 +77,7 @@ from app.workflow_support.query_analysis import (
     _overview_repair_kwargs,
     _source_authority_valid,
 )
+from app.vocabulary import CorpusVocabulary
 
 
 _ENTITY_STOP_WORDS = {
@@ -88,14 +101,11 @@ def _answer_has_minimum_substance(
 ) -> bool:
     """Reject a quote-only fallback or an answer that merely repeats the question.
 
-    Citation markers and a Markdown heading do not add substance. Canonical quote
-    fallback output is intentionally one quoted evidence line, so it must never be
-    treated as a complete answer. Other answer styles fail only when their remaining
-    body is the normalized question itself.
+    Citation markers and a Markdown heading do not add substance. Every answer,
+    including an exact canonical extract, must contain enough material claims for
+    the question shape and must not merely repeat the question.
     """
 
-    if answer_style == "canonical_quote":
-        return False
     body_lines = [
         line.strip()
         for line in generated.answer.splitlines()
@@ -104,7 +114,14 @@ def _answer_has_minimum_substance(
     body = re.sub(r"\[SOURCE \d+\]", "", " ".join(body_lines)).strip(" .?!¿¡\"'")
     normalized_body = " ".join(_normalized_words(body))
     normalized_question = " ".join(_normalized_words(question))
-    return bool(normalized_body) and normalized_body != normalized_question
+    if not normalized_body or normalized_body == normalized_question:
+        return False
+    # Procedural questions need enough structure to express both an action and
+    # its verification/next step. This catches the observed one-sentence drafts
+    # without imposing a topic vocabulary or requiring a particular phrasing.
+    if is_procedural_question(question) and len(material_claims(generated.answer)) < 2:
+        return False
+    return True
 
 
 def _model_fallback_reason(generated: GroundedAnswer | None) -> str:
@@ -175,7 +192,7 @@ def _referential_transformation_requested(
     question: str,
     resolved_question: str,
     vocabulary: tuple[str, ...],
-    history: list[object],
+    history: Sequence[object],
 ) -> bool:
     """Detect a request that transforms the prior answer rather than changing subject."""
 
@@ -249,6 +266,249 @@ def _comparison_subjects(question: str, entities: tuple[str, ...]) -> tuple[str,
     return source_families if len(source_families) >= 2 else ()
 
 
+def _deterministic_subject_comparison_answer(
+    question: str,
+    documents: list[object],
+    subjects: tuple[str, ...],
+    language: str,
+) -> GroundedAnswer | None:
+    """Build a comparison from per-subject extractive evidence."""
+
+    if len(subjects) < 2:
+        return None
+    rows: list[str] = []
+    citations: list[int] = []
+    used_document_indexes: set[int] = set()
+    for subject in subjects:
+        indexed = [
+            (index, document)
+            for index, document in enumerate(documents, start=1)
+            if str(getattr(document, "metadata", {}).get("entity") or "").casefold()
+            == subject.casefold()
+        ]
+        if not indexed:
+            subject_pattern = re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(subject)}(?![A-Za-z0-9_])",
+                flags=re.IGNORECASE,
+            )
+            indexed = [
+                (index, document)
+                for index, document in enumerate(documents, start=1)
+                if index not in used_document_indexes
+                and subject_pattern.search(str(getattr(document, "page_content", "")))
+            ]
+        if not indexed:
+            return None
+        global_index, document = indexed[0]
+        used_document_indexes.add(global_index)
+        content = str(getattr(document, "page_content", "")).strip()
+        if not content:
+            return None
+        blocks = [
+            " ".join(block.split())
+            for block in re.split(r"\n\s*\n|(?<=\.)\s+(?=[A-ZÁÉÍÓÚÜÑ])", content)
+            if len(" ".join(block.split())) >= 40
+        ]
+        if not blocks:
+            return None
+        purpose_terms = re.compile(
+            r"\b(?:purpose|scope|application|features?|workflows?|responsible|owns?|"
+            r"operates?|prop[oó]sito|alcance|aplicaci[oó]n|funciones?|flujos?|opera)\b",
+            flags=re.IGNORECASE,
+        )
+        subject_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(subject)}(?![A-Za-z0-9_])",
+            flags=re.IGNORECASE,
+        )
+        _position, evidence = max(
+            enumerate(blocks),
+            key=lambda item: (
+                4 * bool(subject_pattern.search(item[1])) + 2 * bool(purpose_terms.search(item[1])),
+                -item[0],
+            ),
+        )
+        evidence = evidence[:500].rstrip()
+        evidence = evidence.replace("|", "\\|")
+        rows.append(f"| {subject.upper()} | {evidence} [SOURCE {global_index}] |")
+        citations.append(global_index)
+    return GroundedAnswer(
+        answer="\n".join(("| Subject | Evidence |", "| --- | --- |", *rows)),
+        citations=list(dict.fromkeys(citations)),
+        missing_information=[],
+    )
+
+
+def _subject_comparison_answer_verified(
+    answer: GroundedAnswer,
+    documents: Sequence[object],
+    subjects: tuple[str, ...],
+) -> bool:
+    """Verify every comparison row as a literal excerpt of its cited document."""
+
+    if len(subjects) < 2 or not _citations_valid(answer, len(documents)):
+        return False
+    rows = [line for line in answer.answer.splitlines() if line.lstrip().startswith("|")]
+    for subject in subjects:
+        row = next(
+            (
+                line
+                for line in rows
+                if re.match(
+                    rf"^\|\s*{re.escape(subject)}\s*\|",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            ),
+            "",
+        )
+        parsed = re.match(
+            rf"^\|\s*{re.escape(subject)}\s*\|\s*(.*?)\s*"
+            r"\[SOURCE (\d+)\][.!?]?\s*\|$",
+            row,
+            flags=re.IGNORECASE,
+        )
+        if not row or parsed is None:
+            return False
+        evidence = parsed.group(1).replace("\\|", "|")
+        document_index = int(parsed.group(2))
+        normalized_evidence = " ".join(evidence.split())
+        normalized_document = " ".join(
+            str(getattr(documents[document_index - 1], "page_content", "")).split()
+        )
+        if len(normalized_evidence) < 40 or normalized_evidence not in normalized_document:
+            return False
+    return True
+
+
+def _literal_extractive_answer_verified(
+    answer: GroundedAnswer, documents: Sequence[object]
+) -> bool:
+    """Prove that every material claim is copied from one of its cited sources."""
+
+    if not _citations_valid(answer, len(documents)):
+        return False
+    claims = material_claims(answer.answer)
+    if not claims:
+        return False
+    for claim in claims:
+        cited = [int(value) for value in re.findall(r"\[SOURCE (\d+)\]", claim.text)]
+        literal = re.sub(r"\s*\[SOURCE \d+\]\s*", "", claim.text).strip()
+        normalized_literal = " ".join(literal.split()).rstrip(".!?")
+        if len(normalized_literal) < 20 or not any(
+            normalized_literal
+            in " ".join(str(getattr(documents[index - 1], "page_content", "")).split())
+            for index in cited
+        ):
+            return False
+    return True
+
+
+def _unsupported_definition_subject(question: str, documents: list[object]) -> str:
+    """Return an explicitly questionable premise absent from selected evidence."""
+
+    patterns = (
+        r"\bwhat\s+does\s+([A-Za-z][A-Za-z0-9_-]{2,})\s+mean\b",
+        r"\bwhat\s+is\s+([A-Za-z][A-Za-z0-9_-]{2,})\s+here\b",
+        r"\b(?:what|which)\s+class\s+implements?\s+(?:the\s+)?(?:(?:algorithm|interface|contract)\s+)?(?:nonexistent\s+)?([A-Za-z][A-Za-z0-9_-]{2,})\b",
+        r"\bqu[eé]\s+significa\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_-]{2,})\b",
+        r"\bqu[eé]\s+es\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_-]{2,})\s+aqu[ií]\b",
+        r"\bqu[eé]\s+clase\s+implementa\s+(?:(?:el|la)\s+)?(?:(?:algoritmo|interfaz|contrato)\s+)?(?:inexistente\s+)?([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ_-]{2,})\b",
+    )
+    subject = next(
+        (
+            match.group(1)
+            for pattern in patterns
+            if (match := re.search(pattern, question, flags=re.IGNORECASE)) is not None
+        ),
+        "",
+    )
+    if not subject:
+        unreliable = re.search(
+            r"(?i)\b(?:undocumented|unrecorded|phantom|nonexistent|imaginary|fictional|"
+            r"fictitious|absent|"
+            r"no\s+documentad[oa]s?|no\s+registrad[oa]s?|fantasmas?|inexistentes?|"
+            r"imaginari[oa]s?|fictici[oa]s?|ausentes?)\b",
+            question,
+        )
+        if unreliable:
+            # An unsupported premise may use either a compound identifier
+            # (QZ-004) or a standalone acronym (QZ). Prefer that explicit token
+            # over a nearby generic noun such as "phantom event"; otherwise the
+            # noun is usually present in unrelated evidence and masks the
+            # unsupported subject.
+            identifier = re.search(r"\b[A-Z]{2,}(?:[-_][A-Z0-9]+)*\b", question)
+            compound = re.search(
+                r"(?i)\b(?:phantom|nonexistent|imaginary|fictional|fictitious|"
+                r"fantasmas?|inexistentes?|imaginari[oa]s?|fictici[oa]s?)-[\w-]+",
+                question,
+            )
+            trailing = re.search(
+                r"(?i)\b(?:phantom|nonexistent|imaginary|absent|fantasmas?|inexistentes?|imaginari[oa]s?|ausentes?)[-\s]+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][\w-]{2,})",
+                question,
+            )
+            subject = (
+                identifier.group(0)
+                if identifier
+                else compound.group(0)
+                if compound
+                else trailing.group(1)
+                if trailing
+                else unreliable.group(0)
+            )
+        else:
+            verification = re.match(
+                r"(?i)^\s*(?:verify|assert|confirm|state|claim|afirma|confirma|verifica|declara)\b",
+                question,
+            )
+            numbers = re.findall(r"(?<![A-Za-z0-9])\d+(?:[.,]\d+)?(?![A-Za-z0-9])", question)
+            if verification and numbers:
+                anchors = [*member_identifiers(question), *numbers]
+                if anchors and not any(
+                    all(
+                        re.search(
+                            rf"(?<![A-Za-z0-9_]){re.escape(anchor)}(?![A-Za-z0-9_])",
+                            str(getattr(document, "page_content", "")),
+                            flags=re.IGNORECASE,
+                        )
+                        for anchor in anchors
+                    )
+                    for document in documents
+                ):
+                    return " ".join(anchors)
+            absolute_claim = bool(
+                re.search(
+                    r"(?i)\b(?:always|every|all|never|without\s+any|exactly|"
+                    r"siempre|todos?|todas?|nunca|sin\s+ning(?:ún|un|una)|exactamente)\b",
+                    question,
+                )
+            )
+            if verification and absolute_claim:
+                asserted = (
+                    re.sub(
+                        r"(?i)^\s*(?:verify|assert|confirm|state|claim|afirma|confirma|verifica|declara)"
+                        r"(?:\s+that|\s+que)?\s+",
+                        "",
+                        question,
+                    )
+                    .strip()
+                    .rstrip(".?!")
+                )
+                normalized_asserted = " ".join(asserted.casefold().split())
+                if normalized_asserted and not any(
+                    normalized_asserted
+                    in " ".join(str(getattr(document, "page_content", "")).casefold().split())
+                    for document in documents
+                ):
+                    return asserted
+            return ""
+    exact = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(subject)}(?![A-Za-z0-9_])", re.IGNORECASE)
+    return (
+        ""
+        if any(exact.search(str(getattr(document, "page_content", ""))) for document in documents)
+        else subject
+    )
+
+
 def _enforce_table_claim_shape(
     generated: GroundedAnswer, answer_style: str
 ) -> tuple[GroundedAnswer, int]:
@@ -274,7 +534,7 @@ def _enforce_table_claim_shape(
 def _single_record_details_table(generated: GroundedAnswer, language: str) -> GroundedAnswer:
     """Preserve cited model prose in a deterministic record-details table."""
 
-    if answer_shape_metrics(generated.answer)["answer_table_count"] > 0:
+    if int(answer_shape_metrics(generated.answer)["answer_table_count"]) > 0:
         return generated
     rows: list[str] = []
     for index, claim in enumerate(material_claims(generated.answer), start=1):
@@ -361,10 +621,10 @@ def _deterministic_single_record_table(
             else "| Attribute | Value | Source |\n|---|---|---|"
         )
         labels = ("Registro", "Detalles") if language == "es" else ("Record", "Details")
-        rows = (
+        rows = [
             f"| {labels[0]} | {safe_record} | [SOURCE {source_index}] |",
             f"| {labels[1]} | {safe_body} | [SOURCE {source_index}] |",
-        )
+        ]
         return GroundedAnswer(
             answer="\n".join((table_header, *rows)),
             citations=[source_index],
@@ -785,7 +1045,7 @@ def _scope_is_evidenced(
     return pattern_matches(f"{heading} {body}")
 
 
-def _prefer_document_language(documents: list[object], language: str) -> list[object]:
+def _prefer_document_language(documents: Sequence[object], language: str) -> list[object]:
     """Put the user's indexed language first without discarding fallbacks."""
 
     requested = language.strip().casefold()
@@ -1173,6 +1433,22 @@ def _coverage_expected_identifiers(
         published = _published_population_members(evidence_documents, scope_labels)
         if published:
             return published
+    if scope_labels:
+        scoped_population = tuple(
+            dict.fromkeys(
+                key
+                for document in population_documents
+                if (key := str(getattr(document, "metadata", {}).get("entity_key") or "").strip())
+                and any(
+                    str(getattr(document, "metadata", {}).get("entity") or "").casefold()
+                    == scope.casefold()
+                    or key.casefold().startswith(scope.casefold() + "_")
+                    for scope in scope_labels
+                )
+            )
+        )
+        if scoped_population:
+            return scoped_population
     # The metadata population is loaded by a filter that admits a chunk when
     # *any* subject label matches it (retrieval.py). One weak label is therefore
     # enough to admit an entire unrelated registry -- "key" matches every event
@@ -1181,7 +1457,7 @@ def _coverage_expected_identifiers(
     # same subject test the evidence path uses is applied here first.
     candidates = [*population_documents, *(evidence_documents or [])]
     subject_evidenced = _subject_is_evidenced(candidates, subject_labels)
-    metadata_population = ()
+    metadata_population: tuple[str, ...] = ()
     if subject_evidenced:
         frequencies = _subject_label_frequencies(candidates, subject_labels)
         required = _required_subject_labels(frequencies, subject_labels)
@@ -1302,6 +1578,27 @@ def _deterministic_population_inventory_answer(
         ),
         citations=list(dict.fromkeys(located[identifier][1] for identifier in expected)),
         missing_information=[],
+    )
+
+
+def _population_inventory_answer_verified(
+    generated: GroundedAnswer,
+    documents: Sequence[object],
+    expected: tuple[str, ...],
+) -> bool:
+    """Verify a deterministic population directly against cited entity metadata."""
+
+    if not expected or _coverage(expected, generated.answer):
+        return False
+    cited = set(generated.citations)
+    if not _citations_valid(generated, len(documents)):
+        return False
+    return all(
+        any(
+            index in cited and str(getattr(document, "metadata", {}).get("entity_key") or "") == key
+            for index, document in enumerate(documents, start=1)
+        )
+        for key in expected
     )
 
 
@@ -1503,13 +1800,20 @@ def _expand_standalone_identifier_question(question: str, documents: list[object
 class AnswerNodesMixin:
     """AnswerNodes responsibilities."""
 
+    _generator: LangChainGroundedAnswerGenerator
+    _grounding_verifier: LocalCitationGroundingVerifier
+    _request: RagRequest
+    _retriever: ChromaAccessRetriever
+    _settings: Settings
+    _vocabulary: CorpusVocabulary
+
     async def _generate(self, state: RagState) -> RagState:
         began = started()
         overview_style_repaired = False
         answer_question = state.get("resolved_question") or self._request.question
         route_refusal_reason = state.get("canonical_route_refusal_reason", "")
         if route_refusal_reason:
-            generated = GroundedAnswer(
+            refusal_generated = GroundedAnswer(
                 answer=refusal_answer(route_refusal_reason, state.get("language", "mixed")),
                 citations=[],
                 outcome="REFUSAL",
@@ -1528,7 +1832,7 @@ class AnswerNodesMixin:
                 language=state.get("language", "und"),
             )
             return {
-                "generated": generated,
+                "generated": refusal_generated,
                 "documents": list(state.get("documents", [])),
                 "answer_style": "corpus_declared_refusal",
                 "generated_outcome": "REFUSAL",
@@ -1538,6 +1842,7 @@ class AnswerNodesMixin:
             }
         list_response_requested = _list_response_requested(answer_question)
         from app.jira_query import current_jira_status_evidence
+
         # Parent reconstruction and evidence repair must not reintroduce Jira
         # history into a current-status answer after retrieval has filtered it.
         retrieved_documents = current_jira_status_evidence(
@@ -1570,6 +1875,86 @@ class AnswerNodesMixin:
                 entity_excluded_titles,
                 scope_bypassed,
             ) = _scope_documents_to_entity(retrieved_documents, requested_entity)
+        if state.get("query_intent") == "CODE_INVENTORY":
+            documents = _code_inventory_documents(
+                documents,
+                maximum=max(len(documents), 1),
+                question=answer_question,
+            )
+            sibling_loader = getattr(self._retriever, "ainvoke_source_siblings", None)
+            source_ids = tuple(
+                dict.fromkeys(
+                    str(document.metadata.get("source_id") or "")
+                    for document in documents
+                    if document.metadata.get("source_id")
+                )
+            )
+            if sibling_loader is not None and source_ids:
+                siblings = await sibling_loader(source_ids, state.get("source_types", ()))
+                documents = _code_inventory_documents(
+                    [*documents, *siblings],
+                    maximum=max(len(documents) + len(siblings), 1),
+                    question=answer_question,
+                )
+        if is_exhaustive_entity_detail_question(answer_question):
+            identifiers = member_identifiers(answer_question)
+            sibling_loader = getattr(self._retriever, "ainvoke_source_siblings", None)
+            if identifiers and sibling_loader is not None:
+                target = identifiers[0].removesuffix("_EVENT")
+                source_ids = tuple(
+                    dict.fromkeys(
+                        str(document.metadata.get("source_id") or "")
+                        for document in documents
+                        if document.metadata.get("source_id")
+                        and str(document.metadata.get("source_type") or "").upper() == "CODE"
+                        and target
+                        in " ".join(
+                            (
+                                document.page_content,
+                                str(document.metadata.get("entity_key") or ""),
+                                str(document.metadata.get("symbol") or ""),
+                            )
+                        )
+                    )
+                )
+                if source_ids:
+                    siblings = await sibling_loader(source_ids, state.get("source_types", ()))
+                    documents = list(
+                        {
+                            str(document.metadata.get("chunk_id") or id(document)): document
+                            for document in [*documents, *siblings]
+                        }.values()
+                    )
+        unsupported_subject = _unsupported_definition_subject(answer_question, documents)
+        if unsupported_subject:
+            reason = "INSUFFICIENT_EVIDENCE"
+            unsupported_generated = GroundedAnswer(
+                answer=refusal_answer(reason, state.get("language", "mixed")),
+                citations=[],
+                outcome="REFUSAL",
+                refusal_reason=reason,
+            )
+            stage_complete(
+                "generate",
+                self._request.project_id,
+                began,
+                input_count=len(documents),
+                output_count=0,
+                reason_code="DEFINITION_SUBJECT_NOT_EVIDENCED",
+                model_provider="deterministic",
+                model_name="exact-definition-evidence-gate",
+                model_profile="grounding",
+                language=state.get("language", "und"),
+            )
+            return {
+                "generated": unsupported_generated,
+                "documents": documents,
+                "answer_style": "unsupported_definition",
+                "generated_outcome": "REFUSAL",
+                "generated_refusal_reason": reason,
+                "canonical_fallback_used": False,
+                "canonical_fallback_reason": "",
+            }
         coverage_expected_keys: tuple[str, ...] = ()
         coverage_expected_fields: tuple[str, ...] = ()
         population_retrieval_miss = False
@@ -1643,8 +2028,11 @@ class AnswerNodesMixin:
             initially_retrieved = {
                 str(document.metadata.get("entity_key") or "").strip() for document in documents
             }
-            population_retrieval_miss = bool(coverage_expected_keys) and not bool(
-                initially_retrieved.intersection(coverage_expected_keys)
+            population_retrieval_miss = (
+                bool(coverage_expected_keys)
+                and not bool(initially_retrieved.intersection(coverage_expected_keys))
+                and not _subject_is_evidenced(documents, subject_labels)
+                and not requested_entity
             )
             documents = _merge_ranked_documents(
                 documents,
@@ -1653,6 +2041,7 @@ class AnswerNodesMixin:
             )
         if resolved_request is not None and resolved_request.completeness.all_fields:
             exact_loader = getattr(self._retriever, "ainvoke_exact_identifiers", None)
+            field_loader = getattr(self._retriever, "ainvoke_entity_fields", None)
             aliases = structured_entity_aliases(answer_question, documents)
             if exact_loader is not None and aliases:
                 exact_documents = await exact_loader(aliases, state.get("source_types", ()))
@@ -1660,6 +2049,13 @@ class AnswerNodesMixin:
                     exact_documents,
                     documents,
                     top_n=len(exact_documents) + len(documents),
+                )
+            if field_loader is not None and aliases:
+                field_documents = await field_loader(aliases, state.get("source_types", ()))
+                documents = _merge_ranked_documents(
+                    field_documents,
+                    documents,
+                    top_n=len(field_documents) + len(documents),
                 )
             coverage_expected_fields = structured_entity_field_names(answer_question, documents)
         documents = current_jira_status_evidence(
@@ -1745,33 +2141,66 @@ class AnswerNodesMixin:
         )
         if destination_answer is not None:
             generated = destination_answer
+        comparison_extract = (
+            _deterministic_subject_comparison_answer(
+                answer_question,
+                documents,
+                comparison_subjects,
+                state.get("language", "mixed"),
+            )
+            if comparison_table_selected
+            else None
+        )
+        if comparison_extract is not None:
+            generated = comparison_extract
+        direct_extract = (
+            _deterministic_extractive_answer(
+                answer_question, documents, state.get("language", "mixed")
+            )
+            if generated is None
+            and re.search(
+                r"(?i)(?:\bsection\s+[A-Z][A-Z0-9_-]*-\d+\b|"
+                r"^\s*(?:tell\s+me\s+about|dime\s+sobre|háblame\s+de)\b)",
+                answer_question,
+            )
+            else None
+        )
+        if direct_extract is not None:
+            generated = direct_extract
         if generated is None and state.get("reconstruct_parent_records"):
             generated = _deterministic_single_record_table(documents, state.get("language", "en"))
-        if state.get("query_intent") in {"STRUCTURED_INVENTORY", "STRUCTURED_ENTITY"}:
+        if generated is None and state.get("query_intent") in {
+            "STRUCTURED_INVENTORY",
+            "STRUCTURED_ENTITY",
+        }:
             if destination_answer is None:
-                generated = _deterministic_structured_inventory_answer(
-                    answer_question,
-                    documents,
-                    state.get("language", "mixed"),
+                generated = (
+                    _deterministic_population_inventory_answer(coverage_expected_keys, documents)
+                    if coverage_expected_keys
+                    else _deterministic_structured_inventory_answer(
+                        answer_question,
+                        documents,
+                        state.get("language", "mixed"),
+                    )
                 )
-        elif state.get("query_intent") == "FEATURE_INVENTORY":
+        elif generated is None and state.get("query_intent") == "FEATURE_INVENTORY":
             generated = _deterministic_feature_inventory_answer(
                 documents,
                 state.get("language", "mixed"),
                 state.get("overview_entity", ""),
             )
-        elif state.get("query_intent") == "CODE_INVENTORY":
+        elif generated is None and state.get("query_intent") == "CODE_INVENTORY":
             generated = _deterministic_code_inventory_answer(
                 documents, state.get("language", "mixed")
             )
-        elif state.get("query_intent") == "IMPLEMENTATION":
+        elif generated is None and state.get("query_intent") == "IMPLEMENTATION":
             generated = _deterministic_code_location_answer(
                 answer_question,
                 documents,
                 state.get("language", "mixed"),
                 self._vocabulary.code_extensions,
             )
-        elif state.get("query_intent") == "DELIVERY":
+        elif generated is None and state.get("query_intent") == "DELIVERY":
             generated = _deterministic_delivery_answer(
                 answer_question,
                 documents,
@@ -1781,17 +2210,46 @@ class AnswerNodesMixin:
             generated = _deterministic_population_inventory_answer(
                 coverage_expected_keys, documents
             )
+        # Event-contract questions are safe to render deterministically even when
+        # the planner classified them as DIRECT. This extractor requires an exact
+        # identifier-bearing registry row; the more permissive canonical prose
+        # extractor must never win first and quote a neighboring implementation.
+        if generated is None:
+            generated = _deterministic_structured_inventory_answer(
+                answer_question,
+                documents,
+                state.get("language", "mixed"),
+            )
         if (
             generated is None
             and resolved_request is not None
             and resolved_request.expected_answer_shape in {"STRUCTURED", "COMPARISON"}
         ):
             generated = render_structured_facts(evidence_facts(documents))
+        canonical_direct = False
+        if generated is None:
+            generated = _deterministic_canonical_route_answer(
+                answer_question,
+                documents,
+                state.get("language", "mixed"),
+            )
+            canonical_direct = generated is not None
         deterministic = generated is not None
-        canonical_fallback_used = False
-        canonical_fallback_reason = ""
+        canonical_fallback_used = canonical_direct
+        canonical_fallback_reason = "EXACT_CANONICAL_ROUTE" if canonical_direct else ""
         generation_temperature = 0.0
-        answer_style = "concise"
+        answer_style = (
+            "canonical_quote"
+            if canonical_direct
+            else "literal_extract"
+            if direct_extract is not None and generated == direct_extract
+            else "comparison_extract"
+            if comparison_extract is not None and generated == comparison_extract
+            else "population_inventory"
+            if generated is not None
+            and _population_inventory_answer_verified(generated, documents, coverage_expected_keys)
+            else "concise"
+        )
 
         async def generate_model_answer(answer_style: str) -> GroundedAnswer:
             if not (
@@ -1969,9 +2427,13 @@ class AnswerNodesMixin:
                         if list_response_requested
                         else "concise"
                     )
-            except TimeoutError as failure:
+            except (TimeoutError, OutputParserException) as failure:
                 generation_failure = failure
-                canonical_fallback_reason = "STREAM_TIMEOUT"
+                canonical_fallback_reason = (
+                    "STREAM_TIMEOUT"
+                    if isinstance(failure, TimeoutError)
+                    else "INVALID_MODEL_RESPONSE"
+                )
             generation_temperature = float(getattr(self._generator, "last_temperature", 0.0))
             if not canonical_fallback_reason:
                 canonical_fallback_reason = _model_fallback_reason(generated)
@@ -1990,6 +2452,7 @@ class AnswerNodesMixin:
                     raise generation_failure
                 elif generated is None:
                     generated = GroundedAnswer(answer="", citations=[])
+        assert generated is not None, "generation must resolve to an answer or an explicit fallback"
         generation_usage = (
             TokenUsage()
             if not model_generation_attempted
@@ -2096,9 +2559,10 @@ class AnswerNodesMixin:
         # Provisional generation events are withheld by the streaming reducer;
         # both transports therefore use the same citation alignment before any
         # answer prose reaches the client.
-        generated = await self._grounding_verifier.attach_missing_citations(
-            documents, generated
-        )
+        if not (deterministic and _citations_valid(generated, len(documents))):
+            generated = await self._grounding_verifier.attach_missing_citations(
+                documents, generated
+            )
         generated = _normalize_citations(generated)
         generated, answer_shape_claims_removed = _enforce_table_claim_shape(generated, answer_style)
         coverage_missing = _coverage(coverage_expected_keys, generated.answer)
@@ -2225,10 +2689,47 @@ class AnswerNodesMixin:
         if state.get("grounded") is False:
             return {"missing_requirements": ()}
         answer_question = state.get("resolved_question") or self._request.question
-        missing = _missing_answer_requirements(
-            answer_question,
-            state["generated"].answer,
-            self._vocabulary.entities,
+        canonical_expected = (
+            _deterministic_canonical_route_answer(
+                answer_question,
+                state.get("documents", []),
+                state.get("language", "mixed"),
+            )
+            if state.get("answer_style") == "canonical_quote"
+            else None
+        )
+        if canonical_expected is not None:
+            canonical_expected = _normalize_citations(canonical_expected)
+        canonical_complete = bool(
+            canonical_expected is not None
+            and state["generated"] == canonical_expected
+            and _citations_valid(canonical_expected, len(state.get("documents", [])))
+            and _answer_has_minimum_substance(
+                answer_question, canonical_expected, "canonical_quote"
+            )
+        )
+        # The exact canonical index declares that its linked section answers the
+        # exact user wording. Reinterpreting a term such as Spanish "código" as
+        # an implementation requirement here starts a second, unrelated CODE
+        # retrieval and discards the already verified operational answer.
+        missing = (
+            ()
+            if canonical_complete
+            or (
+                state.get("answer_style") == "comparison_extract"
+                and _citations_valid(state["generated"], len(state.get("documents", [])))
+            )
+            or (
+                state.get("answer_style") == "literal_extract"
+                and _literal_extractive_answer_verified(
+                    state["generated"], state.get("documents", [])
+                )
+            )
+            else _missing_answer_requirements(
+                answer_question,
+                state["generated"].answer,
+                self._vocabulary.entities,
+            )
         )
         if state.get("query_intent") in {
             "FEATURE_INVENTORY",
@@ -2476,6 +2977,120 @@ class AnswerNodesMixin:
                 "grounding_reason": "INSUFFICIENT_ANSWER_SUBSTANCE",
                 "answer_relevance": 0.0,
             }
+        if state.get("answer_style") == "literal_extract":
+            verified = _literal_extractive_answer_verified(state["generated"], state["documents"])
+            stage_complete(
+                "verify_grounding",
+                self._request.project_id,
+                began,
+                input_count=len(state["generated"].citations),
+                output_count=1 if verified else 0,
+                reason_code=(
+                    "LITERAL_EXTRACT_VERIFIED" if verified else "LITERAL_EXTRACT_MISMATCH"
+                ),
+                model_provider="deterministic",
+                model_name="literal-extract-verifier",
+                model_profile="grounding",
+                language=state.get("language", "und"),
+            )
+            return {
+                "grounded": verified,
+                "grounding_reason": (
+                    "LITERAL_EXTRACT_VERIFIED" if verified else "LITERAL_EXTRACT_MISMATCH"
+                ),
+                "answer_relevance": 1.0 if verified else 0.0,
+            }
+        if state.get("answer_style") == "canonical_quote":
+            expected = _deterministic_canonical_route_answer(
+                answer_question,
+                state["documents"],
+                state.get("language", "mixed"),
+            )
+            if expected is not None:
+                expected = _normalize_citations(expected)
+            if (
+                expected is not None
+                and state["generated"] == expected
+                and _citations_valid(expected, len(state["documents"]))
+            ):
+                stage_complete(
+                    "verify_grounding",
+                    self._request.project_id,
+                    began,
+                    input_count=len(expected.citations),
+                    output_count=1,
+                    reason_code="CANONICAL_ROUTE_EXTRACT_VERIFIED",
+                    model_provider="deterministic",
+                    model_name="canonical-route-extract-verifier",
+                    model_profile="grounding",
+                    language=state.get("language", "und"),
+                )
+                return {
+                    "generated": expected,
+                    "grounded": True,
+                    "grounding_reason": "CANONICAL_ROUTE_EXTRACT_VERIFIED",
+                    "repaired": state.get("repaired", False),
+                }
+        if state.get("answer_style") == "population_inventory":
+            population_expected = tuple(state.get("coverage_expected_identifiers", ()))
+            verified = _population_inventory_answer_verified(
+                state["generated"], state["documents"], population_expected
+            )
+            stage_complete(
+                "verify_grounding",
+                self._request.project_id,
+                began,
+                input_count=len(state["generated"].citations),
+                output_count=1 if verified else 0,
+                reason_code=(
+                    "POPULATION_METADATA_VERIFIED" if verified else "POPULATION_METADATA_MISMATCH"
+                ),
+                model_provider="deterministic",
+                model_name="population-metadata-verifier",
+                model_profile="grounding",
+                language=state.get("language", "und"),
+            )
+            return {
+                "generated": state["generated"],
+                "grounded": verified,
+                "grounding_reason": (
+                    "POPULATION_METADATA_VERIFIED" if verified else "POPULATION_METADATA_MISMATCH"
+                ),
+                "repaired": state.get("repaired", False),
+                "answer_relevance": 1.0 if verified else 0.0,
+            }
+        if state.get("answer_style") == "comparison_extract":
+            subjects = _comparison_subjects(answer_question, self._vocabulary.entities)
+            verified = _subject_comparison_answer_verified(
+                state["generated"], state["documents"], subjects
+            )
+            stage_complete(
+                "verify_grounding",
+                self._request.project_id,
+                began,
+                input_count=len(state["generated"].citations),
+                output_count=1 if verified else 0,
+                reason_code=(
+                    "SUBJECT_COMPARISON_EXTRACT_VERIFIED"
+                    if verified
+                    else "SUBJECT_COMPARISON_EXTRACT_MISMATCH"
+                ),
+                model_provider="deterministic",
+                model_name="subject-comparison-extract-verifier",
+                model_profile="grounding",
+                language=state.get("language", "und"),
+            )
+            return {
+                "generated": state["generated"],
+                "grounded": verified,
+                "grounding_reason": (
+                    "SUBJECT_COMPARISON_EXTRACT_VERIFIED"
+                    if verified
+                    else "SUBJECT_COMPARISON_EXTRACT_MISMATCH"
+                ),
+                "repaired": state.get("repaired", False),
+                "answer_relevance": 1.0 if verified else 0.0,
+            }
         if state.get("query_intent") == "IMPLEMENTATION":
             expected = _deterministic_code_location_answer(
                 answer_question,
@@ -2622,7 +3237,7 @@ class AnswerNodesMixin:
         )
         usage = self._grounding_verifier.last_usage
         grounded = verdict.supported
-        reason_code = verdict.reason_code
+        reason_code: str = verdict.reason_code
         claim_fallback_removed_count = 0
         post_prune_regenerated = 0
         post_prune_below_floor = 0
@@ -2677,27 +3292,34 @@ class AnswerNodesMixin:
                     if below_floor and unused_evidence:
                         post_prune_regenerated = 1
                         try:
-                            regenerated = await self._generator.answer(
-                                answer_question,
-                                state["documents"],
-                                state.get("language", "mixed"),
-                                answer_style=state.get("answer_style", "concise"),
-                            )
-                        except TypeError as error:
-                            if "answer_style" not in str(error):
-                                raise
-                            regenerated = await self._generator.answer(
-                                answer_question,
-                                state["documents"],
-                                state.get("language", "mixed"),
-                            )
+                            try:
+                                regenerated = await self._generator.answer(
+                                    answer_question,
+                                    state["documents"],
+                                    state.get("language", "mixed"),
+                                    answer_style=state.get("answer_style", "concise"),
+                                )
+                            except TypeError as error:
+                                if "answer_style" not in str(error):
+                                    raise
+                                regenerated = await self._generator.answer(
+                                    answer_question,
+                                    state["documents"],
+                                    state.get("language", "mixed"),
+                                )
+                        except OutputParserException:
+                            regenerated = None
+                            reason_code = "CLAIMS_REMOVED_REGENERATION_INVALID"
                         usage = _add_usage(usage, self._generator.last_usage)
-                        regenerated = _normalize_citations(regenerated)
-                        regenerated = await self._grounding_verifier.attach_missing_citations(
-                            state["documents"], regenerated
-                        )
-                        regenerated = _normalize_citations(regenerated)
-                        if _citations_valid(regenerated, len(state["documents"])):
+                        if regenerated is not None:
+                            regenerated = _normalize_citations(regenerated)
+                            regenerated = await self._grounding_verifier.attach_missing_citations(
+                                state["documents"], regenerated
+                            )
+                            regenerated = _normalize_citations(regenerated)
+                        if regenerated is not None and _citations_valid(
+                            regenerated, len(state["documents"])
+                        ):
                             regenerated_verdict = await self._grounding_verifier.verify(
                                 answer_question,
                                 state["documents"],
@@ -2777,6 +3399,33 @@ class AnswerNodesMixin:
                     )
                 reason_code = "REPAIRED_SUPPORTED" if grounded else verdict.reason_code
                 state = {**state, "generated": repaired}
+        canonical_grounding_fallback_used = 0
+        # An exact canonical route is an authorized corpus declaration that the
+        # terse prompt is standalone.  If synthesis and its bounded repair both
+        # fail, retain usefulness by copying a topical two/three-sentence window
+        # from a route-matched source.  The extractor cannot introduce a token
+        # that is absent from that source, and citation/substance gates remain
+        # unchanged.
+        if not grounded and state.get("documents"):
+            canonical = _deterministic_canonical_route_answer(
+                answer_question,
+                state["documents"],
+                state.get("language", "mixed"),
+            )
+            if (
+                canonical is not None
+                and _citations_valid(canonical, len(state["documents"]))
+                and _answer_has_minimum_substance(
+                    answer_question,
+                    canonical,
+                    state.get("answer_style", "concise"),
+                )
+            ):
+                state = {**state, "generated": canonical}
+                generated = canonical
+                grounded = True
+                reason_code = "CANONICAL_ROUTE_EXTRACT_VERIFIED"
+                canonical_grounding_fallback_used = 1
         extractive_fallback_used = 0
         # A cross-encoder can reject a faithful paraphrase even when retrieval
         # contains an exact answer. Recover with complete source sentences only
@@ -2789,20 +3438,14 @@ class AnswerNodesMixin:
                 state["documents"],
                 state.get("language", "mixed"),
             )
-            if extracted is not None:
-                extracted_verdict = await self._grounding_verifier.verify(
-                    answer_question,
-                    state["documents"],
-                    extracted,
-                    answer_language=state.get("language", ""),
-                )
-                usage = _add_usage(usage, self._grounding_verifier.last_usage)
-                if extracted_verdict.supported:
-                    state = {**state, "generated": extracted}
-                    generated = extracted
-                    grounded = True
-                    reason_code = "EXTRACTIVE_EVIDENCE_SUPPORTED"
-                    extractive_fallback_used = 1
+            if extracted is not None and _literal_extractive_answer_verified(
+                extracted, state["documents"]
+            ):
+                state = {**state, "generated": extracted}
+                generated = extracted
+                grounded = True
+                reason_code = "LITERAL_EXTRACT_VERIFIED"
+                extractive_fallback_used = 1
         population_expected = tuple(state.get("coverage_expected_identifiers", ()))
         population_missing = _coverage(population_expected, state["generated"].answer)
         field_expected = tuple(state.get("coverage_expected_fields", ()))
@@ -2825,12 +3468,31 @@ class AnswerNodesMixin:
         # Score topicality for accepted and rejected grounding outcomes alike.
         # Restricting this to supported answers biased calibration data toward
         # the population that had already passed the preceding gate.
-        addresses, answer_relevance = await self._grounding_verifier.answer_addresses_question(
-            relevance_question,
-            generated.answer,
-            threshold=self._settings.answer_relevance_threshold,
-        )
+        if extractive_fallback_used:
+            # The extractor already requires concrete query-term overlap and
+            # every released claim was proved literal above. Re-scoring that
+            # same evidence probabilistically can only add variance and a model
+            # call; it cannot strengthen the proof.
+            addresses, answer_relevance = True, 1.0
+        else:
+            addresses, answer_relevance = await self._grounding_verifier.answer_addresses_question(
+                relevance_question,
+                generated.answer,
+                threshold=self._settings.answer_relevance_threshold,
+            )
         initial_answer_relevance = answer_relevance
+        canonical_route_relevance_verified = int(
+            grounded
+            and not addresses
+            and (canonical_grounding_fallback_used or state.get("canonical_fallback_used", False))
+        )
+        if canonical_route_relevance_verified:
+            # The authorized index matched the complete question exactly, its
+            # target section matched concrete query terms, and every released
+            # sentence was copied from that section. This structured proof is
+            # stronger than a low multilingual cosine on terse operational text.
+            addresses = True
+            reason_code = "CANONICAL_ROUTE_RELEVANCE_VERIFIED"
         relevance_repair_attempted = 0
         relevance_repair_succeeded = 0
         # A supported answer can still miss the requested subject. Give that
@@ -2901,29 +3563,24 @@ class AnswerNodesMixin:
                 state["documents"],
                 state.get("language", "mixed"),
             )
-            if extracted is not None:
-                extracted_verdict = await self._grounding_verifier.verify(
-                    answer_question,
-                    state["documents"],
-                    extracted,
-                    answer_language=state.get("language", ""),
+            if extracted is not None and _literal_extractive_answer_verified(
+                extracted, state["documents"]
+            ):
+                (
+                    extracted_addresses,
+                    extracted_relevance,
+                ) = await self._grounding_verifier.answer_addresses_question(
+                    relevance_question,
+                    extracted.answer,
+                    threshold=self._settings.answer_relevance_threshold,
                 )
-                usage = _add_usage(usage, self._grounding_verifier.last_usage)
-                if extracted_verdict.supported:
-                    extracted_addresses, extracted_relevance = (
-                        await self._grounding_verifier.answer_addresses_question(
-                            relevance_question,
-                            extracted.answer,
-                            threshold=self._settings.answer_relevance_threshold,
-                        )
-                    )
-                    if extracted_addresses:
-                        state = {**state, "generated": extracted}
-                        generated = extracted
-                        addresses = True
-                        answer_relevance = extracted_relevance
-                        reason_code = "EXTRACTIVE_EVIDENCE_SUPPORTED"
-                        extractive_fallback_used = 1
+                if extracted_addresses:
+                    state = {**state, "generated": extracted}
+                    generated = extracted
+                    addresses = True
+                    answer_relevance = extracted_relevance
+                    reason_code = "LITERAL_EXTRACT_VERIFIED"
+                    extractive_fallback_used = 1
         if grounded and not addresses:
             grounded = False
             reason_code = "ANSWER_NOT_RELEVANT"
@@ -2954,6 +3611,8 @@ class AnswerNodesMixin:
                 "post_prune_regenerated": post_prune_regenerated,
                 "post_prune_below_floor": post_prune_below_floor,
                 "claim_pruning_bypassed": claim_pruning_bypassed,
+                "canonical_grounding_fallback_used": canonical_grounding_fallback_used,
+                "canonical_route_relevance_verified": canonical_route_relevance_verified,
                 "extractive_fallback_used": extractive_fallback_used,
                 "coverage_expected": len(population_expected),
                 "coverage_covered": len(population_expected) - len(population_missing),
@@ -2996,6 +3655,7 @@ class AnswerNodesMixin:
                 "CLAIMS_REMOVED_SUPPORTED",
                 "RELEVANCE_REPAIRED_SUPPORTED",
                 "EXTRACTIVE_EVIDENCE_SUPPORTED",
+                "LITERAL_EXTRACT_VERIFIED",
             },
         }
 

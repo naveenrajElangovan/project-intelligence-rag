@@ -6,16 +6,13 @@ from collections.abc import AsyncIterator
 from langchain_core.documents import Document
 
 from app.llm import GroundedAnswer
-from app.grounding import _material_claims
+from app.grounding import LocalCitationGroundingVerifier, _material_claims
+from app.workflow_state import RagState
 
 
-def _degradation_reasons(
-    state: dict[str, object], *, unverified: bool = False
-) -> list[str]:
+def _degradation_reasons(state: RagState, *, unverified: bool = False) -> list[str]:
     reasons: list[str] = []
-    fallback_count = state.get(
-        "fallback_candidate_count", state.get("lexical_fallback_count", 0)
-    )
+    fallback_count = state.get("fallback_candidate_count", state.get("lexical_fallback_count", 0))
     if int(fallback_count or 0) > 0:
         reasons.append("LEXICAL_RETRIEVAL_FALLBACK")
     if state.get("repaired"):
@@ -41,7 +38,7 @@ def _highest_rerank_score(documents: list[Document]) -> float:
 
 
 async def _incrementally_verified_events(
-    verifier: object,
+    verifier: LocalCitationGroundingVerifier,
     *,
     question: str,
     documents: list[Document],
@@ -51,9 +48,7 @@ async def _incrementally_verified_events(
     """Release only sentences that independently pass the grounding verifier."""
 
     for index, sentence in enumerate(_material_claims(generated.answer), start=1):
-        citations = [
-            int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)
-        ]
+        citations = [int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)]
         verdict = await verifier.verify(
             question,
             documents,
@@ -74,6 +69,7 @@ async def _incrementally_verified_events(
                 "reason": verdict.reason_code,
             }
 
+
 def _expand_candidate_neighbors(
     ranked: list[Document],
     candidates: list[Document],
@@ -90,7 +86,9 @@ def _expand_candidate_neighbors(
 
     def add(document: Document) -> bool:
         identity = str(document.metadata.get("chunk_id") or id(document))
-        source_id = str(document.metadata.get("source_id") or document.metadata.get("reference") or identity)
+        source_id = str(
+            document.metadata.get("source_id") or document.metadata.get("reference") or identity
+        )
         if identity in selected_ids or source_counts.get(source_id, 0) >= max_per_source:
             return False
         selected_ids.add(identity)
@@ -109,7 +107,10 @@ def _expand_candidate_neighbors(
             (
                 candidate
                 for candidate in candidates
-                if str(candidate.metadata.get("parent_id") or candidate.metadata.get("source_id") or "") == parent
+                if str(
+                    candidate.metadata.get("parent_id") or candidate.metadata.get("source_id") or ""
+                )
+                == parent
                 and str(candidate.metadata.get("source_version") or "") == source_version
                 and abs(int(candidate.metadata.get("chunk_ordinal") or 0) - ordinal) == 1
             ),
@@ -124,9 +125,7 @@ def _expand_candidate_neighbors(
                 neighbor.metadata["neighbor_of"] = str(
                     anchor.metadata.get("chunk_id") or anchor.metadata.get("source_id") or ""
                 )
-                neighbor.metadata["inherited_score"] = float(
-                    anchor.metadata.get("rerank_score", 0)
-                )
+                neighbor.metadata["inherited_score"] = float(anchor.metadata.get("rerank_score", 0))
                 neighbor.metadata.pop("rerank_score", None)
                 added += 1
     for document in ranked:
@@ -137,7 +136,7 @@ def _expand_candidate_neighbors(
 
 
 def _stream_progress(
-    node_name: str, language: str, details: dict[str, object] | None = None
+    node_name: str, language: str, details: RagState | None = None
 ) -> dict[str, object] | None:
     """Map internal graph nodes to content-free, user-facing progress events."""
 

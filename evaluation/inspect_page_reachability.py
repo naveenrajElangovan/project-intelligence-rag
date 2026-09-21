@@ -79,24 +79,34 @@ async def main() -> None:
 
     dense = await retriever.ainvoke_scoped(arguments.question, tuple(scope))
     fell_back = any(d.metadata.get("retrieval_fallback") for d in dense)
-    print(f"\nretrieved: {len(dense)} chunks"
-          + ("  *** LEXICAL FALLBACK -- dense retrieval failed, see the log line above ***"
-             if fell_back else ""))
+    print(
+        f"\nretrieved: {len(dense)} chunks"
+        + (
+            "  *** LEXICAL FALLBACK -- dense retrieval failed, see the log line above ***"
+            if fell_back
+            else ""
+        )
+    )
 
-    hits = [(rank, d) for rank, d in enumerate(dense, start=1) if _matches(d, arguments.expect_title)]
+    hits = [
+        (rank, d) for rank, d in enumerate(dense, start=1) if _matches(d, arguments.expect_title)
+    ]
     if not hits:
-        print(f"\n[1/2] The expected page is NOT in the dense candidate set.")
+        print("\n[1/2] The expected page is NOT in the dense candidate set.")
         print("      Either it was never indexed, or the source scope above excludes it,")
         print("      or the embedding simply does not associate it with this wording.")
     else:
-        print(f"\n[ok] The expected page IS in the candidate set, at dense ranks:")
+        print("\n[ok] The expected page IS in the candidate set, at dense ranks:")
         for rank, document in hits[:5]:
-            print(f"     #{rank:<3} score={float(document.metadata.get('score') or 0):.4f}"
-                  f"  {str(document.metadata.get('structure_path') or '')[:70]}")
+            print(
+                f"     #{rank:<3} score={float(document.metadata.get('score') or 0):.4f}"
+                f"  {str(document.metadata.get('structure_path') or '')[:70]}"
+            )
 
     lexical = BM25Retriever().rank(arguments.question, list(dense))
     lexical_ranks = [
-        rank for rank, document in enumerate(lexical, start=1)
+        rank
+        for rank, document in enumerate(lexical, start=1)
         if _matches(document, arguments.expect_title)
     ]
     print(f"\nlexical channel: expected page at ranks {lexical_ranks[:5] or 'absent'}")
@@ -108,27 +118,35 @@ async def main() -> None:
     )
     fused = fusion.fuse(lexical, list(dense), limit=settings.max_candidates)
     fused_ranks = [
-        rank for rank, document in enumerate(fused, start=1)
+        rank
+        for rank, document in enumerate(fused, start=1)
         if _matches(document, arguments.expect_title)
     ]
-    print(f"fused           : expected page at ranks {fused_ranks[:5] or 'absent'}"
-          f" of {len(fused)} candidates")
+    print(
+        f"fused           : expected page at ranks {fused_ranks[:5] or 'absent'}"
+        f" of {len(fused)} candidates"
+    )
 
     reranker = build_reranker(settings)
     reranked = await reranker.rerank(arguments.question, list(fused))
     reranked_ranks = [
-        rank for rank, document in enumerate(reranked, start=1)
+        rank
+        for rank, document in enumerate(reranked, start=1)
         if _matches(document, arguments.expect_title)
     ]
-    print(f"reranked        : {len(reranked)} survive the window;"
-          f" expected page at ranks {reranked_ranks[:5] or 'absent'}")
+    print(
+        f"reranked        : {len(reranked)} survive the window;"
+        f" expected page at ranks {reranked_ranks[:5] or 'absent'}"
+    )
 
     print("\n--- what survives, in order ---")
     for rank, document in enumerate(reranked, start=1):
         mark = " <== expected" if _matches(document, arguments.expect_title) else ""
-        print(f"  #{rank:<3} {float(document.metadata.get('rerank_score') or 0):.3f}"
-              f"  {str(document.metadata.get('title') or '')[:42]:42}"
-              f"  {str(document.metadata.get('structure_path') or '')[:44]}{mark}")
+        print(
+            f"  #{rank:<3} {float(document.metadata.get('rerank_score') or 0):.3f}"
+            f"  {str(document.metadata.get('title') or '')[:42]:42}"
+            f"  {str(document.metadata.get('structure_path') or '')[:44]}{mark}"
+        )
 
     print("\n--- verdict ---")
     if fell_back:

@@ -1,0 +1,245 @@
+from langchain_core.documents import Document
+import pytest
+
+from app.retrieval_pipeline import (
+    BM25Retriever,
+    HeuristicContextEvaluator,
+    ReciprocalRankFusion,
+    authorized_project_policies,
+    balanced_source_ids,
+    deduplicate_candidate_bodies,
+    validate_authorized_candidates,
+)
+
+
+def document(chunk_id: str, text: str, **metadata) -> Document:
+    return Document(page_content=text, metadata={"chunk_id": chunk_id, **metadata})
+
+
+def test_bm25_preserves_exact_identifiers_and_metadata() -> None:
+    exact = document("exact", "CashReliefConfirmationModal returns HTTP 403", path="Payment.kt")
+    other = document("other", "The payment screen renders a checkout form", path="Checkout.kt")
+
+    ranked = BM25Retriever().rank("HTTP 403 CashReliefConfirmationModal", [other, exact])
+
+    assert ranked[0] is exact
+    assert exact.metadata["lexical_score"] > 0
+
+
+def test_rrf_fuses_independent_channels() -> None:
+    lexical = document("lexical", "exact PR-1842")
+    dense = document("dense", "semantic deployment failure")
+    shared = document("shared", "PR-1842 deployment failure")
+
+    fused = ReciprocalRankFusion(k=10).fuse([shared, lexical], [shared, dense], limit=3)
+
+    assert [item.metadata["chunk_id"] for item in fused] == ["shared", "lexical", "dense"]
+    assert all(item.metadata["retrieval_channel"] == "hybrid" for item in fused)
+
+
+def test_rrf_preserves_exact_anchor_metadata_from_dense_duplicate() -> None:
+    lexical = document("registry", "POS family (1xx)", lexical_score=4.0)
+    exact = document(
+        "registry",
+        "POS family (1xx)",
+        identifier_anchor=True,
+        identifier_anchor_score=42.0,
+    )
+
+    fused = ReciprocalRankFusion().fuse([lexical], [exact], limit=1)
+
+    assert fused[0].metadata["identifier_anchor"] is True
+    assert fused[0].metadata["identifier_anchor_score"] == 42.0
+
+
+def test_rrf_truncation_protects_an_anchor_without_family_rank_metadata() -> None:
+    lexical = [
+        document(
+            f"lexical-{index}",
+            f"lexical-{index}",
+            source_type="PAGE",
+            lexical_family_rank=index + 1,
+        )
+        for index in range(20)
+    ]
+    anchor = document(
+        "exact-file",
+        "exact-file",
+        source_type="CODE",
+        identifier_anchor=True,
+    )
+
+    fused = ReciprocalRankFusion().fuse(lexical, [anchor], limit=8)
+
+    assert anchor in fused
+
+
+def test_rrf_truncation_balances_dynamically_observed_source_families() -> None:
+    lexical = [
+        document(
+            f"code-{index}",
+            f"code-{index}",
+            source_type="CODE",
+            source_id="code:dominant",
+        )
+        for index in range(80)
+    ]
+    lexical.extend(
+        document(
+            f"page-{index}",
+            f"page-{index}",
+            source_type="PAGE",
+            source_id=f"page:{index}",
+        )
+        for index in range(8)
+    )
+
+    fused = ReciprocalRankFusion().fuse(lexical, [], limit=16)
+
+    assert len(fused) == 16
+    assert sum(item.metadata["source_type"] == "CODE" for item in fused) == 12
+    assert sum(item.metadata["source_type"] == "PAGE" for item in fused) == 4
+    assert {
+        item.metadata["source_id"] for item in fused if item.metadata["source_type"] == "PAGE"
+    } == {f"page:{index}" for index in range(4)}
+
+
+def test_rrf_scores_use_rank_within_source_family_not_interleaved_position() -> None:
+    code = document(
+        "code",
+        "code",
+        source_type="CODE",
+        dense_family_rank=1,
+    )
+    page = document(
+        "page",
+        "page",
+        source_type="PAGE",
+        dense_family_rank=1,
+    )
+
+    fused = ReciprocalRankFusion(k=60).fuse([], [code, page], limit=2)
+
+    assert fused[0].metadata["fusion_score"] == fused[1].metadata["fusion_score"]
+
+
+def test_source_expansion_selects_only_independently_retrieved_compound_sources() -> None:
+    documents = [
+        document("page-a-1", "a1", source_id="page:a", source_type="PAGE"),
+        document("code-one", "code", source_id="code:one", source_type="CODE"),
+        document("page-b-1", "b1", source_id="page:b", source_type="PAGE"),
+        document("page-a-2", "a2", source_id="page:a", source_type="PAGE"),
+        document("page-b-2", "b2", source_id="page:b", source_type="PAGE"),
+    ]
+
+    assert balanced_source_ids(documents) == ("page:a", "page:b")
+
+
+def test_rrf_duplicate_retains_family_rank_from_each_channel() -> None:
+    lexical = document(
+        "shared",
+        "shared",
+        source_type="CODE",
+        lexical_family_rank=9,
+    )
+    dense = document(
+        "shared",
+        "shared",
+        source_type="CODE",
+        dense_family_rank=2,
+    )
+
+    fused = ReciprocalRankFusion().fuse([lexical], [dense], limit=1)
+
+    assert fused[0].metadata["lexical_family_rank"] == 9
+    assert fused[0].metadata["dense_family_rank"] == 2
+
+
+def test_duplicate_candidate_bodies_consume_one_reranking_slot() -> None:
+    preferred = document("preferred", "@Composable", content_hash="same", reference="POS.kt")
+    duplicate = document("duplicate", "@Composable", content_hash="same", reference="BOT.kt")
+    distinct = document("distinct", "fun checkout()", content_hash="other")
+
+    result = deduplicate_candidate_bodies([preferred, duplicate, distinct])
+
+    assert result == [preferred, distinct]
+    assert preferred.metadata["duplicate_references"] == ["BOT.kt"]
+
+
+def test_authorization_filter_fails_closed_and_excludes_cross_project_documents() -> None:
+    allowed = document(
+        "allowed", "POS evidence", project_id="DEMO", access_policy_id="project:DEMO"
+    )
+    unauthorized = document(
+        "other", "BOT evidence", project_id="AAOS", access_policy_id="project:AAOS"
+    )
+
+    result = validate_authorized_candidates(
+        [allowed, unauthorized], project_id="DEMO", access_policy_ids=["project:DEMO"]
+    )
+
+    assert result == [allowed]
+    with pytest.raises(PermissionError):
+        validate_authorized_candidates([allowed], project_id="DEMO", access_policy_ids=[])
+
+
+def test_authorization_filter_allows_only_explicit_department_policies() -> None:
+    shared = document(
+        "shared", "Company evidence", project_id="DEMO", access_policy_id="project:DEMO"
+    )
+    store = document(
+        "store",
+        "Store evidence",
+        project_id="DEMO",
+        access_policy_id="department:DEMO:STORE_OPERATIONS",
+    )
+    finance = document(
+        "finance",
+        "Finance evidence",
+        project_id="DEMO",
+        access_policy_id="department:DEMO:FINANCE_AND_ACCOUNTING",
+    )
+
+    result = validate_authorized_candidates(
+        [shared, store, finance],
+        project_id="DEMO",
+        access_policy_ids=[
+            "project:DEMO",
+            "department:DEMO:STORE_OPERATIONS",
+        ],
+    )
+
+    assert result == [shared, store]
+
+
+def test_cross_project_policy_is_removed_before_retrieval() -> None:
+    assert authorized_project_policies(
+        "DEMO",
+        [
+            "project:DEMO",
+            "project:OTHER",
+            "department:DEMO:STORE_OPERATIONS",
+            "department:OTHER:FINANCE_AND_ACCOUNTING",
+            "role:DEMO:EMPLOYEE",
+            "user:user-id",
+        ],
+    ) == (
+        "project:DEMO",
+        "department:DEMO:STORE_OPERATIONS",
+        "role:DEMO:EMPLOYEE",
+        "user:user-id",
+    )
+
+
+def test_context_evaluator_reports_no_results_and_sufficient_context() -> None:
+    evaluator = HeuristicContextEvaluator()
+    empty = evaluator.evaluate("What failed?", [])
+    sufficient = evaluator.evaluate(
+        "What failed?",
+        [document("one", "The build failed", rerank_score=0.91)],
+    )
+
+    assert empty.failure_reason == "NO_RESULTS"
+    assert empty.retry_recommended is True
+    assert sufficient.quality == "SUFFICIENT"
+    assert sufficient.retry_recommended is False

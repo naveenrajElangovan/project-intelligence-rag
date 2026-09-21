@@ -34,9 +34,7 @@ REQUIRED_COLUMNS = (
     "regions",
     "effective_date",
 )
-PRICE_COLUMNS = frozenset(
-    {"price", "precio", "regular_price", "sale_price", "currency"}
-)
+PRICE_COLUMNS = frozenset({"price", "precio", "regular_price", "sale_price", "currency"})
 
 
 class CatalogValidationError(ValueError):
@@ -120,9 +118,7 @@ def validate_manifest(
     )
     missing = [key for key in required if manifest.get(key) in (None, "", {})]
     if missing:
-        raise CatalogValidationError(
-            "Manifest is missing required values: " + ", ".join(missing)
-        )
+        raise CatalogValidationError("Manifest is missing required values: " + ", ".join(missing))
     try:
         date.fromisoformat(str(manifest["effectiveDate"]))
     except ValueError as error:
@@ -135,8 +131,7 @@ def validate_manifest(
         )
     actual_totals = dict(sorted(Counter(row["category_code"] for row in rows).items()))
     declared_totals = {
-        str(key): int(value)
-        for key, value in dict(manifest["categoryTotals"]).items()
+        str(key): int(value) for key, value in dict(manifest["categoryTotals"]).items()
     }
     if declared_totals != actual_totals:
         raise CatalogValidationError(

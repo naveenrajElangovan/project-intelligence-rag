@@ -49,9 +49,7 @@ async def _main() -> None:
     )
 
     began = time.perf_counter()
-    warmed_projects = await warm_authorized_lexical_corpora(
-        settings, build_embedder(settings)
-    )
+    warmed_projects = await warm_authorized_lexical_corpora(settings, build_embedder(settings))
     warm_ms = (time.perf_counter() - began) * 1000
 
     retriever = _retriever(settings, arguments.project_id)

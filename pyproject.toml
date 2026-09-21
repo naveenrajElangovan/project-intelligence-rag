@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==81.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
   "azure-identity==1.25.3",
   "fastapi==0.141.1",
+  "httpx==0.28.1",
   "langchain-core==1.5.5",
   "langchain-ollama==1.1.0",
   "langchain-openai==1.5.1",
@@ -20,22 +21,28 @@ dependencies = [
   "opentelemetry-exporter-otlp-proto-http==1.44.0",
   "opentelemetry-sdk==1.44.0",
   "prometheus-client==0.26.0",
+  "pydantic==2.13.4",
   "pydantic-settings==2.15.0",
   "sentence-transformers==5.7.0",
+  "starlette==0.47.3",
+  "torch==2.11.0",
   "uvicorn[standard]==0.52.3",
+  "huggingface-hub==1.27.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "coverage>=7.10,<8",
-  "import-linter>=2.7,<3",
-  "mypy>=1.18,<2",
-  "pre-commit>=4.3,<5",
-  "pytest>=8.4,<9",
-  "ruff>=0.13,<1",
+  "coverage==7.10.7",
+  "deptry==0.25.1",
+  "import-linter==2.7",
+  "mypy==1.18.2",
+  "pre-commit==4.3.0",
+  "pytest==8.4.2",
+  "ruff==0.13.2",
 ]
 eval = [
   "ragas==0.4.3",
+  "pandas==3.0.5",
   # Ragas 0.4.3 still imports chat_models.vertexai; 0.4.2 removed it.
   "langchain-community==0.4.1",
 ]
@@ -62,6 +69,7 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 python_version = "3.12"
+plugins = ["pydantic.mypy"]
 show_error_codes = true
 warn_unused_configs = true
 
