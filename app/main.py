@@ -124,8 +124,7 @@ async def _warm_or_report(name: str, awaitable) -> None:
         raise
     except Exception as failure:
         logging.getLogger("app.startup").warning(
-            "The %s warm-up failed (%s: %s); serving cold. /ready stays 503 "
-            "while its dependency is unavailable.",
+            "The %s warm-up failed (%s: %s); serving cold while its dependency is unavailable.",
             name,
             type(failure).__name__,
             failure,
@@ -198,6 +197,9 @@ async def lifespan(_application: FastAPI):
                 await asyncio.wait_for(warm_task, timeout=5)
         if tracer_provider is not None:
             await asyncio.to_thread(tracer_provider.shutdown)
+        from app.model_gateway import close_model_gateway_clients
+
+        await close_model_gateway_clients()
 
 
 def create_app() -> FastAPI:
@@ -254,16 +256,14 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
     """Acquire capacity before retrieval or reject the request immediately."""
 
     loop = asyncio.get_running_loop()
-    # Preserve the conservative local clamp unless an operator explicitly opts
-    # into pipeline overlap. The accelerator and model have their own bounds, so
-    # the override changes admission only; it never widens either inference slot.
+    # Admission bounds whole requests; model and accelerator calls have their
+    # own independent semaphores. Coupling admission to the single local-model
+    # slot prevented request B from retrieving while request A was generating,
+    # even though those stages use different resources.
     capacity = settings.max_inflight_requests
     if settings.admission_capacity_override is not None:
         capacity = settings.admission_capacity_override
         capacity_path = "override"
-    elif settings.local_inference_enabled:
-        capacity = min(capacity, settings.local_max_concurrency)
-        capacity_path = "local-clamp"
     else:
         capacity_path = "configured-maximum"
     key = (id(loop), capacity)
@@ -277,19 +277,10 @@ async def _acquire_request_slot(settings: Settings) -> _RequestSlot:
                 "bounded.",
                 capacity,
             )
-        elif capacity_path == "local-clamp":
-            LOGGER.info(
-                "Admission capacity is %d, clamped from PI_RAG_MAX_INFLIGHT_"
-                "REQUESTS=%d by PI_RAG_LOCAL_MAX_CONCURRENCY=%d. Requests beyond "
-                "it are shed with 503, not queued.",
-                capacity,
-                settings.max_inflight_requests,
-                settings.local_max_concurrency,
-            )
         else:
             LOGGER.info(
                 "Admission capacity is %d from PI_RAG_MAX_INFLIGHT_REQUESTS; "
-                "the local-inference clamp is inactive.",
+                "model and accelerator concurrency remain independently bounded.",
                 capacity,
             )
     semaphore = _REQUEST_SEMAPHORES[key]
@@ -331,11 +322,10 @@ async def metrics() -> Response:
 
 @app.get("/ready")
 async def ready(settings: Settings = Depends(get_settings)) -> dict[str, str]:
-    if not app.state.lexical_corpus_ready:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "The lexical retrieval corpus is still warming.",
-        )
+    # The authorized lexical corpus is an optimization and continues warming in
+    # the background. Exact structured operations and dense retrieval remain
+    # correct while it is cold, so cache temperature must not take the whole
+    # application out of service.
     if not settings.llm_configured:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -507,7 +497,7 @@ async def answer(request: RagRequest, settings: Settings = Depends(get_settings)
         )
         # The dependency or request budget has already failed. A second model
         # call would queue behind the same outage and delay the 503 again.
-        user_message = pipeline_unavailable_answer(language)
+        user_message = pipeline_unavailable_answer(language, request.question)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, user_message) from failure
     finally:
         request_slot.release()
@@ -585,7 +575,7 @@ async def answer_stream(
                 language=language,
                 reason_code=failure_code,
             )
-            message = pipeline_unavailable_answer(language)
+            message = pipeline_unavailable_answer(language, request.question)
             yield (
                 json.dumps(
                     {"type": "error", "message": message},

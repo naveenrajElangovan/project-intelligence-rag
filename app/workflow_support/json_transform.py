@@ -133,9 +133,7 @@ class JsonTransformResult:
     error_column: int = 0
 
 
-def detect_json_transform_request(
-    question: str, language: str
-) -> JsonTransformRequest | None:
+def detect_json_transform_request(question: str, language: str) -> JsonTransformRequest | None:
     """Return a conversion request only when the message asks for one and carries JSON.
 
     Two independent paths qualify. Either the message asks for a conversion in so
@@ -196,8 +194,7 @@ def transform_json(payload: str) -> JsonTransformResult:
             repairs=repairs,
             unwrap_rounds=unwrap_rounds,
             error_message=(
-                f"the payload nests {depth} levels deep, above the "
-                f"{MAX_NESTING_DEPTH} level limit"
+                f"the payload nests {depth} levels deep, above the {MAX_NESTING_DEPTH} level limit"
             ),
         )
     return JsonTransformResult(
@@ -208,13 +205,10 @@ def transform_json(payload: str) -> JsonTransformResult:
     )
 
 
-
 def _inline(value: object) -> str:
     """Compact single-line form. ensure_ascii=False keeps accented Spanish readable."""
 
-    return json.dumps(
-        value, ensure_ascii=False, separators=(", ", ": "), allow_nan=False
-    )
+    return json.dumps(value, ensure_ascii=False, separators=(", ", ": "), allow_nan=False)
 
 
 def format_json(value: object, width: int = LINE_WIDTH, indent: int = _INDENT) -> str:
@@ -311,10 +305,14 @@ def json_transform_answer(result: JsonTransformResult, language: str) -> str:
     spanish = language == "es"
     if not result.ok:
         position = (
-            f" (línea {result.error_line}, columna {result.error_column})"
-            if spanish
-            else f" (line {result.error_line}, column {result.error_column})"
-        ) if result.error_line else ""
+            (
+                f" (línea {result.error_line}, columna {result.error_column})"
+                if spanish
+                else f" (line {result.error_line}, column {result.error_column})"
+            )
+            if result.error_line
+            else ""
+        )
         heading = (
             "No pude convertir esto en JSON válido"
             if spanish
@@ -426,9 +424,9 @@ def _bare_payload(question: str) -> str | None:
         if not candidate:
             continue
         remainder = stripped.replace(candidate, "", 1)
-        remainder = "".join(
-            character for character in remainder if not character.isspace()
-        ).strip(":=-\u2014\u2013.\u00bf?\u00a1!\"'")
+        remainder = "".join(character for character in remainder if not character.isspace()).strip(
+            ":=-\u2014\u2013.\u00bf?\u00a1!\"'"
+        )
         if len(remainder) <= MAX_BARE_PAYLOAD_PROSE_CHARACTERS:
             return candidate
     return None
@@ -443,9 +441,7 @@ def _fold(value: str) -> str:
     """Casefold and strip accents so "válido" and "valido" both match."""
 
     decomposed = unicodedata.normalize("NFKD", value.casefold())
-    return "".join(
-        character for character in decomposed if not unicodedata.combining(character)
-    )
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
 
 
 def _payload_candidates(question: str) -> list[str]:
@@ -523,9 +519,7 @@ def _widest_structural_span(value: str) -> str | None:
 def _widest_quoted_span(value: str) -> str | None:
     """Return a double-quoted run that itself looks like escaped JSON."""
 
-    match = re.search(
-        r'"\s*\\*"?\s*[\{\[].*[\}\]]\s*\\*"?\s*"', value, flags=re.DOTALL
-    )
+    match = re.search(r'"\s*\\*"?\s*[\{\[].*[\}\]]\s*\\*"?\s*"', value, flags=re.DOTALL)
     return match.group(0) if match else None
 
 
@@ -548,9 +542,7 @@ def _decode(
             last_error = (
                 error
                 if isinstance(error, json.JSONDecodeError)
-                else json.JSONDecodeError(
-                    f"{error.token} is not valid JSON", current, 0
-                )
+                else json.JSONDecodeError(f"{error.token} is not valid JSON", current, 0)
             )
             repaired, applied = _repair(current)
             if not applied:
@@ -605,7 +597,9 @@ def _repair(value: str) -> tuple[str, list[str]]:
     step("bom", result.lstrip("﻿"))
     step(
         "smart_quotes",
-        result.translate(str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})),
+        result.translate(
+            str.maketrans(dict[str, str | int | None]({"“": '"', "”": '"', "‘": "'", "’": "'"}))
+        ),
     )
     step("comments", _strip_comments(result))
     step("python_literals", re.sub(r"\b(None|True|False)\b", _python_literal, result))
@@ -710,6 +704,7 @@ def _complete_truncated(value: str) -> str:
     closers = {"{": "}", "[": "]"}
     return head + "".join(closers[opener] for opener, _after, _safe in reversed(stack))
 
+
 def _python_literal(match: re.Match[str]) -> str:
     return {"None": "null", "True": "true", "False": "false"}[match.group(1)]
 
@@ -813,9 +808,7 @@ def _wrap_concatenated_objects(value: str) -> str:
 
 def _depth(value: object, current: int = 1) -> int:
     if isinstance(value, dict):
-        return max(
-            (_depth(item, current + 1) for item in value.values()), default=current
-        )
+        return max((_depth(item, current + 1) for item in value.values()), default=current)
     if isinstance(value, list):
         return max((_depth(item, current + 1) for item in value), default=current)
     return current

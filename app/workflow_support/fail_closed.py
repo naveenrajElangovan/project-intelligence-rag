@@ -18,7 +18,10 @@ from app.workflow_support.answer_structure import (
     prune_unsupported_claims,
 )
 from app.workflow_support.conversation import _conversation_resolution_decision
+from app.workflow_support.inventory_intent import is_inventory_question
+from app.workflow_support.identifiers import member_identifiers
 from app.workflow_support.query_analysis import resolve_response_language
+from app.workflow_state import RagState
 
 
 def clarification_response(
@@ -27,6 +30,39 @@ def clarification_response(
     source_types: tuple[str, ...] = (),
 ) -> RagResponse | None:
     normalized = " ".join(re.findall(r"[a-z0-9à-ÿ]+", request.question.casefold()))
+    standalone_topic_request = bool(
+        re.match(
+            r"(?i)^\s*(?:tell\s+me\s+about|dime\s+sobre|háblame\s+de)\s+\S+",
+            request.question,
+        )
+    )
+    credential_value_request = bool(
+        re.search(
+            r"\b(?:what|show|give|tell|reveal|cu[aá]l|muestra|dame|dime|revela)\b"
+            r".{0,45}\b(?:password|passcode|pin|token|secret|contrase[nñ]a|clave|secreto)\b",
+            request.question,
+            re.IGNORECASE,
+        )
+    )
+    if credential_value_request:
+        language = resolve_response_language(request.question)
+        return RagResponse(
+            status="INSUFFICIENT_EVIDENCE",
+            answer=(
+                "No puedo proporcionar credenciales, contraseñas, PIN, tokens ni secretos."
+                if language == "es"
+                else "I cannot provide credentials, passwords, PINs, tokens, or secrets."
+            ),
+            confidence="NONE",
+            project_id=request.project_id,
+            sources=[],
+            missing_information=[],
+            evidenceStatus="NOT_APPLICABLE",
+            contextQuality="NOT_APPLICABLE",
+            coverage="NOT_APPLICABLE",
+            failureReason="SOURCE_SCOPE_VIOLATION",
+            refusalReason="SOURCE_SCOPE_VIOLATION",
+        )
     # Underscores are word separators to the tokenizer above, so an underscored
     # identifier arrives here as separate words and trips the overloaded-record
     # guard on whichever of them happens to be an overloaded noun. The identifier
@@ -36,6 +72,59 @@ def clarification_response(
     explicit_identifier = bool(
         re.search(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b", request.question)
     )
+    unreliable_premise = bool(
+        re.search(
+            r"(?i)\b(?:undocumented|unrecorded|phantom|nonexistent|imaginary|fictional|"
+            r"fictitious|absent|"
+            r"no\s+documentad[oa]s?|no\s+registrad[oa]s?|fantasmas?|inexistentes?|"
+            r"imaginari[oa]s?|fictici[oa]s?|ausentes?)\b",
+            request.question,
+        )
+    )
+    named_unknowns = tuple(
+        dict.fromkeys(
+            [
+                *member_identifiers(request.question),
+                *re.findall(
+                    r"(?i)\b(?:phantom|nonexistent|imaginary|fictional|fictitious|"
+                    r"fantasmas?|inexistentes?|imaginari[oa]s?|fictici[oa]s?)-[\w-]+",
+                    request.question,
+                ),
+                *re.findall(
+                    r"(?<![\w.-])[A-Z][A-Z0-9]{1,30}(?![\w-])",
+                    request.question,
+                ),
+            ]
+        )
+    )
+    unsupported_name = next(iter(named_unknowns), "")
+    if unreliable_premise and unsupported_name:
+        language = resolve_response_language(request.question)
+        population_request = is_inventory_question(request.question) or bool(
+            re.search(
+                r"(?i)\b(?:all|every|list|enumerate|todos|todas|lista|enumera|"
+                r"cu[aá]les\s+son|qu[eé].{0,35}\b(?:existen|definidos|compatibles))\b",
+                request.question,
+            )
+        )
+        reason = "POPULATION_RETRIEVAL_MISS" if population_request else "INSUFFICIENT_EVIDENCE"
+        return RagResponse(
+            status="INSUFFICIENT_EVIDENCE",
+            answer=(
+                "No encontré evidencia indexada que establezca ese elemento; no voy a sustituirlo por elementos de otro conjunto."
+                if language == "es"
+                else "I found no indexed evidence establishing that item; I will not substitute items from a different set."
+            ),
+            confidence="NONE",
+            project_id=request.project_id,
+            sources=[],
+            missing_information=[],
+            evidenceStatus="INSUFFICIENT",
+            contextQuality="INSUFFICIENT",
+            coverage="NOT_APPLICABLE",
+            failureReason="EXPLICIT_UNSUPPORTED_PREMISE",
+            refusalReason=reason,
+        )
     available = {value.upper() for value in source_types}
     issue_sources_available = not available or "ISSUE" in available
     code_sources_available = not available or "CODE" in available
@@ -68,9 +157,9 @@ def clarification_response(
                 "Ask about a visible store-application task, or contact authorized support."
             ),
             confidence="NONE",
-            projectId=request.project_id,
+            project_id=request.project_id,
             sources=[],
-            missingInformation=[],
+            missing_information=[],
             evidenceStatus="UNVERIFIED",
             contextQuality="NOT_APPLICABLE",
             coverage="NOT_APPLICABLE",
@@ -108,6 +197,10 @@ def clarification_response(
         and not jira_selected
         and not explicit_delivery_context
         and not document_context
+        and not (
+            standalone_topic_request
+            and re.search(r"\b(?:vocabulary|glossary|vocabulario|glosario)\b", normalized)
+        )
     ):
         language = resolve_response_language(request.question)
         return RagResponse(
@@ -118,9 +211,9 @@ def clarification_response(
                 else "Do you mean a work item or a receipt/document?"
             ),
             confidence="NONE",
-            projectId=request.project_id,
+            project_id=request.project_id,
             sources=[],
-            missingInformation=[],
+            missing_information=[],
             evidenceStatus="NOT_APPLICABLE",
             contextQuality="NOT_APPLICABLE",
             coverage="NOT_APPLICABLE",
@@ -142,6 +235,7 @@ def clarification_response(
     )
     if (
         not needed
+        or standalone_topic_request
         or explicit_identifier
         or named_entity
         or request.conversation_context.active_subject.strip()
@@ -158,9 +252,9 @@ def clarification_response(
             else "Which topic or entity are you referring to?"
         ),
         confidence="NONE",
-        projectId=request.project_id,
+        project_id=request.project_id,
         sources=[],
-        missingInformation=[],
+        missing_information=[],
         evidenceStatus="NOT_APPLICABLE",
         contextQuality="NOT_APPLICABLE",
         coverage="NOT_APPLICABLE",
@@ -168,8 +262,31 @@ def clarification_response(
     )
 
 
+async def clarification_response_with_canonical_index(
+    request: RagRequest,
+    known_entities: tuple[str, ...],
+    source_types: tuple[str, ...],
+    retriever: object,
+) -> RagResponse | None:
+    """Let an exact authorized corpus declaration prove a fragment standalone."""
+
+    clarification = clarification_response(request, known_entities, source_types)
+    if clarification is None:
+        return None
+    if clarification.failure_reason == "EXPLICIT_UNSUPPORTED_PREMISE":
+        return clarification
+    loader = getattr(retriever, "ainvoke_canonical_questions", None)
+    if loader is None:
+        return clarification
+    try:
+        declared = await loader(request.question, source_types)
+    except Exception:
+        return clarification
+    return None if declared else clarification
+
+
 def resolved_request_for_state(
-    state: dict[str, object], request: RagRequest, known_entities: tuple[str, ...]
+    state: RagState, request: RagRequest, known_entities: tuple[str, ...]
 ) -> ResolvedRequest:
     return state.get("resolved_request") or resolve_request(
         state.get("resolved_question", request.question),
@@ -180,7 +297,7 @@ def resolved_request_for_state(
 
 
 def apply_output_gate(
-    state: dict[str, object],
+    state: RagState,
     request: RagRequest,
     resolved: ResolvedRequest,
     generated: GroundedAnswer | None,

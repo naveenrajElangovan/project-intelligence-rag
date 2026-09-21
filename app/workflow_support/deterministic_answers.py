@@ -14,6 +14,202 @@ from app.workflow_support.query_analysis import (
     _document_source_type,
     _normalized_words,
 )
+from app.workflow_support.procedural_retrieval import is_procedural_question
+
+
+_EXTRACTIVE_QUERY_NOISE = {
+    "about",
+    "all",
+    "anything",
+    "are",
+    "can",
+    "could",
+    "details",
+    "does",
+    "explain",
+    "for",
+    "from",
+    "give",
+    "have",
+    "here",
+    "how",
+    "in",
+    "is",
+    "me",
+    "of",
+    "project",
+    "tell",
+    "the",
+    "this",
+    "what",
+    "where",
+    "which",
+    "with",
+    "you",
+    "algo",
+    "aqui",
+    "cómo",
+    "cual",
+    "cuáles",
+    "dame",
+    "de",
+    "del",
+    "donde",
+    "el",
+    "en",
+    "esta",
+    "este",
+    "explica",
+    "hay",
+    "la",
+    "las",
+    "los",
+    "me",
+    "para",
+    "proyecto",
+    "que",
+    "qué",
+    "sobre",
+    "tiene",
+}
+
+
+def _has_strong_evidence_anchor(question: str, documents: list[Document]) -> bool:
+    """Return whether authorized evidence contains the question's concrete subject.
+
+    This is a provider- and domain-neutral fail-closed guard for the narrow case
+    where semantic context evaluation reported zero relevance. It does not rank
+    documents or decide whether a claim is true; it prevents a grounded answer
+    about a neighboring subject from being released as an answer to the question.
+    """
+
+    query_words = tuple(
+        dict.fromkeys(
+            word
+            for word in _normalized_words(question)
+            if len(word) >= 3
+            and word not in _EXTRACTIVE_QUERY_NOISE
+            and not re.fullmatch(r"t?\d+(?:\.\d+)*", word)
+        )
+    )
+    if not query_words:
+        return False
+    required_overlap = len(query_words) if len(query_words) <= 2 else 2
+    for document in documents:
+        evidence_words = set(_normalized_words(document.page_content))
+        if sum(word in evidence_words for word in query_words) >= required_overlap:
+            return True
+        metadata_words = set(
+            _normalized_words(
+                " ".join(
+                    str(document.metadata.get(field) or "")
+                    for field in ("title", "reference", "issue_key", "locator")
+                )
+            )
+        )
+        if sum(word in metadata_words for word in query_words) >= required_overlap:
+            return True
+    return False
+
+
+def _deterministic_extractive_answer(
+    question: str, documents: list[Document], language: str
+) -> GroundedAnswer | None:
+    """Recover an answer by quoting strongly matching authorized evidence.
+
+    This is the final recovery path when a generated paraphrase cannot pass the
+    grounding model. It is deliberately domain and provider neutral. Candidate
+    windows must share every meaningful query term when the question has at most
+    two, or at least two terms for a longer question. The output copies complete
+    source sentences, so it cannot introduce a fact that is absent from the
+    indexed evidence.
+    """
+
+    query_words = tuple(
+        dict.fromkeys(
+            word
+            for word in _normalized_words(question)
+            if len(word) >= 3
+            and word not in _EXTRACTIVE_QUERY_NOISE
+            and not re.fullmatch(r"t?\d+(?:\.\d+)*", word)
+        )
+    )
+    if not query_words:
+        return None
+    required_overlap = len(query_words) if len(query_words) <= 2 else 2
+    ranked: list[tuple[tuple[float, ...], int, tuple[str, ...]]] = []
+    for source_number, document in enumerate(documents, start=1):
+        raw_segments = re.split(r"(?<=[.!?])\s+|\n+", document.page_content)
+        segments = [
+            " ".join(segment.strip().strip("#>*- ").split())
+            for segment in raw_segments
+            if segment.strip()
+        ]
+        for start in range(len(segments)):
+            for width in range(1, min(3, len(segments) - start) + 1):
+                window = tuple(
+                    segment
+                    for segment in segments[start : start + width]
+                    if 4 <= len(re.findall(r"\w+", segment)) <= 100
+                )
+                if not window:
+                    continue
+                folded = " ".join(window).casefold()
+                overlap = sum(word in set(_normalized_words(folded)) for word in query_words)
+                if overlap < required_overlap:
+                    continue
+                phrase_bonus = int(" ".join(query_words) in folded)
+                anchor_words = set(_normalized_words(window[0]))
+                anchor_overlap = sum(word in anchor_words for word in query_words)
+                metadata = document.metadata
+                authority = {"PAGE": 3, "ISSUE": 2, "CODE": 1}.get(
+                    str(metadata.get("source_type") or "").upper(), 0
+                )
+                retrieval = max(
+                    float(metadata.get("rerank_score") or 0.0),
+                    float(metadata.get("lexical_score") or 0.0),
+                    float(metadata.get("score") or 0.0),
+                )
+                word_count = sum(len(re.findall(r"\w+", value)) for value in window)
+                prose_window = int(not any("|" in value for value in window))
+                ranked.append(
+                    (
+                        (
+                            float(overlap),
+                            float(phrase_bonus),
+                            float(anchor_overlap),
+                            float(authority),
+                            float(prose_window),
+                            float(len(window)),
+                            retrieval,
+                            -float(word_count),
+                        ),
+                        source_number,
+                        window,
+                    )
+                )
+    if not ranked:
+        return None
+    _score, source_number, window = max(ranked, key=lambda item: item[0])
+    substantive = tuple(
+        sentence
+        for sentence in window
+        if not re.search(
+            r"(?:section identity|retrieval terms|document id|"
+            r"identidad de secci[oó]n|t[eé]rminos de recuperaci[oó]n)\s*:",
+            sentence,
+            re.IGNORECASE,
+        )
+    )
+    if substantive:
+        window = substantive
+    cited_sentences = [f"{sentence.rstrip('.')} [SOURCE {source_number}]." for sentence in window]
+    heading = " ".join(question.split()).strip("# ")
+    return GroundedAnswer(
+        answer=f"### {heading}\n" + "\n".join(cited_sentences),
+        citations=[source_number],
+        missing_information=[],
+    )
 
 
 def _deterministic_canonical_route_answer(
@@ -27,11 +223,16 @@ def _deterministic_canonical_route_answer(
     run afterward.
     """
 
+    topic = re.sub(
+        r"(?i)^\s*(?:tell\s+me\s+about|dime\s+sobre|háblame\s+de)\s+",
+        "",
+        question,
+    ).strip(" .?!")
+    topic_phrase = " ".join(_normalized_words(topic))
     words = {
         word
         for word in _normalized_words(question)
-        if len(word) >= 5
-        and word not in {"which", "where", "about", "cómo", "donde", "sobre"}
+        if len(word) >= 5 and word not in {"which", "where", "about", "cómo", "donde", "sobre"}
     }
     stems = {
         word[:-4] if word.endswith("idad") else word[:-3] if word.endswith("ity") else word
@@ -39,28 +240,107 @@ def _deterministic_canonical_route_answer(
     }
     if not stems:
         return None
-    matches: list[tuple[int, int, str]] = []
+    matches: list[tuple[tuple[float, ...], int, tuple[str, ...]]] = []
+    routed_fallbacks: list[tuple[tuple[float, ...], int, tuple[str, ...]]] = []
+    minimum_width = 1
     for source_number, document in enumerate(documents, start=1):
-        if not document.metadata.get("canonical_route_match"):
+        exact_route = bool(document.metadata.get("canonical_route_match"))
+        route_candidate = bool(document.metadata.get("canonical_route_candidate"))
+        evidence_language = str(document.metadata.get("language") or "").casefold()
+        language_match = int(language not in {"", "mixed", "und"} and evidence_language == language)
+        # Candidate means only that the canonical index linked this section into
+        # the search pool. It is authoritative enough for a deterministic quote
+        # only after a topical exact-match check, except when retrieval proved
+        # an exact index-to-section route. That route is corpus-authored evidence
+        # for terse symptom questions whose wording need not occur in the linked
+        # resolution text.
+        if not exact_route and not (route_candidate and is_procedural_question(question)):
             continue
-        for segment in re.split(r"(?<=[.!?])\s+|\n+", document.page_content):
-            cleaned = " ".join(segment.split()).strip(" -*")
-            if len(re.findall(r"\w+", cleaned)) < 4:
-                continue
-            folded = cleaned.casefold()
-            score = sum(stem in folded for stem in stems)
-            if score:
-                matches.append((score, -source_number, cleaned))
+        segments = [
+            " ".join(segment.split()).strip(" -*")
+            for segment in re.split(r"(?<=[.!?])\s+|\n+", document.page_content)
+        ]
+        segments = [segment for segment in segments if len(re.findall(r"\w+", segment)) >= 4]
+        segments = [
+            segment
+            for segment in segments
+            if not re.match(
+                r"(?i)(?:equivalent questions|preguntas equivalentes|routes?|rutas?)\s*:",
+                segment,
+            )
+            and not re.search(
+                r"(?i)section identity|retrieval terms|identidad de secci[oó]n", segment
+            )
+        ]
+        for start in range(len(segments)):
+            for width in range(minimum_width, min(3, len(segments) - start) + 1):
+                window = tuple(segments[start : start + width])
+                folded = " ".join(window).casefold()
+                score = sum(stem in folded for stem in stems)
+                if score:
+                    first_score = sum(stem in window[0].casefold() for stem in stems)
+                    phrase_score = int(
+                        bool(topic_phrase) and topic_phrase in " ".join(_normalized_words(folded))
+                    )
+                    matches.append(
+                        (
+                            (
+                                float(document.metadata.get("canonical_route_match_score") or 0),
+                                language_match,
+                                phrase_score,
+                                score,
+                                first_score,
+                                width,
+                                -sum(map(len, window)),
+                            ),
+                            -source_number,
+                            window,
+                        )
+                    )
+                action_language = any(
+                    re.search(
+                        r"(?i)\b(?:select|choose|open|wait|review|retain|contact|restart|"
+                        r"retry|verify|check|escalate|do not|selecciona|elige|abre|espera|"
+                        r"revisa|conserva|contacta|reinicia|reintenta|verifica|comprueba|"
+                        r"escala|no repitas|no cambies)\b",
+                        text,
+                    )
+                    for text in window
+                )
+                exact_route_score = float(document.metadata.get("canonical_route_match_score") or 0)
+                if (exact_route and exact_route_score >= 2) or (
+                    route_candidate and is_procedural_question(question) and action_language
+                ):
+                    routed_fallbacks.append(
+                        (
+                            (
+                                exact_route_score,
+                                float(language_match),
+                                float(action_language),
+                                float(not any("|" in text for text in window)),
+                                float(document.metadata.get("rerank_score") or 0),
+                                width,
+                                -sum(map(len, window)),
+                            ),
+                            -source_number,
+                            window,
+                        )
+                    )
     if not matches:
-        return None
-    _score, negative_source, text = max(matches)
+        if not routed_fallbacks:
+            return None
+        _score, negative_source, window = max(routed_fallbacks)
+    else:
+        _score, negative_source, window = max(matches)
     source_number = -negative_source
     heading = " ".join(question.split()).strip("# ")
+    quoted = "\n".join(f"{text.rstrip('.')} [SOURCE {source_number}]." for text in window)
     return GroundedAnswer(
-        answer=f"### {heading}\n{text.rstrip('.')} [SOURCE {source_number}].",
+        answer=f"### {heading}\n{quoted}",
         citations=[source_number],
         missing_information=[],
     )
+
 
 def _deterministic_identifier_answer(
     question: str, documents: list[Document], language: str
@@ -80,7 +360,12 @@ def _deterministic_identifier_answer(
                 components = _identifier_components(identifier)
                 if all(value in components for value in expected):
                     matches.append(
-                        (len(components) - len(expected), len(identifier), identifier, source_number)
+                        (
+                            len(components) - len(expected),
+                            len(identifier),
+                            identifier,
+                            source_number,
+                        )
                     )
         if not matches:
             return None
@@ -89,9 +374,7 @@ def _deterministic_identifier_answer(
         citations.append(source_number)
     cited = list(dict.fromkeys(citations))
     names = (
-        selected[0]
-        if len(selected) == 1
-        else ", ".join(selected[:-1]) + f", and {selected[-1]}"
+        selected[0] if len(selected) == 1 else ", ".join(selected[:-1]) + f", and {selected[-1]}"
     )
     prefix = "Los tipos solicitados son" if language == "es" else "The requested types are"
     markers = " ".join(f"[SOURCE {number}]" for number in cited)
@@ -114,9 +397,27 @@ def _deterministic_structured_inventory_answer(
     registry: tuple[list[str], int] | None = None
     aliases = {target}
     for source_number, document in enumerate(documents, start=1):
+        metadata = document.metadata
+        entity_key = str(metadata.get("entity_key") or "").strip()
+        if _registry_identifier_matches(target, [entity_key]):
+            enum_match = re.search(
+                rf"\b{re.escape(entity_key)}\s*\(\s*\"([^\"]+)\"\s*,\s*(\d+)\s*,\s*\"([^\"]+)\"",
+                document.page_content,
+            )
+            if enum_match:
+                registry = (
+                    [entity_key, enum_match.group(1), enum_match.group(2), enum_match.group(3)],
+                    source_number,
+                )
+                aliases.update((entity_key, enum_match.group(1)))
         for line in document.page_content.splitlines():
             cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
-            if len(cells) < 4 or not _registry_identifier_matches(target, cells[:2]):
+            if (
+                len(cells) < 4
+                or not cells[2].isdigit()
+                or re.fullmatch(r"\d+(?:[.,]\d+)*", cells[3]) is None
+                or not _registry_identifier_matches(target, cells[:2])
+            ):
                 continue
             registry = (cells, source_number)
             aliases.update(cells[:2])
@@ -133,9 +434,7 @@ def _deterministic_structured_inventory_answer(
             body = _balanced_call_body(content, match.end() - 1)
             fields = [
                 (name, value.strip())
-                for name, value in re.findall(
-                    r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*([^,\n]+),?\s*$", body
-                )
+                for name, value in re.findall(r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*([^,\n]+),?\s*$", body)
             ]
             if len(fields) > len(best_fields):
                 best_fields = fields
@@ -238,6 +537,19 @@ def _declared_entity_fields(
     }
     candidates: list[tuple[int, list[tuple[str, str, str, int]]]] = []
     for source_number, document in enumerate(documents, start=1):
+        metadata = document.metadata
+        entity_key = str(metadata.get("entity_key") or "").strip()
+        serialized = str(metadata.get("serialized_field") or "").strip()
+        property_name = str(metadata.get("field_name") or "").strip()
+        field_type = str(metadata.get("field_type") or "").strip()
+        if (
+            metadata.get("chunk_profile") == "data-class-field"
+            and entity_key in aliases
+            and serialized
+            and property_name
+            and field_type
+        ):
+            candidates.append((200, [(serialized, property_name, field_type, source_number)]))
         content = document.page_content
         searchable = f"{document.metadata.get('title', '')} {content}".casefold()
         for match in re.finditer(r"\bdata\s+class\s+([A-Za-z_]\w*)\s*\(", content):
@@ -262,19 +574,18 @@ def _declared_entity_fields(
             exact_alias = bool(class_aliases.intersection(aliases))
             term_matches = sum(term in searchable for term in target_terms)
             has_registry_alias = len(aliases) > 1
-            if (has_registry_alias and not exact_alias) or (
-                not exact_alias and not term_matches
-            ):
+            if (has_registry_alias and not exact_alias) or (not exact_alias and not term_matches):
                 continue
             candidates.append((100 if exact_alias else term_matches, fields))
     if not candidates:
         return []
+    metadata_fields = [fields[0] for score, fields in candidates if score == 200]
+    if metadata_fields:
+        return list(dict.fromkeys(metadata_fields))
     return max(candidates, key=lambda candidate: (candidate[0], len(candidate[1])))[1]
 
 
-def structured_entity_field_names(
-    question: str, documents: list[Document]
-) -> tuple[str, ...]:
+def structured_entity_field_names(question: str, documents: list[Document]) -> tuple[str, ...]:
     """Return the authoritative serialized field population for one entity."""
 
     identifiers = re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", question)
@@ -297,9 +608,7 @@ def structured_entity_field_names(
     )
 
 
-def structured_entity_aliases(
-    question: str, documents: list[Document]
-) -> tuple[str, ...]:
+def structured_entity_aliases(question: str, documents: list[Document]) -> tuple[str, ...]:
     """Resolve constant and wire aliases without embedding domain-specific names."""
 
     identifiers = re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", question)
@@ -337,12 +646,19 @@ def exact_current_issue_evidence(question: str, documents: list[Document]) -> li
     keys = _jira_identifiers(question)
     if len(keys) != 1 or not re.search(r"\b(?:status|estado)\b", question, re.I):
         return []
-    if re.search(r"\b(?:previous|previously|history|historical|changed|change|why|when|before|anterior|antes|historial|histórico|históricos|cambi[oó]|cambios|por qu[eé]|cu[aá]ndo)\b", question, re.I):
+    if re.search(
+        r"\b(?:previous|previously|history|historical|changed|change|why|when|before|anterior|antes|historial|histórico|históricos|cambi[oó]|cambios|por qu[eé]|cu[aá]ndo)\b",
+        question,
+        re.I,
+    ):
         return []
-    matched = [document for document in documents
+    matched = [
+        document
+        for document in documents
         if str(document.metadata.get("issue_key") or "").upper() == keys[0]
         and document.metadata.get("jira_chunk_kind") == "CURRENT"
-        and _document_source_type(document) == "ISSUE"]
+        and _document_source_type(document) == "ISSUE"
+    ]
     sources = {document.metadata.get("source_id") for document in matched}
     return matched if len(sources) == 1 and None not in sources else []
 
@@ -353,18 +669,22 @@ def _deterministic_delivery_answer(
     """Render unambiguous Jira facts while preserving each issue's citation."""
 
     from app.jira_query import jira_current_status_question
-    requested_keys = tuple(dict.fromkeys(key.upper() for key in re.findall(
-        r"\b[A-Z][A-Z0-9_]*-\d+\b", question, re.I
-    )))
+
+    requested_keys = tuple(
+        dict.fromkeys(key.upper() for key in re.findall(r"\b[A-Z][A-Z0-9_]*-\d+\b", question, re.I))
+    )
     if len(requested_keys) > 1 and jira_current_status_question(question):
         by_key = {}
         for index, document in enumerate(documents, 1):
             metadata = document.metadata
             key = str(metadata.get("issue_key") or "").upper()
-            if (metadata.get("provider") != "JIRA"
-                    or metadata.get("jira_chunk_kind") != "CURRENT"
-                    or key not in requested_keys or key in by_key
-                    or not metadata.get("status")):
+            if (
+                metadata.get("provider") != "JIRA"
+                or metadata.get("jira_chunk_kind") != "CURRENT"
+                or key not in requested_keys
+                or key in by_key
+                or not metadata.get("status")
+            ):
                 return None
             by_key[key] = (index, metadata)
         if set(by_key) != set(requested_keys):
@@ -379,18 +699,26 @@ def _deterministic_delivery_answer(
     if len(documents) != 1 or _document_source_type(documents[0]) != "ISSUE":
         return None
     normalized = " ".join(_normalized_words(question))
-    if re.search(r"\b(?:previous|previously|history|historical|changed|change|why|when|before|anterior|antes|historial|cambi[oó]|por qu[eé]|cu[aá]ndo)\b", question, re.I):
+    if re.search(
+        r"\b(?:previous|previously|history|historical|changed|change|why|when|before|anterior|antes|historial|cambi[oó]|por qu[eé]|cu[aá]ndo)\b",
+        question,
+        re.I,
+    ):
         return None
     if documents[0].metadata.get("jira_chunk_kind") not in (None, "", "CURRENT"):
         return None
-    status_question = bool(re.search(
-        r"\b(?:status|project status|delivery status|release status|estado)\b",
-        normalized,
-    ))
-    details_question = bool(re.search(
-        r"\b(?:detail|details|information|info|ticket|issue|jira)\b",
-        normalized,
-    ))
+    status_question = bool(
+        re.search(
+            r"\b(?:status|project status|delivery status|release status|estado)\b",
+            normalized,
+        )
+    )
+    details_question = bool(
+        re.search(
+            r"\b(?:detail|details|information|info|ticket|issue|jira)\b",
+            normalized,
+        )
+    )
     if not status_question and not details_question:
         return None
     document = documents[0]
@@ -494,8 +822,7 @@ def _deterministic_delivery_answer(
 def _jira_identifiers(value: str) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
-            match.upper()
-            for match in re.findall(r"\b[A-Z][A-Z0-9]*-\d+\b", value, re.IGNORECASE)
+            match.upper() for match in re.findall(r"\b[A-Z][A-Z0-9]*-\d+\b", value, re.IGNORECASE)
         )
     )
 
@@ -561,9 +888,13 @@ def _deterministic_code_location_answer(
         # its own citation and the deterministic answer never needs an LLM
         # citation-repair pass that could alter exact paths or identifiers.
         prefix = "### Archivos coincidentes" if language == "es" else "### Matching files"
-        answer = prefix + "\n" + "\n".join(
-            f"- `{label}` [SOURCE {source_number}]."
-            for _score, _rank, label, source_number in selected
+        answer = (
+            prefix
+            + "\n"
+            + "\n".join(
+                f"- `{label}` [SOURCE {source_number}]."
+                for _score, _rank, label, source_number in selected
+            )
         )
     return GroundedAnswer(
         answer=answer,
@@ -573,10 +904,35 @@ def _deterministic_code_location_answer(
 
 
 _CODE_LOCATION_IGNORED = {
-    "a", "an", "and", "are", "class", "classes", "code", "does", "file",
-    "files", "for", "function", "functions", "has", "have", "in", "is", "it",
-    "method", "methods", "of", "repository", "source", "the", "what", "where",
-    "which", "with", "you",
+    "a",
+    "an",
+    "and",
+    "are",
+    "class",
+    "classes",
+    "code",
+    "does",
+    "file",
+    "files",
+    "for",
+    "function",
+    "functions",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "method",
+    "methods",
+    "of",
+    "repository",
+    "source",
+    "the",
+    "what",
+    "where",
+    "which",
+    "with",
+    "you",
 }
 
 
@@ -611,9 +967,7 @@ def _code_file_pattern(code_extensions: tuple[str, ...]) -> re.Pattern[str] | No
     )
 
 
-def _code_location_values(
-    document: Document, code_extensions: tuple[str, ...] = ()
-) -> list[str]:
+def _code_location_values(document: Document, code_extensions: tuple[str, ...] = ()) -> list[str]:
     pattern = _code_file_pattern(code_extensions)
     values = (
         [match.group(0) for match in pattern.finditer(document.page_content)]
@@ -623,10 +977,7 @@ def _code_location_values(
     metadata_path = str(document.metadata.get("path") or "").strip()
     if metadata_path and (pattern is None or pattern.fullmatch(metadata_path)):
         values.insert(0, metadata_path)
-    return [
-        value if value == metadata_path else value.rsplit("/", 1)[-1]
-        for value in values
-    ]
+    return [value if value == metadata_path else value.rsplit("/", 1)[-1] for value in values]
 
 
 def _code_location_label_score(query_terms: set[str], label: str) -> int:
@@ -715,23 +1066,11 @@ def _code_inventory_documents(
     documents: list[Document], maximum: int, question: str = ""
 ) -> list[Document]:
     question_words = set(_normalized_words(question))
-    requires_symbol = bool(
-        question_words
-        & {
-            "class",
-            "classes",
-            "function",
-            "functions",
-            "method",
-            "methods",
-            "clase",
-            "clases",
-            "funcion",
-            "funciones",
-            "metodo",
-            "metodos",
-        }
+    requested_path_match = re.search(
+        r"(?i)(?<![A-Za-z0-9_.-])([./A-Za-z0-9_-]+\.(?:kt|kts|java|py|ya?ml|json|toml|js|ts|tsx|jsx))\b",
+        question,
     )
+    requested_path = requested_path_match.group(1).casefold() if requested_path_match else ""
     generic_words = {
         "all",
         "and",
@@ -791,7 +1130,8 @@ def _code_inventory_documents(
         if _document_source_type(document) != "CODE":
             continue
         symbol = str(document.metadata.get("symbol") or "")
-        if requires_symbol and not symbol:
+        path = str(document.metadata.get("path") or document.metadata.get("reference") or "")
+        if requested_path and not path.casefold().endswith(requested_path):
             continue
         searchable_metadata = " ".join(
             _normalized_words(
@@ -809,7 +1149,7 @@ def _code_inventory_documents(
         identity = (
             str(document.metadata.get("repository") or ""),
             str(document.metadata.get("branch") or ""),
-            str(document.metadata.get("path") or document.metadata.get("reference") or ""),
+            path,
             symbol,
         )
         if identity[2]:
@@ -828,24 +1168,51 @@ def _deterministic_code_inventory_answer(
 ) -> GroundedAnswer | None:
     if not documents:
         return None
-    bullets = [
-        f"- {_code_inventory_label(document)} [SOURCE {source_number}]."
-        for source_number, document in enumerate(documents, start=1)
-    ]
+    grouped: dict[tuple[str, str, str], dict[str, object]] = {}
+    for source_number, document in enumerate(documents, start=1):
+        path = str(
+            document.metadata.get("path") or document.metadata.get("reference") or ""
+        ).strip()
+        symbol = str(document.metadata.get("symbol") or "").strip()
+        if not path:
+            continue
+        key = (
+            str(document.metadata.get("repository") or ""),
+            str(document.metadata.get("branch") or ""),
+            path,
+        )
+        group = grouped.setdefault(key, {"symbols": [], "sources": []})
+        sources = group["sources"]
+        assert isinstance(sources, list)
+        sources.append(source_number)
+        if symbol:
+            symbols = group["symbols"]
+            assert isinstance(symbols, list)
+            if symbol not in symbols:
+                symbols.append(symbol)
+    complete = [(key, value) for key, value in grouped.items() if value["symbols"]]
+    if not complete:
+        return None
+    bullets: list[str] = []
+    citations: list[int] = []
+    symbol_label = "símbolos" if language == "es" else "symbols"
+    for (_repository, _branch, path), group in complete:
+        symbols = group["symbols"]
+        sources = group["sources"]
+        assert isinstance(symbols, list)
+        assert isinstance(sources, list)
+        citations.extend(int(source) for source in sources)
+        markers = " ".join(f"[SOURCE {source}]" for source in sources)
+        bullets.append(f"- {path} — {symbol_label}: {', '.join(symbols)} {markers}.")
     return GroundedAnswer(
         answer="\n".join(bullets),
-        citations=list(range(1, len(documents) + 1)),
+        citations=list(dict.fromkeys(citations)),
         missing_information=[],
     )
 
 
-def _code_inventory_answer_verified(
-    answer: GroundedAnswer, documents: list[Document]
-) -> bool:
-    if answer.citations != list(range(1, len(documents) + 1)):
-        return False
-    return all(
-        _code_inventory_label(document) in answer.answer
-        and f"[SOURCE {source_number}]" in answer.answer
-        for source_number, document in enumerate(documents, start=1)
+def _code_inventory_answer_verified(answer: GroundedAnswer, documents: list[Document]) -> bool:
+    expected = _deterministic_code_inventory_answer(
+        documents, "es" if "símbolos" in answer.answer else "en"
     )
+    return expected is not None and answer == expected

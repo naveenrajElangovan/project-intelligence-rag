@@ -37,9 +37,7 @@ class RequestSizeLimitMiddleware:
                     await response(scope, receive, send)
                     return
             messages.append(message)
-            if message["type"] != "http.request" or not message.get(
-                "more_body", False
-            ):
+            if message["type"] != "http.request" or not message.get("more_body", False):
                 break
 
         async def replay() -> Message:

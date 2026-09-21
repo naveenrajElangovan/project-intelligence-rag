@@ -11,13 +11,30 @@ from app.workflow_support.query_analysis import (
     _feature_title_anchor,
     _normalized_words,
 )
+from app.workflow_support.answer_structure import material_claims
 
 
 LOGGER = logging.getLogger("project_intelligence.rag.stages")
 
-def _answer_requirements(
-    question: str, entities: tuple[str, ...] = ()
-) -> tuple[str, ...]:
+
+def _complete_procedure_requested(question: str) -> bool:
+    """Recognize an explicit request for instructions, not a mere workflow noun."""
+
+    return bool(
+        re.search(
+            r"(?i)\b(?:how\s+(?:do|can|should|would)\s+(?:i|we|a user)|how\s+to|"
+            r"what\s+should\s+(?:i|we|a user)\s+do|"
+            r"steps?|procedure|instructions?|"
+            r"c[oó]mo\s+(?:puedo|debo|hago|registro|imprimo|reimprimo|cierro|inicio|"
+            r"conecto|filtro|cargo|actualizo|genero|cambio|reviso|resuelvo|recupero|"
+            r"agrego|se\s+puede|se\s+debe)|"
+            r"pasos?|procedimiento|instrucciones?)\b",
+            question,
+        )
+    )
+
+
+def _answer_requirements(question: str, entities: tuple[str, ...] = ()) -> tuple[str, ...]:
     lowered = question.casefold()
     requirements: list[str] = []
     asks_files = bool(re.search(r"\b(files?|archivos?)\b", lowered))
@@ -55,17 +72,18 @@ def _answer_requirements(
     if _code_output_requested(question):
         requirements.append("code:implementation")
 
+    if _complete_procedure_requested(question):
+        requirements.append("procedure:multi_step")
+
     entity_pattern = "|".join(re.escape(entity) for entity in entities)
     boundary = rf"\s+(?:in|en)\s+(?:{entity_pattern})\b" if entity_pattern else r"(?!)"
     listed_for = re.search(
-        rf"\b(?:listed\s+for\s+(?:the\s+)?|listados?\s+para\s+(?:el|la|los|las)?\s*)(.+?)(?:{boundary}|\?|$)", lowered
+        rf"\b(?:listed\s+for\s+(?:the\s+)?|listados?\s+para\s+(?:el|la|los|las)?\s*)(.+?)(?:{boundary}|\?|$)",
+        lowered,
     )
     if (
         listed_for
-        and not (
-            entities
-            and re.match(rf"(?:{entity_pattern})\b", listed_for.group(1))
-        )
+        and not (entities and re.match(rf"(?:{entity_pattern})\b", listed_for.group(1)))
         and re.search(r",|\band\b|\by\b", listed_for.group(1))
     ):
         requested_items = [
@@ -103,6 +121,8 @@ def _missing_answer_requirements(
             )
         elif requirement == "code:implementation":
             present = _code_answer_complete(question, answer)
+        elif requirement == "procedure:multi_step":
+            present = len(material_claims(answer)) >= 2
         else:
             term = requirement.split(":", 1)[1]
             present = _text_satisfies_identifier_requirement(answer, requirement, term)
@@ -128,8 +148,7 @@ def _completeness_repair_query(
         (),
     )
     anchor_text = " ".join(
-        word.upper() if index == 0 else word
-        for index, word in enumerate(anchor)
+        word.upper() if index == 0 else word for index, word in enumerate(anchor)
     )
     for value in dict.fromkeys(missing):
         if ":" not in value:
@@ -145,13 +164,13 @@ def _completeness_repair_query(
                 )
             )
     terms = [
-        value.split(":", 1)[1].replace("+", " ")
-        if ":" in value
-        else value.replace("+", " ")
+        value.split(":", 1)[1].replace("+", " ") if ":" in value else value.replace("+", " ")
         for value in missing
     ]
     if "code:implementation" in missing:
         terms.extend(("complete function bodies", "implementation code"))
+    if "procedure:multi_step" in missing:
+        terms.extend(("procedure steps", "expected result"))
     query = " ".join(value for value in (anchor_text, *terms) if value).strip()
     return query or question
 
@@ -211,15 +230,15 @@ def _merge_ranked_documents(
     return selected[:top_n]
 
 
-def _document_satisfies_requirement(
-    document: Document, requirement: str, term: str
-) -> bool:
+def _document_satisfies_requirement(document: Document, requirement: str, term: str) -> bool:
     content = document.page_content
     lowered = content.casefold()
     if requirement.startswith(("term:", "identifier:")):
         return _text_satisfies_identifier_requirement(content, requirement, term)
     if requirement == "code:implementation":
         return _contains_implementation_code(content)
+    if requirement == "procedure:multi_step":
+        return len(material_claims(content)) >= 2
     if requirement == "count:files":
         return bool(re.search(r"\b\d[\d,.]*\s+.*?\b(?:files?|archivos?)\b", lowered))
     if requirement == "count:lines":

@@ -41,6 +41,9 @@ _MORE = re.compile(
 )
 _FIXED = re.compile(r"\b(?:fixed|resolved|corregid[oa]s?|resuelt[oa]s?)\b", re.I)
 _ISSUE_KEY = re.compile(r"\b[A-Z][A-Z0-9_]*-\d+\b", re.I)
+_DOCUMENT_SECTION = re.compile(
+    r"\b(?:document(?:ation)?\s+)?sections?\b|\bsecci[oó]n(?:es)?\b", re.I
+)
 _REPORT = re.compile(
     r"\b(?:status report|project report|jira report|summary report|"
     r"reporte de estado|informe de estado|reporte del proyecto|informe de jira)\b",
@@ -49,7 +52,11 @@ _REPORT = re.compile(
 _OVERVIEW = re.compile(
     r"\b(?:jira overview|overview of jira|summari[sz]e jira|summari[sz]e (?:the )?(?:whole|entire) jira|"
     r"whole jira|entire jira|complete jira report|resumen (?:general )?de jira|"
-    r"resume (?:todo )?jira|informe completo de jira)\b",
+    r"resume (?:todo )?jira|informe completo de jira|"
+    r"summari[sz]e (?:the )?(?:jira )?project status|project status (?:summary|overview)|"
+    r"(?:give|show) me (?:the )?project status|overall project status|how is the project doing|"
+    r"resumen del estado del proyecto|resume (?:el )?estado del proyecto|"
+    r"muestra (?:el )?estado del proyecto|c[oó]mo va el proyecto)\b",
     re.I,
 )
 _DETAIL = re.compile(
@@ -68,12 +75,71 @@ _PENDING_WORK = re.compile(
     r"outstanding work|hay algo pendiente|trabajo pendiente|falta por implementar|qu[eé] falta)\b",
     re.I,
 )
+_COMPLETION_CHECK = re.compile(
+    r"\b(?:is|was)\s+(?:it|this|that|the\s+(?:ticket|issue|work\s+item))\s+"
+    r"(?:done|complete|completed|closed|resolved)\b|"
+    r"\b(?:est[aá]|qued[oó])\s+(?:completad[oa]|terminad[oa]|cerrad[oa]|resuelt[oa])\b|"
+    r"\b(?:ya\s+)?(?:se\s+)?(?:complet[oó]|termin[oó]|cerr[oó]|resolvi[oó])\b",
+    re.I,
+)
+_CURRENT_FACT = re.compile(
+    r"\b(?:status|priority|assignee|assigned|owner|reporter|resolution|due date|created|updated|"
+    r"estado|prioridad|asignad[oa]|responsable|reportad[oa]|resoluci[oó]n|fecha l[ií]mite|"
+    r"cread[oa]|actualizad[oa])\b",
+    re.I,
+)
 _TOPIC_STOP_WORDS = {
-    "all", "and", "anything", "are", "do", "does", "for", "from", "have", "has", "in",
-    "implement", "implementation", "is", "issue", "issues", "jira", "left", "of", "outstanding",
-    "pending", "remaining", "the", "ticket", "tickets", "to", "what", "which", "work",
-    "algo", "de", "del", "el", "en", "esta", "estan", "falta", "hay", "implementar", "jira",
-    "la", "las", "los", "para", "pendiente", "pendientes", "por", "que", "qué", "se", "trabajo",
+    "all",
+    "and",
+    "anything",
+    "are",
+    "do",
+    "does",
+    "for",
+    "from",
+    "have",
+    "has",
+    "in",
+    "implement",
+    "implementation",
+    "is",
+    "issue",
+    "issues",
+    "jira",
+    "left",
+    "of",
+    "outstanding",
+    "pending",
+    "remaining",
+    "the",
+    "ticket",
+    "tickets",
+    "to",
+    "what",
+    "which",
+    "work",
+    "algo",
+    "de",
+    "del",
+    "el",
+    "en",
+    "esta",
+    "estan",
+    "falta",
+    "hay",
+    "implementar",
+    "jira",
+    "la",
+    "las",
+    "los",
+    "para",
+    "pendiente",
+    "pendientes",
+    "por",
+    "que",
+    "qué",
+    "se",
+    "trabajo",
 }
 _SECTION_PATTERNS = (
     ("COMMENT", re.compile(r"\b(?:comments?|commented|comentarios?|coment[oó])\b", re.I)),
@@ -112,6 +178,8 @@ def select_providers(
     question: str,
     enabled: tuple[ProviderName, ...],
     structured_scope: StructuredConversationScope | None = None,
+    *,
+    explicit_selection: bool = False,
 ) -> ProviderSelection:
     requested_list = [
         provider
@@ -122,7 +190,16 @@ def select_providers(
         )
         if pattern.search(question)
     ]
-    if _ISSUE_KEY.search(question) and ProviderName.JIRA not in requested_list:
+    document_section_reference = bool(
+        _ISSUE_KEY.search(question)
+        and _DOCUMENT_SECTION.search(question)
+        and not _JIRA_EXPLICIT.search(question)
+    )
+    if (
+        _ISSUE_KEY.search(question)
+        and not document_section_reference
+        and ProviderName.JIRA not in requested_list
+    ):
         requested_list.insert(0, ProviderName.JIRA)
     requested = tuple(requested_list)
     disabled = tuple(provider for provider in requested if provider not in enabled)
@@ -180,6 +257,25 @@ def select_providers(
             available_providers=enabled,
             reason="EXPLICIT_PROVIDER",
         )
+    # A client-selected provider set is an evidence boundary, not merely an
+    # availability hint. In particular, the UI's exclusive All chip sends all
+    # authorized providers. Treating that request like an omitted selection
+    # allowed the legacy planner to narrow an ambiguous question to one source
+    # family and made a large Jira corpus crowd out GitHub and Confluence.
+    if explicit_selection and len(enabled) > 1:
+        return ProviderSelection(
+            mode=ExecutionMode.FEDERATED,
+            providers=enabled,
+            available_providers=enabled,
+            reason="USER_SELECTED_PROVIDERS",
+        )
+    if explicit_selection and len(enabled) == 1:
+        return ProviderSelection(
+            mode=ExecutionMode.SINGLE_PROVIDER,
+            providers=enabled,
+            available_providers=enabled,
+            reason="USER_SELECTED_PROVIDER",
+        )
     if structured_scope is None and (
         _MORE.fullmatch(question) or (_FIXED.search(question) and _LIST.search(question))
     ):
@@ -201,21 +297,32 @@ def select_providers(
 
 def _jira_structured_query(question: str, *, assume_jira: bool = False) -> StructuredQuery | None:
     keys = tuple(dict.fromkeys(value.upper() for value in _ISSUE_KEY.findall(question)))
+    if keys and _DOCUMENT_SECTION.search(question) and not _JIRA_EXPLICIT.search(question):
+        return None
     if not (_JIRA.search(question) or assume_jira or keys):
         return None
     if keys and (_GITHUB.search(question) or _CONFLUENCE.search(question)):
         return None
-    section_kind = next(
-        (kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question)), None
-    )
+    # A project overview may explicitly request hierarchy, comments, or
+    # attachment totals. Those nouns describe requested breakdowns; without a
+    # specific issue key they must not narrow the whole request to one section.
+    if not keys and _OVERVIEW.search(question):
+        return StructuredQuery(
+            operation=StructuredOperation.OVERVIEW,
+            provider=ProviderName.JIRA,
+            filters=_jira_filters(question),
+        )
+    section_kinds = tuple(kind for kind, pattern in _SECTION_PATTERNS if pattern.search(question))
+    section_kind = section_kinds[0] if len(section_kinds) == 1 else None
     if keys and _CHILDREN.search(question):
         return StructuredQuery(
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
             filters={"issue_key": keys},
+            requested_fact="CHILDREN",
         )
-    if section_kind and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
-        section_filters: dict[str, tuple[str, ...]] = {"section_kind": (section_kind,)}
+    if section_kinds and (keys or assume_jira or _JIRA_EXPLICIT.search(question)):
+        section_filters: dict[str, tuple[str, ...]] = {"section_kind": section_kinds}
         if keys:
             section_filters["issue_key"] = keys
         return StructuredQuery(
@@ -227,6 +334,7 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             provider=ProviderName.JIRA,
             filters=section_filters,
             section_kind=section_kind,
+            section_kinds=section_kinds,
             limit=20,
         )
     if keys and not _CROSS.search(question):
@@ -234,6 +342,13 @@ def _jira_structured_query(question: str, *, assume_jira: bool = False) -> Struc
             operation=StructuredOperation.DETAIL,
             provider=ProviderName.JIRA,
             filters={"issue_key": keys},
+            requested_fact=(
+                "COMPLETION"
+                if _COMPLETION_CHECK.search(question)
+                else "CURRENT"
+                if _CURRENT_FACT.search(question)
+                else None
+            ),
         )
     filters = _jira_filters(question)
     pending_work = bool(_PENDING_WORK.search(question))
@@ -359,6 +474,8 @@ def _jira_structured_followup(
     operation = StructuredOperation(scope.operation)
     group_by = scope.group_by
     section_kind = None
+    section_kinds: tuple[str, ...] = ()
+    requested_fact = None
     offset = 0
     labels = tuple(
         dict.fromkeys(
@@ -375,10 +492,24 @@ def _jira_structured_followup(
         )
         offset = scope.next_offset
         section_kind = filters.get("section_kind", (None,))[0]
+        section_kinds = tuple(filters.get("section_kind", ()))
+    elif _COMPLETION_CHECK.search(question):
+        issue_keys = filters.get("issue_key", ())
+        if len(issue_keys) != 1:
+            return None
+        filters = {"issue_key": issue_keys}
+        operation = StructuredOperation.DETAIL
+        requested_fact = "COMPLETION"
+    elif _CURRENT_FACT.search(question) and len(filters.get("issue_key", ())) == 1:
+        filters = {"issue_key": filters["issue_key"]}
+        operation = StructuredOperation.DETAIL
+        requested_fact = "CURRENT"
     elif candidate := _jira_structured_query(question, assume_jira=True):
         operation = candidate.operation
         group_by = candidate.group_by
         section_kind = candidate.section_kind
+        section_kinds = candidate.section_kinds
+        requested_fact = candidate.requested_fact
         incoming = candidate.filters
         if "issue_key" in incoming:
             filters = dict(incoming)
@@ -424,6 +555,8 @@ def _jira_structured_followup(
         filters=filters,
         group_by=group_by,
         section_kind=section_kind,
+        section_kinds=section_kinds,
+        requested_fact=requested_fact,
         offset=offset,
         limit=scope.page_size,
     )

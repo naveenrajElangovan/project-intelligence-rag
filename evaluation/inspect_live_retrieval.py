@@ -45,9 +45,7 @@ async def main() -> None:
         # The production path always embeds locally with the same model as ingestion.
         embedder=build_embedder(settings),
     )
-    documents = await retriever.ainvoke_scoped(
-        arguments.question, tuple(arguments.source_type)
-    )
+    documents = await retriever.ainvoke_scoped(arguments.question, tuple(arguments.source_type))
     raw_scores = await asyncio.to_thread(
         predict_local_scores,
         settings.local_models_path or settings.local_rerank_model,
@@ -102,10 +100,7 @@ async def main() -> None:
             arguments.show_content_title
             and document.metadata.get("title") in arguments.show_content_title
         ):
-            print(
-                "CONTENT_PREVIEW="
-                + document.page_content[:1200].replace("\n", " | ")
-            )
+            print("CONTENT_PREVIEW=" + document.page_content[:1200].replace("\n", " | "))
 
 
 if __name__ == "__main__":

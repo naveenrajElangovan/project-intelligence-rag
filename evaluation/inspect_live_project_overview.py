@@ -60,8 +60,7 @@ async def main() -> None:
             continue
         claim_text = re.sub(r"\s*\[SOURCE \d+\]", "", claim).strip()
         evidence = "\n".join(
-            state["documents"][number - 1].page_content
-            for number in dict.fromkeys(source_numbers)
+            state["documents"][number - 1].page_content for number in dict.fromkeys(source_numbers)
         )
         scores = await asyncio.to_thread(
             predict_local_scores,

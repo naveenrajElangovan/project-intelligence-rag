@@ -4,6 +4,12 @@ import hashlib
 import re
 
 
+def configured_collection_name(explicit: str | None, primary: str) -> str:
+    """Resolve an operator override against the primary serving route."""
+
+    return explicit or primary
+
+
 def project_collection_name(base_name: str, project_id: str) -> str:
     base = _slug(base_name)
     project = _slug(project_id)

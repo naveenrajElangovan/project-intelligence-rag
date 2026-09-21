@@ -11,9 +11,31 @@ from langchain_core.documents import Document
 
 _PROCEDURAL_PATTERNS = (
     re.compile(r"\bhow\s+(?:do|can|should|would)\s+(?:i|we|a user)\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+should\s+(?:i|we|a user)\s+do\b", re.IGNORECASE),
     re.compile(r"\bhow\s+to\b", re.IGNORECASE),
-    re.compile(r"\b(?:steps?|procedure|workflow|walkthrough|instructions?)\b", re.IGNORECASE),
+    re.compile(
+        r"\bc[oó]mo\s+(?:(?:yo\s+)?(?:puedo|podemos|debo|debemos|deber[ií]a)\s+)"
+        r"[a-záéíóúñ]{3,}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bc[oó]mo\s+(?:se\s+)?(?:abr(?:o|e|ir)|cerr(?:ar|amos?|ar)|"
+        r"cre(?:o|a|ar)|inici(?:o|a|ar)|registr(?:o|a|ar)|agreg(?:o|a|ar)|"
+        r"a[nñ]ad(?:o|e|ir)|configur(?:o|a|ar)|instal(?:o|a|ar)|"
+        r"actualiz(?:o|a|ar)|conect(?:o|a|ar)|desconect(?:o|a|ar)|"
+        r"reinici(?:o|a|ar)|envi(?:o|a|ar)|guard(?:o|a|ar)|"
+        r"elimin(?:o|a|ar)|cancel(?:o|a|ar)|pag(?:o|a|ar)|"
+        r"imprim(?:o|e|ir)|escane(?:o|a|ar)|liquid(?:o|a|ar))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bqu[eé]\s+debo\s+hacer\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:steps?|procedure|workflow|walkthrough|instructions?|"
+        r"pasos?|procedimiento|flujo|instrucciones?)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b(?:log[ -]?in|sign[ -]?in|authenticate)\b", re.IGNORECASE),
+    re.compile(r"\b(?:iniciar|inicio)\s+de\s+sesi[oó]n\b", re.IGNORECASE),
 )
 
 
@@ -32,12 +54,16 @@ def procedural_rerank_query(question: str) -> str:
 
 def _source_family(document: Document) -> str:
     metadata = document.metadata
-    return str(
-        metadata.get("source_type")
-        or metadata.get("provider")
-        or metadata.get("content_type")
-        or "UNKNOWN"
-    ).strip().upper()
+    return (
+        str(
+            metadata.get("source_type")
+            or metadata.get("provider")
+            or metadata.get("content_type")
+            or "UNKNOWN"
+        )
+        .strip()
+        .upper()
+    )
 
 
 def _cheap_score(document: Document) -> tuple[float, ...]:
@@ -51,9 +77,7 @@ def _cheap_score(document: Document) -> tuple[float, ...]:
     )
 
 
-def balanced_source_candidate_pool(
-    documents: list[Document], limit: int
-) -> list[Document]:
+def balanced_source_candidate_pool(documents: list[Document], limit: int) -> list[Document]:
     """Narrow without allowing one current or future source type to dominate."""
 
     if limit <= 0 or len(documents) <= limit:

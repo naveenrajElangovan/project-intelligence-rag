@@ -50,9 +50,7 @@ class SourcePolicyRegistry:
     def select(self, intent: str, requested: Iterable[str]) -> tuple[str, ...]:
         selected = tuple(
             dict.fromkeys(
-                str(category).strip().upper()
-                for category in requested
-                if str(category).strip()
+                str(category).strip().upper() for category in requested if str(category).strip()
             )
         )
         for category in selected:
@@ -103,22 +101,23 @@ def deduplicate_authoritative_versions(
     for entity in order:
         candidates = grouped[entity]
         best_authority = max(
-            int(document.metadata.get("authority") or registry.authority(
-                str(document.metadata.get("source_type") or "")
-            ))
+            int(
+                document.metadata.get("authority")
+                or registry.authority(str(document.metadata.get("source_type") or ""))
+            )
             for document in candidates
         )
         authoritative = [
             document
             for document in candidates
-            if int(document.metadata.get("authority") or registry.authority(
-                str(document.metadata.get("source_type") or "")
-            )) == best_authority
+            if int(
+                document.metadata.get("authority")
+                or registry.authority(str(document.metadata.get("source_type") or ""))
+            )
+            == best_authority
         ]
         newest = max(_freshness_key(document) for document in authoritative)
         selected.extend(
-            document
-            for document in authoritative
-            if _freshness_key(document) == newest
+            document for document in authoritative if _freshness_key(document) == newest
         )
     return selected

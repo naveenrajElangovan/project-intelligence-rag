@@ -23,7 +23,11 @@ from app.workflow_support.language import DEFAULT_RESPONSE_LANGUAGE, language_na
 from app.reranking import sanitize_evidence
 from app.retry import with_transient_retry
 from app.table_evidence import contains_table
-from app.telemetry import prompt_budget_pressure
+from app.telemetry import (
+    log_ollama_request,
+    log_ollama_request_async,
+    prompt_budget_pressure,
+)
 
 
 # Answer length used to be hard-coded inside each style instruction, so "answer
@@ -72,6 +76,7 @@ def _citations_from_answer(answer: str) -> list[int]:
     """Return the exact unique source references already present in prose."""
 
     return sorted({int(value) for value in _SOURCE_REF.findall(answer)})
+
 
 _ANSWER_SKELETON = (
     "Use this answer contract: begin with one or two sentences that directly answer the question. "
@@ -192,8 +197,15 @@ def insufficient_evidence_answer(language: str) -> str:
     return INSUFFICIENT_EVIDENCE_ANSWER_ES if language == "es" else INSUFFICIENT_EVIDENCE_ANSWER
 
 
-def pipeline_unavailable_answer(language: str) -> str:
-    return PIPELINE_UNAVAILABLE_ANSWER_ES if language == "es" else PIPELINE_UNAVAILABLE_ANSWER
+def pipeline_unavailable_answer(language: str, question: str = "") -> str:
+    """Return a bounded, query-aware fallback when no model call is safe."""
+
+    subject = " ".join(question.split())[:160].strip()
+    if not subject:
+        return PIPELINE_UNAVAILABLE_ANSWER_ES if language == "es" else PIPELINE_UNAVAILABLE_ANSWER
+    if language == "es":
+        return f"No pude completar la búsqueda del proyecto para «{subject}» en este momento. Inténtalo de nuevo en unos instantes."
+    return f"I couldn’t complete the project search for “{subject}” right now. Please try again in a moment."
 
 
 _REFUSAL_ANSWERS = {
@@ -237,6 +249,25 @@ def refusal_answer(reason: str, language: str) -> str:
     )
 
 
+def query_aware_refusal_answer(question: str, reason: str, language: str) -> str:
+    """Return a bounded natural fallback that names the unresolved request."""
+
+    subject = " ".join(question.split()).strip()[:180]
+    if not subject:
+        return refusal_answer(reason, language)
+    if language == "es":
+        if reason == "NO_ACCESS":
+            return f"No tengo acceso autorizado para comprobar «{subject}». Prueba con una fuente o un proyecto que tengas habilitado."
+        if reason == "TEMPORARILY_UNAVAILABLE":
+            return f"No pude completar ahora la búsqueda de «{subject}». Inténtalo de nuevo en unos instantes."
+        return f"Encontré material relacionado, pero no confirma una respuesta para «{subject}». Aclara el término o indica la función, el ticket o el documento que quieres revisar."
+    if reason == "NO_ACCESS":
+        return f"I don’t have authorized access to verify “{subject}”. Try a source or project that is enabled for your account."
+    if reason == "TEMPORARILY_UNAVAILABLE":
+        return f"I couldn’t complete the search for “{subject}” right now. Please try again in a moment."
+    return f"I found related material, but it does not confirm an answer to “{subject}”. Clarify the term or name the feature, ticket, or document you want checked."
+
+
 class QueryPlan(BaseModel):
     language: Literal["en", "es", "mixed"]
     translated_query: str = Field(default="", max_length=4000)
@@ -268,9 +299,9 @@ class AnswerOutcome(BaseModel):
     """
 
     outcome: Literal["ANSWER", "REFUSAL"]
-    refusal_reason: Literal[
-        "SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"
-    ] | None = None
+    refusal_reason: (
+        Literal["SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"] | None
+    ) = None
 
     @model_validator(mode="after")
     def validate_typed_outcome(self) -> "AnswerOutcome":
@@ -279,9 +310,7 @@ class AnswerOutcome(BaseModel):
         return self
 
 
-def normalize_streamed_answer_outcome(
-    prose: str, outcome: AnswerOutcome
-) -> AnswerOutcome:
+def normalize_streamed_answer_outcome(prose: str, outcome: AnswerOutcome) -> AnswerOutcome:
     """Reconcile streamed prose with possibly incomplete outcome metadata.
 
     The second model call supplies a candidate reason, while the generated prose
@@ -363,9 +392,9 @@ class GroundedAnswer(BaseModel):
             "response declines the request, even if it also redirects the user."
         ),
     )
-    refusal_reason: Literal[
-        "SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"
-    ] | None = Field(
+    refusal_reason: (
+        Literal["SOURCE_SCOPE_VIOLATION", "UNVERIFIED_EVIDENCE", "INSUFFICIENT_EVIDENCE"] | None
+    ) = Field(
         default=None,
         description=(
             "Required for REFUSAL: SOURCE_SCOPE_VIOLATION for requests outside the "
@@ -432,7 +461,11 @@ class GroundingVerdict(BaseModel):
     supported: bool
     unsupported_claims: list[str] = Field(default_factory=list, max_length=20)
     reason_code: Literal[
-        "SUPPORTED", "MISSING_CITATION", "UNSUPPORTED_CLAIM", "CONTRADICTION", "INSUFFICIENT_EVIDENCE"
+        "SUPPORTED",
+        "MISSING_CITATION",
+        "UNSUPPORTED_CLAIM",
+        "CONTRADICTION",
+        "INSUFFICIENT_EVIDENCE",
     ]
 
 
@@ -448,6 +481,22 @@ class SafeUserMessage(BaseModel):
     message: str = Field(min_length=1, max_length=700)
 
 
+RefusalReason = Literal[
+    "NO_ACCESS",
+    "INSUFFICIENT_EVIDENCE",
+    "UNVERIFIED_EVIDENCE",
+    "POPULATION_RETRIEVAL_MISS",
+    "UNRESOLVED_SOURCE_CONFLICT",
+    "SOURCE_SCOPE_VIOLATION",
+    "PERMISSIONS_NOT_SATISFIED",
+    "FRESHNESS_NOT_VERIFIABLE",
+    "REQUESTED_COVERAGE_INCOMPLETE",
+    "UNSUPPORTED_CLAIM",
+    "INVALID_DERIVATION",
+    "TEMPORARILY_UNAVAILABLE",
+]
+
+
 class LangChainSafeResponseGenerator:
     """Generates user-facing refusals without receiving evidence or security details."""
 
@@ -461,20 +510,7 @@ class LangChainSafeResponseGenerator:
         self,
         question: str,
         language: str,
-        reason: Literal[
-            "NO_ACCESS",
-            "INSUFFICIENT_EVIDENCE",
-            "UNVERIFIED_EVIDENCE",
-            "POPULATION_RETRIEVAL_MISS",
-            "UNRESOLVED_SOURCE_CONFLICT",
-            "SOURCE_SCOPE_VIOLATION",
-            "PERMISSIONS_NOT_SATISFIED",
-            "FRESHNESS_NOT_VERIFIABLE",
-            "REQUESTED_COVERAGE_INCOMPLETE",
-            "UNSUPPORTED_CLAIM",
-            "INVALID_DERIVATION",
-            "TEMPORARILY_UNAVAILABLE",
-        ],
+        reason: RefusalReason,
     ) -> str:
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -522,7 +558,15 @@ class LangChainSafeResponseGenerator:
                 self._settings,
             )
         self.last_usage = usage
-        return value.message.strip()
+        message = value.message.strip()
+        if re.search(
+            r"\b(?:do not (?:state|mention|answer)|invite a|naming the exact|suggest checking|"
+            r"no (?:indiques|menciones|respondas)|invita a|sugiere comprobar)\b",
+            message,
+            re.IGNORECASE,
+        ):
+            raise ValueError("Safe-response model returned instruction-like prose.")
+        return message
 
 
 class ConversationQueryResolver:
@@ -737,12 +781,8 @@ class LangChainGroundedAnswerGenerator:
         self.last_stream_timeout_kind = ""
         self.last_stream_truncated = False
 
-    def _render_evidence(
-        self, documents: list[Document], maximum_tokens: int
-    ) -> str:
-        value, dropped, truncated = _evidence_with_diagnostics(
-            documents, maximum_tokens
-        )
+    def _render_evidence(self, documents: list[Document], maximum_tokens: int) -> str:
+        value, dropped, truncated = _evidence_with_diagnostics(documents, maximum_tokens)
         self.last_documents_dropped = dropped
         self.last_documents_truncated = truncated
         return value
@@ -754,7 +794,7 @@ class LangChainGroundedAnswerGenerator:
         language: str,
         *,
         answer_style: str = "concise",
-        sentence_callback: Callable[[str, int], Awaitable[None]] | None = None,
+        sentence_callback: Callable[[str, int], Awaitable[bool | None]] | None = None,
         delta_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> GroundedAnswer:
         if not documents:
@@ -826,19 +866,19 @@ class LangChainGroundedAnswerGenerator:
             )
         elif answer_style == "entity_overview":
             style_instruction = (
-            f"Give a helpful, conversational overview in "
-            f"{_sentence_range(self._settings, 'medium')} short sentences across "
-            f"{_paragraph_range(self._settings)}. Phrase every sentence as a close paraphrase of one evidence source "
-            "and normally cite only that source; cite at most two sources when both directly support the "
-            "same sentence. Describe how the product appears in the indexed project evidence, then cover "
-            "its most important evidenced capabilities or workflows. When at least three distinct feature "
-            "sources are supplied, cover at least three named features in separate sentences. Prioritize "
-            "one feature per sentence and cite only that feature's directly supporting source. Do not begin "
-            "with a product-definition sentence or combine a list of features into one factual sentence. "
-            "Prioritize what the features do; do not report file counts, line counts, symbol counts, tests, maturity, "
-            "or lifecycle status unless the user asks for those details. Do not expand an acronym, infer a "
-            "product definition, generalize a shared architecture, or combine implementation details "
-            "across features unless the cited evidence explicitly states that claim."
+                f"Give a helpful, conversational overview in "
+                f"{_sentence_range(self._settings, 'medium')} short sentences across "
+                f"{_paragraph_range(self._settings)}. Phrase every sentence as a close paraphrase of one evidence source "
+                "and normally cite only that source; cite at most two sources when both directly support the "
+                "same sentence. Describe how the product appears in the indexed project evidence, then cover "
+                "its most important evidenced capabilities or workflows. When at least three distinct feature "
+                "sources are supplied, cover at least three named features in separate sentences. Prioritize "
+                "one feature per sentence and cite only that feature's directly supporting source. Do not begin "
+                "with a product-definition sentence or combine a list of features into one factual sentence. "
+                "Prioritize what the features do; do not report file counts, line counts, symbol counts, tests, maturity, "
+                "or lifecycle status unless the user asks for those details. Do not expand an acronym, infer a "
+                "product definition, generalize a shared architecture, or combine implementation details "
+                "across features unless the cited evidence explicitly states that claim."
             )
         elif answer_style == "implementation":
             style_instruction = (
@@ -930,7 +970,8 @@ class LangChainGroundedAnswerGenerator:
         if answer_style != "feature_inventory":
             style_instruction = f"{style_instruction} {_LIST_RULE}"
         style_instruction = " ".join(
-            part for part in (
+            part
+            for part in (
                 style_instruction,
                 _USER_REQUESTED_SHAPE_RULE,
                 _ANSWER_SKELETON,
@@ -942,8 +983,7 @@ class LangChainGroundedAnswerGenerator:
             [
                 (
                     "system",
-                    _GROUNDED_ANSWER_RULES
-                    + "Every material sentence "
+                    _GROUNDED_ANSWER_RULES + "Every material sentence "
                     "MUST end with one or more exact citations such as [SOURCE 1]. The citations array "
                     "MUST contain each one-based SOURCE number used in the answer. Never return a "
                     "factual answer with an empty citations array. "
@@ -1041,26 +1081,12 @@ class LangChainGroundedAnswerGenerator:
                         stream_timing.time_to_first_chunk_seconds
                     )
                 metadata_began = time.perf_counter()
-                outcome_prompt = ChatPromptTemplate.from_messages(
-                    [
-                        (
-                            "system",
-                            "Classify the response disposition only; do not add or verify facts. "
-                            "Use REFUSAL whenever the response declines the request, including when "
-                            "it redirects to supported topics. Use SOURCE_SCOPE_VIOLATION when the "
-                            "request is outside the authorized assistance boundary, "
-                            "UNVERIFIED_EVIDENCE for an in-project detail not established by evidence, "
-                            "and INSUFFICIENT_EVIDENCE for any other inability to answer.",
-                        ),
-                        ("human", "QUESTION:\n{question}\n\nRESPONSE:\n{response}"),
-                    ]
+                # The prose is authoritative and the normalizer already derives
+                # refusal disposition from observable language. A second model
+                # call added serialized latency and could contradict the prose.
+                outcome = normalize_streamed_answer_outcome(
+                    prose, AnswerOutcome(outcome="ANSWER", refusal_reason=None)
                 )
-                outcome, outcome_usage = await _invoke_with_usage(
-                    outcome_prompt | model.with_structured_output(AnswerOutcome),
-                    {"question": question, "response": prose},
-                    self._settings,
-                )
-                outcome = normalize_streamed_answer_outcome(prose, outcome)
                 self.last_answer_metadata_seconds = time.perf_counter() - metadata_began
                 value = GroundedAnswer(
                     outcome=outcome.outcome,
@@ -1078,7 +1104,7 @@ class LangChainGroundedAnswerGenerator:
                     # free-text commentary, which no client renders.
                     missing_information=[],
                 )
-                usage = _combine_usage(prose_usage, outcome_usage)
+                usage = prose_usage
         self.last_usage = usage
         return value
 
@@ -1158,18 +1184,18 @@ class LangChainGroundedAnswerGenerator:
             )
         elif answer_style == "entity_overview":
             style_instruction = (
-            f"Rewrite the overview as {_sentence_range(self._settings, 'medium')} short, evidence-close sentences across "
-            f"{_paragraph_range(self._settings)}. Base each sentence primarily on one source and normally cite only that "
-            "source; use at most two citations when both sources directly support the same sentence. "
-            "When at least three distinct feature sources are supplied, cover at least three named features "
-            "in separate sentences. Use one feature per sentence with only that feature's directly supporting "
-            "source, and remove any product-definition sentence that combines multiple features. Prioritize "
-            "their purpose or workflows over implementation metrics. "
-            "Unless the question explicitly asks for metrics, remove every file count, line count, symbol "
-            "count, test count, percentage, maturity label, and lifecycle status from the repaired answer. "
-            "Remove inferred definitions, acronym expansions, broad architecture generalizations, and "
-            "cross-feature synthesis that is not stated explicitly in the cited evidence. Never replace a "
-            "functional overview with imports, package-qualified symbols, filenames, or an implementation inventory."
+                f"Rewrite the overview as {_sentence_range(self._settings, 'medium')} short, evidence-close sentences across "
+                f"{_paragraph_range(self._settings)}. Base each sentence primarily on one source and normally cite only that "
+                "source; use at most two citations when both sources directly support the same sentence. "
+                "When at least three distinct feature sources are supplied, cover at least three named features "
+                "in separate sentences. Use one feature per sentence with only that feature's directly supporting "
+                "source, and remove any product-definition sentence that combines multiple features. Prioritize "
+                "their purpose or workflows over implementation metrics. "
+                "Unless the question explicitly asks for metrics, remove every file count, line count, symbol "
+                "count, test count, percentage, maturity label, and lifecycle status from the repaired answer. "
+                "Remove inferred definitions, acronym expansions, broad architecture generalizations, and "
+                "cross-feature synthesis that is not stated explicitly in the cited evidence. Never replace a "
+                "functional overview with imports, package-qualified symbols, filenames, or an implementation inventory."
             )
         elif answer_style == "implementation":
             style_instruction = (
@@ -1233,7 +1259,8 @@ class LangChainGroundedAnswerGenerator:
                 f"request. {style_instruction}"
             )
         style_instruction = " ".join(
-            part for part in (
+            part
+            for part in (
                 style_instruction,
                 _USER_REQUESTED_SHAPE_RULE,
                 _ANSWER_SKELETON,
@@ -1354,9 +1381,7 @@ def _chat_model(
 ):
     if not settings.llm_configured:
         raise ValueError("The configured LLM provider is incomplete.")
-    selected_temperature = (
-        settings.factual_temperature if temperature is None else temperature
-    )
+    selected_temperature = settings.factual_temperature if temperature is None else temperature
     if settings.model_gateway == "litellm" and not (
         settings.llm_provider == "azure-openai"
         and settings.azure_openai_use_managed_identity
@@ -1377,6 +1402,15 @@ def _chat_model(
             model=_model_name(settings, model_profile, task=task),
             base_url=settings.ollama_base_url,
             temperature=selected_temperature,
+            # Ollama may still sample among equal-probability tokens at
+            # temperature zero. Pin the sampler so factual, repair, and
+            # verification reruns are reproducible for identical inputs.
+            seed=0,
+            # Temperature zero alone still allowed Ollama to choose among a
+            # changing top-k candidate set on identical Metal-backed runs.
+            # A factual turn is greedy; creative overview synthesis retains the
+            # runtime's normal candidate width.
+            top_k=1 if selected_temperature == 0.0 else 40,
             num_ctx=settings.ollama_context_tokens,
             num_predict=512 if task == "planner" else settings.ollama_max_output_tokens,
             num_thread=8,
@@ -1387,6 +1421,8 @@ def _chat_model(
             # evidence wording that verbatim citation and grounding depend on.
             presence_penalty=settings.ollama_presence_penalty,
             repeat_penalty=settings.ollama_repeat_penalty,
+            sync_client_kwargs={"event_hooks": {"request": [log_ollama_request]}},
+            async_client_kwargs={"event_hooks": {"request": [log_ollama_request_async]}},
         )
     if settings.llm_provider == "openai":
         return ChatOpenAI(
@@ -1427,7 +1463,11 @@ def _model_name(settings: Settings, model_profile: str, *, task: str) -> str:
 
 class _model_slot:
     def __init__(self, settings: Settings) -> None:
-        self._wait_seconds = settings.load_shed_wait_seconds
+        # Once a request has passed admission and completed retrieval, waiting
+        # for the model is normal pipeline contention, not a new request to shed.
+        # Bound that wait by the model timeout rather than the millisecond-scale
+        # admission window so overlapped requests do not fail at generation.
+        self._wait_seconds = settings.llm_timeout_seconds
         self._acquired = False
         self._semaphore = (
             _local_semaphore(settings.local_max_concurrency)
@@ -1438,9 +1478,7 @@ class _model_slot:
     async def __aenter__(self) -> None:
         if self._semaphore is not None:
             try:
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), timeout=self._wait_seconds
-                )
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=self._wait_seconds)
             except TimeoutError as failure:
                 raise ModelSlotUnavailableError(
                     "The local model is busy; retry the request shortly."
@@ -1515,9 +1553,7 @@ async def _stream_grounded_answer_with_usage(
                         break
                     except TimeoutError as failure:
                         raise StreamTimeoutError(
-                            "stream_idle_timeout"
-                            if saw_chunk
-                            else "stream_first_chunk_timeout",
+                            "stream_idle_timeout" if saw_chunk else "stream_first_chunk_timeout",
                             str(latest.get("answer") or ""),
                             tuple(verified),
                         ) from failure
@@ -1604,18 +1640,14 @@ async def _stream_plain_answer_with_usage(
                         break
                     except TimeoutError as failure:
                         raise StreamTimeoutError(
-                            "stream_idle_timeout"
-                            if saw_chunk
-                            else "stream_first_chunk_timeout",
+                            "stream_idle_timeout" if saw_chunk else "stream_first_chunk_timeout",
                             answer,
                             tuple(verified),
                         ) from failure
                     if not saw_chunk:
                         saw_chunk = True
                         if timing is not None:
-                            timing.time_to_first_chunk_seconds = (
-                                time.perf_counter() - began
-                            )
+                            timing.time_to_first_chunk_seconds = time.perf_counter() - began
                     delta = _stream_chunk_text(chunk)
                     if not delta:
                         continue
@@ -1633,9 +1665,7 @@ async def _stream_plain_answer_with_usage(
     except StreamTimeoutError:
         raise
     except TimeoutError as failure:
-        raise StreamTimeoutError(
-            "stream_total_timeout", answer, tuple(verified)
-        ) from failure
+        raise StreamTimeoutError("stream_total_timeout", answer, tuple(verified)) from failure
     finally:
         if timing is not None:
             timing.total_seconds = time.perf_counter() - began
@@ -1706,9 +1736,7 @@ _OVERVIEW_METRIC_LINE = re.compile(
 )
 
 
-def _documents_for_answer_style(
-    documents: list[Document], answer_style: str
-) -> list[Document]:
+def _documents_for_answer_style(documents: list[Document], answer_style: str) -> list[Document]:
     if answer_style not in {"entity_overview", "project_overview"}:
         return documents
     filtered_documents: list[Document] = []
@@ -1780,7 +1808,9 @@ def _evidence_budget(
 
 _FRAME_CONTROL = re.compile(
     r"(?im)^(?P<indent>\s*)(?P<label>SOURCE\s+\d+|TITLE|TYPE|PROVIDER|"
-    r"REFERENCE|LOCATOR|RE" r"PO" r"SITORY|BRANCH|COMMIT|PATH|SYMBOL|CONTENT)(?P<suffix>\s*:?)"
+    r"REFERENCE|LOCATOR|RE"
+    r"PO"
+    r"SITORY|BRANCH|COMMIT|PATH|SYMBOL|CONTENT)(?P<suffix>\s*:?)"
 )
 
 
@@ -1790,16 +1820,17 @@ def _neutralize_frame_controls(value: str) -> str:
     cleaned = sanitize_evidence(value)
     return _FRAME_CONTROL.sub(
         lambda match: (
-            f"{match.group('indent')}[embedded {match.group('label')}]"
-            f"{match.group('suffix')}"
+            f"{match.group('indent')}[embedded {match.group('label')}]{match.group('suffix')}"
         ),
         cleaned,
     )
 
 
 def _jira_relationship_subject(document: Document) -> str:
-    if (document.metadata.get("provider") != "JIRA"
-            or document.metadata.get("jira_chunk_kind") != "RELATIONSHIP"):
+    if (
+        document.metadata.get("provider") != "JIRA"
+        or document.metadata.get("jira_chunk_kind") != "RELATIONSHIP"
+    ):
         return ""
     try:
         related = json.loads(document.page_content)
@@ -1811,9 +1842,11 @@ def _jira_relationship_subject(document: Document) -> str:
     owner = str(document.metadata.get("issue_key") or "")
     if not all(re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", value, re.I) for value in (key, owner)):
         return ""
-    return (f"RELATIONSHIP OWNER: {owner}\nRELATED ISSUE: {key}\n"
-            f"The JSON issue type, summary and related status describe {key}. "
-            f"They do not establish the type or status of {owner}.\n")
+    return (
+        f"RELATIONSHIP OWNER: {owner}\nRELATED ISSUE: {key}\n"
+        f"The JSON issue type, summary and related status describe {key}. "
+        f"They do not establish the type or status of {owner}.\n"
+    )
 
 
 def _evidence_with_diagnostics(
@@ -1824,12 +1857,23 @@ def _evidence_with_diagnostics(
     truncated = 0
     nonce = secrets.token_hex(16)
     for index, document in enumerate(documents, start=1):
-        content = _neutralize_frame_controls(_jira_relationship_subject(document) + document.page_content)
+        content = _neutralize_frame_controls(
+            _jira_relationship_subject(document) + document.page_content
+        )
         metadata = {
             key: sanitize_evidence(str(document.metadata.get(key, ""))).replace("\n", " ")
             for key in (
-                "title", "source_type", "provider", "reference", "locator",
-                "repository", "branch", "commit_sha", "blob_sha", "path", "symbol",
+                "title",
+                "source_type",
+                "provider",
+                "reference",
+                "locator",
+                "repository",
+                "branch",
+                "commit_sha",
+                "blob_sha",
+                "path",
+                "symbol",
             )
         }
         header = (

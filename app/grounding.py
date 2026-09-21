@@ -56,9 +56,7 @@ class LocalCitationGroundingVerifier:
         self._pair_score_cache: dict[tuple[str, str], float] = {}
         self.last_citation_realignments = 0
 
-    def _predict_scores(
-        self, pairs: list[tuple[str, str]], batch_size: int
-    ) -> list[float]:
+    def _predict_scores(self, pairs: list[tuple[str, str]], batch_size: int) -> list[float]:
         if self._accelerator_url:
             # Batched by the client. A long answer produces more claim/evidence
             # pairs than one request may carry, and the rejection would fail the
@@ -73,9 +71,7 @@ class LocalCitationGroundingVerifier:
                 max_concurrency=self._accelerator_max_concurrency,
             )
             if len(scores) != len(pairs):
-                raise RuntimeError(
-                    "Local accelerator returned invalid grounding scores."
-                )
+                raise RuntimeError("Local accelerator returned invalid grounding scores.")
             return scores
         return [
             float(value)
@@ -115,9 +111,7 @@ class LocalCitationGroundingVerifier:
     async def _ensure_scores(
         self, pairs: list[tuple[str, str]], *, batch_size: int | None = None
     ) -> None:
-        missing = list(
-            dict.fromkeys(pair for pair in pairs if pair not in self._pair_score_cache)
-        )
+        missing = list(dict.fromkeys(pair for pair in pairs if pair not in self._pair_score_cache))
         if not missing:
             return
         raw_scores = await asyncio.to_thread(
@@ -149,9 +143,7 @@ class LocalCitationGroundingVerifier:
         kind = getattr(structured_claim, "kind", None)
         table_header = str(getattr(structured_claim, "table_header", ""))
         score_claim = (
-            linearize_table_row(table_header, claim)
-            if kind is AnswerLineKind.TABLE_ROW
-            else claim
+            linearize_table_row(table_header, claim) if kind is AnswerLineKind.TABLE_ROW else claim
         )
         exact_row_evidence = (
             literal_table_row_evidence(table_header, claim, literal_evidence)
@@ -161,8 +153,7 @@ class LocalCitationGroundingVerifier:
         if exact_row_evidence:
             return ((score_claim, exact_row_evidence),)
         return tuple(
-            (score_claim, self._scored(documents[number - 1].page_content))
-            for number in cited
+            (score_claim, self._scored(documents[number - 1].page_content)) for number in cited
         )
 
     def _best_score(self, pairs: tuple[tuple[str, str], ...]) -> float:
@@ -206,9 +197,7 @@ class LocalCitationGroundingVerifier:
         current_pairs: list[tuple[str, str]] = []
         for structured_claim in structured_material_claims(answer.answer):
             sentence = structured_claim.text
-            source_numbers = [
-                int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)
-            ]
+            source_numbers = [int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)]
             claim = re.sub(r"\s*\[SOURCE \d+\]", "", sentence).strip()
             if structured_claim.kind is AnswerLineKind.LIST_ITEM:
                 claim = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", claim)
@@ -217,8 +206,7 @@ class LocalCitationGroundingVerifier:
             current_threshold: float | None = None
             if cited and not any(number < 1 or number > len(documents) for number in cited):
                 literal_evidence = "\n".join(
-                    sanitize_evidence(documents[number - 1].page_content)
-                    for number in cited
+                    sanitize_evidence(documents[number - 1].page_content) for number in cited
                 )
                 if _exact_anchors_supported(
                     claim, literal_evidence, [documents[number - 1] for number in cited]
@@ -243,9 +231,7 @@ class LocalCitationGroundingVerifier:
                         table_evidence=contains_table(literal_evidence),
                     )
                     current_pairs.extend(current_group)
-            eligible: list[
-                tuple[tuple[int, ...], tuple[tuple[str, str], ...], float]
-            ] = []
+            eligible: list[tuple[tuple[int, ...], tuple[tuple[str, str], ...], float]] = []
 
             def add_candidate(candidate_citations: tuple[int, ...]) -> None:
                 literal_evidence = "\n".join(
@@ -253,7 +239,9 @@ class LocalCitationGroundingVerifier:
                     for number in candidate_citations
                 )
                 if not _exact_anchors_supported(
-                    claim, literal_evidence, [documents[number - 1] for number in candidate_citations]
+                    claim,
+                    literal_evidence,
+                    [documents[number - 1] for number in candidate_citations],
                 ) or not _negation_supported(claim, literal_evidence):
                     return
                 group = self._verification_score_pairs(
@@ -286,14 +274,10 @@ class LocalCitationGroundingVerifier:
             # and verify() applies the same best-source rule afterward.
             if not eligible:
                 for size in range(2, min(3, len(documents)) + 1):
-                    for candidate_citations in combinations(
-                        range(1, len(documents) + 1), size
-                    ):
+                    for candidate_citations in combinations(range(1, len(documents) + 1), size):
                         add_candidate(candidate_citations)
             if current_group is not None or eligible:
-                pending.append(
-                    (sentence, cited, current_group, current_threshold, eligible)
-                )
+                pending.append((sentence, cited, current_group, current_threshold, eligible))
         if pending:
             # Fast path: score the citations the model already supplied in one
             # batch. Alternative documents are scored only for claims whose
@@ -367,17 +351,13 @@ class LocalCitationGroundingVerifier:
 
         for position, structured_claim in enumerate(claims, start=1):
             sentence = structured_claim.text
-            source_numbers = [
-                int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)
-            ]
+            source_numbers = [int(value) for value in re.findall(r"\[SOURCE (\d+)\]", sentence)]
             if not source_numbers or any(
                 number < 1 or number > len(documents) for number in source_numbers
             ):
                 invalid_claims.append(sentence)
                 rejections.append(
-                    ClaimRejection(
-                        claim_index=position, reason="MISSING_OR_INVALID_CITATION"
-                    )
+                    ClaimRejection(claim_index=position, reason="MISSING_OR_INVALID_CITATION")
                 )
                 continue
             claim = re.sub(r"\s*\[SOURCE \d+\]", "", sentence).strip()
@@ -390,7 +370,9 @@ class LocalCitationGroundingVerifier:
                 sanitize_evidence(documents[number - 1].page_content) for number in cited
             )
             table_evidence = contains_table(literal_evidence)
-            if not _exact_anchors_supported(claim, literal_evidence, [documents[number - 1] for number in cited]):
+            if not _exact_anchors_supported(
+                claim, literal_evidence, [documents[number - 1] for number in cited]
+            ):
                 # Two failures wear one reason code here, and they need opposite
                 # responses. If the anchor is absent from every authorized
                 # document the model invented it and the claim must go. If it is
@@ -447,17 +429,13 @@ class LocalCitationGroundingVerifier:
                 and answer_language not in evidence_languages
             )
             score_thresholds.append(
-                self._threshold_for(
-                    cross_language=cross_language, table_evidence=table_evidence
-                )
+                self._threshold_for(cross_language=cross_language, table_evidence=table_evidence)
             )
 
         # _ensure_scores already skips pairs attach_missing_citations cached,
         # so passing the full set costs nothing and keeps the bookkeeping in one
         # place.
-        await self._ensure_scores(
-            [pair for group in score_groups for pair in group]
-        )
+        await self._ensure_scores([pair for group in score_groups for pair in group])
         resolved_scores = [self._best_score(group) for group in score_groups]
         for sentence, score, threshold, position, table_evidence in zip(
             score_claims,
@@ -501,7 +479,6 @@ class LocalCitationGroundingVerifier:
             reason_code="SUPPORTED",
         )
 
-
     async def answer_addresses_question(
         self, question: str, answer: str, *, threshold: float
     ) -> tuple[bool, float]:
@@ -515,9 +492,7 @@ class LocalCitationGroundingVerifier:
         over the whole answer rather than per claim.
         """
 
-        text = sanitize_evidence(
-            linearize_tables(re.sub(r"\s*\[SOURCE \d+\]", "", answer))
-        ).strip()
+        text = sanitize_evidence(linearize_tables(re.sub(r"\s*\[SOURCE \d+\]", "", answer))).strip()
         prompt = " ".join(str(question or "").split())
         if not text or not prompt:
             # Nothing to judge. Inventing a refusal here would be worse than
@@ -542,7 +517,9 @@ def _exact_anchors_supported(claim: str, evidence: str, documents=()) -> bool:
     # support in the cited body; historical metadata cannot supply current state.
     for document in documents:
         key = str(document.metadata.get("issue_key") or "")
-        if document.metadata.get("provider") != "JIRA" or not re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", key, re.I):
+        if document.metadata.get("provider") != "JIRA" or not re.fullmatch(
+            r"[A-Z][A-Z0-9_]*-\d+", key, re.I
+        ):
             continue
         pattern = rf"(?<![\w-])`?{re.escape(key)}`?(?![\w-])"
         claim = re.sub(pattern, "", claim, flags=re.I)
@@ -561,13 +538,31 @@ def _numeric_anchors(value: str) -> set[str]:
     # ISO's adjacent T also used to hide the day from the numeric regex.
     dates: set[str] = set()
     months = {
-        "january": 1, "enero": 1, "february": 2, "febrero": 2,
-        "march": 3, "marzo": 3, "april": 4, "abril": 4,
-        "may": 5, "mayo": 5, "june": 6, "junio": 6,
-        "july": 7, "julio": 7, "august": 8, "agosto": 8,
-        "september": 9, "septiembre": 9, "setiembre": 9,
-        "october": 10, "octubre": 10, "november": 11, "noviembre": 11,
-        "december": 12, "diciembre": 12,
+        "january": 1,
+        "enero": 1,
+        "february": 2,
+        "febrero": 2,
+        "march": 3,
+        "marzo": 3,
+        "april": 4,
+        "abril": 4,
+        "may": 5,
+        "mayo": 5,
+        "june": 6,
+        "junio": 6,
+        "july": 7,
+        "julio": 7,
+        "august": 8,
+        "agosto": 8,
+        "september": 9,
+        "septiembre": 9,
+        "setiembre": 9,
+        "october": 10,
+        "octubre": 10,
+        "november": 11,
+        "noviembre": 11,
+        "december": 12,
+        "diciembre": 12,
     }
 
     def replace_date(match):
@@ -582,10 +577,22 @@ def _numeric_anchors(value: str) -> set[str]:
         dates.add(str(int(parts["year"])))
         return " "
 
-    value = re.sub(r"\b(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})(?:T(?=\d{2}:)|\b)", replace_date, value)
+    value = re.sub(
+        r"\b(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})(?:T(?=\d{2}:)|\b)", replace_date, value
+    )
     names = "|".join(months)
-    value = re.sub(rf"\b(?P<day>\d{{1,2}})\s+(?:de\s+)?(?P<name>{names})\s+(?:de\s+)?(?P<year>\d{{4}})\b", replace_date, value, flags=re.I)
-    value = re.sub(rf"\b(?P<name>{names})\s+(?P<day>\d{{1,2}}),?\s+(?P<year>\d{{4}})\b", replace_date, value, flags=re.I)
+    value = re.sub(
+        rf"\b(?P<day>\d{{1,2}})\s+(?:de\s+)?(?P<name>{names})\s+(?:de\s+)?(?P<year>\d{{4}})\b",
+        replace_date,
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        rf"\b(?P<name>{names})\s+(?P<day>\d{{1,2}}),?\s+(?P<year>\d{{4}})\b",
+        replace_date,
+        value,
+        flags=re.I,
+    )
     return dates | {
         _canonical_number(number)
         for number in re.findall(r"(?<![\w])\d+(?:[.,]\d+)*(?![\w])", value)

@@ -1,0 +1,52 @@
+{
+  "title": "RAG latency and decode throughput",
+  "uid": "rag-latency",
+  "schemaVersion": 39,
+  "tags": ["rag", "latency", "llm"],
+  "templating": {
+    "list": [
+      {"name": "stage", "type": "query", "query": "label_values(pi_rag_stage_duration_seconds_bucket, stage)", "multi": true, "includeAll": true},
+      {"name": "outcome", "type": "query", "query": "label_values(pi_rag_stage_duration_seconds_bucket{stage=~\"$stage\"}, outcome)", "multi": true, "includeAll": true}
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Stage latency p50 by stage outcome",
+      "targets": [{"expr": "histogram_quantile(0.50, sum by (le,stage,outcome) (rate(pi_rag_stage_duration_seconds_bucket{stage=~\"$stage\",outcome=~\"$outcome\"}[5m])))", "legendFormat": "{{stage}} · {{outcome}}"}]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Stage latency p95 by stage outcome",
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le,stage,outcome) (rate(pi_rag_stage_duration_seconds_bucket{stage=~\"$stage\",outcome=~\"$outcome\"}[5m])))", "legendFormat": "{{stage}} · {{outcome}}"}]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "End-to-end request latency p50/p95 by outcome",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le,outcome) (rate(pi_rag_request_duration_seconds_bucket[5m])))", "legendFormat": "p50 · {{outcome}}"},
+        {"expr": "histogram_quantile(0.95, sum by (le,outcome) (rate(pi_rag_request_duration_seconds_bucket[5m])))", "legendFormat": "p95 · {{outcome}}"}
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Generated output tokens per second",
+      "description": "Production estimate from exact model output-token counters divided by generation-stage wall time. Use evaluation/benchmark_ollama_decode.py for isolated model decode measurements.",
+      "targets": [{"expr": "sum(rate(pi_rag_tokens_total{stage=~\"generate|citation_repair|verify_grounding\",direction=\"output\"}[5m])) / clamp_min(sum(rate(pi_rag_stage_duration_seconds_sum{stage=~\"generate|citation_repair|verify_grounding\"}[5m])), 0.001)", "legendFormat": "output tokens/s"}]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Admission and inference pressure",
+      "targets": [
+        {"expr": "pi_rag_inflight_requests", "legendFormat": "in flight"},
+        {"expr": "pi_rag_admission_capacity", "legendFormat": "admission capacity"},
+        {"expr": "sum(rate(pi_rag_request_admissions_total{outcome=\"shed\"}[5m]))", "legendFormat": "shed/s"}
+      ]
+    }
+  ]
+}

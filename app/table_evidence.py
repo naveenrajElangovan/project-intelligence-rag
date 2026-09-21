@@ -72,9 +72,7 @@ def normalize_table_dialect(value: str) -> str:
             end += 1
         run = lines[index:end]
         if len(run) < 2 or (
-            len(run) >= 2
-            and _is_row(run[0])
-            and _SEPARATOR.fullmatch(run[1]) is not None
+            len(run) >= 2 and _is_row(run[0]) and _SEPARATOR.fullmatch(run[1]) is not None
         ):
             output.extend(run)
             index = end

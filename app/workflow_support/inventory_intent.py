@@ -33,7 +33,7 @@ _PLURAL_AUXILIARY_QUESTION = re.compile(
     r"\b(?:what|which|cu[aá]les|qu[eé])\s+"
     r"(?:[a-z][a-z0-9_-]*\s+){0,2}[a-z][a-z0-9_-]*s\s+"
     r"(?:does|do|did|can|could|will|would|should|"
-    r"hace|hacen|puede|pueden|debe|deben)\b",
+    r"hace|hacen|usa|usan|utiliza|utilizan|puede|pueden|debe|deben)\b",
     re.IGNORECASE,
 )
 _PLURAL_EXISTENCE = re.compile(
@@ -45,7 +45,7 @@ _PLURAL_EXISTENCE = re.compile(
 )
 _INVENTORY_NOUN = re.compile(
     r"\b(?:inventory|catalog|registry|matrix|available options|supported values|"
-    r"inventario|cat[aá]logo|registro|matriz|opciones\s+disponibles|"
+    r"inventario|cat[aá]logo|registro(?!\s+(?:un|una|el|la|los|las)\b)|matriz|opciones\s+disponibles|"
     r"valores\s+soportados)\b",
     re.IGNORECASE,
 )
@@ -67,9 +67,17 @@ def is_exhaustive_entity_detail_question(question: str) -> bool:
     """Return true for every-field requests about one explicit identifier."""
 
     normalized = " ".join(question.split())
+    plural_field_request = bool(
+        re.search(
+            r"\b(?:fields|parameters|attributes|properties|campos|par[aá]metros|"
+            r"atributos|propiedades)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
     return bool(
         member_identifiers(normalized)
-        and _EXHAUSTIVE_DETAIL.search(normalized)
+        and (_EXHAUSTIVE_DETAIL.search(normalized) or plural_field_request)
         and _ENTITY_DETAIL_NOUN.search(normalized)
     )
 
@@ -78,6 +86,10 @@ def is_inventory_question(question: str) -> bool:
     """Return true when the user requests a collection rather than one fact."""
 
     normalized = " ".join(question.split())
+    # In these Spanish forms ``registro`` is the first-person verb "I record",
+    # not the inventory noun "registry".
+    if re.search(r"(?i)\bc[oó]mo\s+registro\b", normalized):
+        return False
     if member_identifiers(normalized):
         return False
     return any(

@@ -20,9 +20,7 @@ def build(cases: list[dict[str, object]], dataset_version: str) -> list[dict[str
             "query_language": case["query_language"],
             "target_evidence_language": case["target_evidence_language"],
             "question_for_review": case["question"],
-            "question_sha256": hashlib.sha256(
-                str(case["question"]).encode("utf-8")
-            ).hexdigest(),
+            "question_sha256": hashlib.sha256(str(case["question"]).encode("utf-8")).hexdigest(),
             "reference": "",
             "reference_status": "pending_review",
             "dataset_version": dataset_version,

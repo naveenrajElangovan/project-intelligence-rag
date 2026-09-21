@@ -45,36 +45,189 @@ _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 # bad correction target.
 ENGLISH_FUNCTION_WORDS: frozenset[str] = frozenset(
     {
-        "the", "of", "that", "for", "how", "what", "status", "tell", "about",
-        "describe", "explain", "overview", "list", "all", "every", "feature",
-        "features", "have", "which", "where", "when", "who", "why", "whose",
-        "does", "did", "is", "are", "was", "were", "been", "being", "had",
-        "this", "these", "those", "there", "their", "they", "them", "its",
-        "with", "from", "into", "and", "but", "than", "then", "also", "only",
-        "show", "give", "please", "can", "could", "should", "would", "must",
-        "need", "want", "find", "search", "work", "works", "working", "used",
-        "between", "during", "before", "after", "again", "any", "some", "more",
-        "most", "each", "both", "such", "very", "many", "much", "summary",
-        "details", "detail", "difference", "example", "current", "currently",
+        "i",
+        "the",
+        "of",
+        "that",
+        "for",
+        "how",
+        "what",
+        "status",
+        "tell",
+        "about",
+        "describe",
+        "explain",
+        "overview",
+        "list",
+        "all",
+        "every",
+        "feature",
+        "features",
+        "have",
+        "which",
+        "where",
+        "when",
+        "who",
+        "why",
+        "whose",
+        "does",
+        "did",
+        "is",
+        "are",
+        "was",
+        "were",
+        "been",
+        "being",
+        "had",
+        "this",
+        "these",
+        "those",
+        "there",
+        "their",
+        "they",
+        "them",
+        "its",
+        "with",
+        "from",
+        "into",
+        "and",
+        "but",
+        "than",
+        "then",
+        "also",
+        "only",
+        "show",
+        "give",
+        "please",
+        "can",
+        "could",
+        "should",
+        "would",
+        "must",
+        "need",
+        "want",
+        "find",
+        "search",
+        "work",
+        "works",
+        "working",
+        "used",
+        "between",
+        "during",
+        "before",
+        "after",
+        "again",
+        "any",
+        "some",
+        "more",
+        "most",
+        "each",
+        "both",
+        "such",
+        "very",
+        "many",
+        "much",
+        "summary",
+        "details",
+        "detail",
+        "difference",
+        "example",
+        "current",
+        "currently",
     }
 )
 
 SPANISH_FUNCTION_WORDS: frozenset[str] = frozenset(
     {
-        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
-        "al", "que", "para", "por", "con", "sin", "como", "cual", "cuales",
-        "cuando", "donde", "quien", "quienes", "cuanto", "cuantos", "cuanta",
-        "cuantas", "porque", "es", "esta", "estan", "este", "estos", "esta",
-        "estas", "ese", "esa", "esos", "esas", "estado", "sobre", "hacia",
-        "desde", "entre", "segun", "tambien", "pero", "mas", "muy", "todo",
-        "todos", "toda", "todas", "funciona", "funcionan", "funcionamiento",
-        "explica", "explicar", "dime", "lista", "listar", "informacion",
-        "detalles", "resumen", "quiero", "necesito", "puedo", "puede",
-        "pueden", "hay", "tiene", "tienen", "tener", "hacer", "hace", "ver",
-        "saber", "decir", "sirve", "sirven", "ademas", "aunque", "mientras",
-        "cuál", "cómo", "qué",
+        "el",
+        "la",
+        "los",
+        "las",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "de",
+        "del",
+        "al",
+        "que",
+        "para",
+        "por",
+        "con",
+        "sin",
+        "como",
+        "cual",
+        "cuales",
+        "cuando",
+        "donde",
+        "quien",
+        "quienes",
+        "cuanto",
+        "cuantos",
+        "cuanta",
+        "cuantas",
+        "porque",
+        "es",
+        "esta",
+        "estan",
+        "este",
+        "estos",
+        "esta",
+        "estas",
+        "ese",
+        "esa",
+        "esos",
+        "esas",
+        "estado",
+        "sobre",
+        "hacia",
+        "desde",
+        "entre",
+        "segun",
+        "tambien",
+        "pero",
+        "mas",
+        "muy",
+        "todo",
+        "todos",
+        "toda",
+        "todas",
+        "funciona",
+        "funcionan",
+        "funcionamiento",
+        "explica",
+        "explicar",
+        "dime",
+        "lista",
+        "listar",
+        "informacion",
+        "detalles",
+        "resumen",
+        "quiero",
+        "necesito",
+        "puedo",
+        "puede",
+        "pueden",
+        "hay",
+        "tiene",
+        "tienen",
+        "tener",
+        "hacer",
+        "hace",
+        "ver",
+        "saber",
+        "decir",
+        "sirve",
+        "sirven",
+        "ademas",
+        "aunque",
+        "mientras",
+        "cuál",
+        "cómo",
+        "qué",
     }
 )
+
 
 def _ascii_fold(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
@@ -86,24 +239,62 @@ def _ascii_fold(value: str) -> str:
 _LEXICON: frozenset[str] = frozenset(
     _ascii_fold(word) for word in (ENGLISH_FUNCTION_WORDS | SPANISH_FUNCTION_WORDS)
 )
-_SPANISH_FOLDED: frozenset[str] = frozenset(
-    _ascii_fold(word) for word in SPANISH_FUNCTION_WORDS
-)
-_ENGLISH_FOLDED: frozenset[str] = frozenset(
-    _ascii_fold(word) for word in ENGLISH_FUNCTION_WORDS
-)
+_SPANISH_FOLDED: frozenset[str] = frozenset(_ascii_fold(word) for word in SPANISH_FUNCTION_WORDS)
+_ENGLISH_FOLDED: frozenset[str] = frozenset(_ascii_fold(word) for word in ENGLISH_FUNCTION_WORDS)
 
 # Real words that must survive verbatim even though they sit one edit away from
 # a correction target: 'cuenta' is not a misspelling of 'cuanta', and 'last' is
 # not a misspelling of 'list'. Extend this rather than widening the targets.
 _NEVER_CORRECT: frozenset[str] = frozenset(
     {
-        "last", "first", "next", "new", "old", "user", "users", "word", "words",
-        "card", "cart", "case", "cost", "chat", "flow", "note", "node", "port",
-        "sale", "sales", "sort", "test", "text", "role", "rule", "line", "link",
-        "cuenta", "cuentas", "tienda", "tiendas", "venta", "ventas", "cuenta",
-        "pedido", "pedidos", "cliente", "clientes", "tarjeta", "caja", "cajas",
-        "pago", "pagos", "precio", "precios", "producto", "productos", "tienda",
+        "last",
+        "first",
+        "next",
+        "new",
+        "old",
+        "user",
+        "users",
+        "word",
+        "words",
+        "card",
+        "cart",
+        "case",
+        "cost",
+        "chat",
+        "flow",
+        "note",
+        "node",
+        "port",
+        "sale",
+        "sales",
+        "sort",
+        "test",
+        "text",
+        "role",
+        "rule",
+        "line",
+        "link",
+        "cuenta",
+        "cuentas",
+        "tienda",
+        "tiendas",
+        "venta",
+        "ventas",
+        "cuenta",
+        "pedido",
+        "pedidos",
+        "cliente",
+        "clientes",
+        "tarjeta",
+        "caja",
+        "cajas",
+        "pago",
+        "pagos",
+        "precio",
+        "precios",
+        "producto",
+        "productos",
+        "tienda",
     }
 )
 
@@ -112,12 +303,46 @@ _NEVER_CORRECT: frozenset[str] = frozenset(
 # an unknown token is either one edit from a question word or it is left alone.
 _CORRECTABLE_TARGETS: frozenset[str] = frozenset(
     {
-        "what", "that", "the", "how", "which", "where", "when", "why", "status",
-        "list", "feature", "features", "explain", "describe", "about",
-        "overview", "summary", "details", "between", "difference", "current",
-        "como", "cual", "cuales", "cuando", "donde", "para", "porque", "sobre",
-        "funciona", "funcionan", "funcionamiento", "estado", "explicar",
-        "informacion", "detalles", "resumen", "quiero", "necesito", "tambien",
+        "what",
+        "that",
+        "the",
+        "how",
+        "which",
+        "where",
+        "when",
+        "why",
+        "status",
+        "list",
+        "feature",
+        "features",
+        "explain",
+        "describe",
+        "about",
+        "overview",
+        "summary",
+        "details",
+        "between",
+        "difference",
+        "current",
+        "como",
+        "cual",
+        "cuales",
+        "cuando",
+        "donde",
+        "para",
+        "porque",
+        "sobre",
+        "funciona",
+        "funcionan",
+        "funcionamiento",
+        "estado",
+        "explicar",
+        "informacion",
+        "detalles",
+        "resumen",
+        "quiero",
+        "necesito",
+        "tambien",
     }
 )
 
@@ -173,24 +398,16 @@ def _damerau_within_one(first: str, second: str) -> bool:
     if abs(length_first - length_second) > 1:
         return False
     if length_first == length_second:
-        differences = [
-            index
-            for index in range(length_first)
-            if first[index] != second[index]
-        ]
+        differences = [index for index in range(length_first) if first[index] != second[index]]
         if len(differences) == 1:
             return True
         if len(differences) == 2:
             left, right = differences
             return (
-                right == left + 1
-                and first[left] == second[right]
-                and first[right] == second[left]
+                right == left + 1 and first[left] == second[right] and first[right] == second[left]
             )
         return False
-    shorter, longer = (
-        (first, second) if length_first < length_second else (second, first)
-    )
+    shorter, longer = (first, second) if length_first < length_second else (second, first)
     index = 0
     while index < len(shorter) and shorter[index] == longer[index]:
         index += 1
@@ -227,9 +444,7 @@ def _best_correction(token: str) -> str | None:
     if mapped is not None:
         return mapped
     matches = [
-        candidate
-        for candidate in _CORRECTABLE_TARGETS
-        if _damerau_within_one(folded, candidate)
+        candidate for candidate in _CORRECTABLE_TARGETS if _damerau_within_one(folded, candidate)
     ]
     # Ambiguity is left alone: a coin flip between two dictionary words is more
     # damaging than the original typo.
@@ -250,9 +465,7 @@ def autocorrect_question(question: str, *, vocabulary: Iterable[str] = ()) -> st
     'what is ACME como funciona?' while the entity survives verbatim.
     """
 
-    protected = frozenset(
-        fold(str(entity)) for entity in vocabulary if str(entity).strip()
-    )
+    protected = frozenset(fold(str(entity)) for entity in vocabulary if str(entity).strip())
     corrections: list[tuple[int, int, str]] = []
     for match in _WORD.finditer(question):
         token = match.group()
@@ -277,9 +490,7 @@ def autocorrect_question(question: str, *, vocabulary: Iterable[str] = ()) -> st
 def correction_count(question: str, *, vocabulary: Iterable[str] = ()) -> int:
     """Number of tokens the corrector rewrites -- content-free telemetry."""
 
-    protected = frozenset(
-        fold(str(entity)) for entity in vocabulary if str(entity).strip()
-    )
+    protected = frozenset(fold(str(entity)) for entity in vocabulary if str(entity).strip())
     return sum(
         1
         for match in _WORD.finditer(question)

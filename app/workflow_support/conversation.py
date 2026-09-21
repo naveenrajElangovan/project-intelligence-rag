@@ -2,29 +2,22 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from difflib import SequenceMatcher
 
 from app.workflow_support.language import fold
 from app.workflow_support.query_analysis import _normalized_words
 
 
-def _subject_matches_vocabulary(
-    subject: str, vocabulary: Iterable[str]
-) -> bool:
+def _subject_matches_vocabulary(subject: str, vocabulary: Iterable[str]) -> bool:
     """Return whether a candidate subject shares a normalized project term."""
 
     subject_words = set(_normalized_words(subject))
-    vocabulary_words = {
-        word
-        for entry in vocabulary
-        for word in _normalized_words(str(entry))
-    }
+    vocabulary_words = {word for entry in vocabulary for word in _normalized_words(str(entry))}
     return bool(subject_words & vocabulary_words)
 
 
-def _bounded_history(
-    history: list[tuple[str, str]], maximum_tokens: int
-) -> list[tuple[str, str]]:
+def _bounded_history(history: list[tuple[str, str]], maximum_tokens: int) -> list[tuple[str, str]]:
     """Trim prior turns to a token budget, keeping the most recent ones.
 
     A conversation message may carry 8,000 characters and six are forwarded, so an
@@ -56,9 +49,7 @@ def _estimated_tokens(value: str) -> int:
     return max(1, -(-len(value.encode("utf-8")) // 3))
 
 
-def _contextual_subtopic_followup(
-    question: str, history: list[tuple[str, str]]
-) -> bool:
+def _contextual_subtopic_followup(question: str, history: Sequence[tuple[str, str]]) -> bool:
     """Recognize a short named subtopic taken from the preceding answer.
 
     A fragment such as ``named subsystem flow?`` names a real entity, but it
@@ -72,25 +63,77 @@ def _contextual_subtopic_followup(
     if not normalized.endswith(("?", "¿")) or not 1 < len(words) <= 8:
         return False
     relation_words = {
-        "behavior", "details", "flow", "mechanism", "overview", "part",
-        "path", "process", "sequence", "steps", "workflow",
-        "comportamiento", "detalles", "flujo", "mecanismo", "parte",
-        "pasos", "proceso", "secuencia",
+        "behavior",
+        "details",
+        "flow",
+        "mechanism",
+        "overview",
+        "part",
+        "path",
+        "process",
+        "sequence",
+        "steps",
+        "workflow",
+        "comportamiento",
+        "detalles",
+        "flujo",
+        "mecanismo",
+        "parte",
+        "pasos",
+        "proceso",
+        "secuencia",
     }
     if not words & relation_words:
         return False
     # A complete interrogative introduces its own predicate and must remain
     # standalone even if some of its nouns appeared in the previous answer.
     if words & {
-        "can", "could", "did", "do", "does", "how", "is", "should",
-        "what", "when", "where", "which", "who", "why", "would",
-        "como", "cómo", "cuando", "cuándo", "cual", "cuál", "donde",
-        "dónde", "por", "que", "qué", "quien", "quién",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "how",
+        "is",
+        "should",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "would",
+        "como",
+        "cómo",
+        "cuando",
+        "cuándo",
+        "cual",
+        "cuál",
+        "donde",
+        "dónde",
+        "por",
+        "que",
+        "qué",
+        "quien",
+        "quién",
     }:
         return False
-    topic_words = words - relation_words - {
-        "a", "an", "and", "de", "del", "el", "la", "of", "the", "y",
-    }
+    topic_words = (
+        words
+        - relation_words
+        - {
+            "a",
+            "an",
+            "and",
+            "de",
+            "del",
+            "el",
+            "la",
+            "of",
+            "the",
+            "y",
+        }
+    )
     if not topic_words:
         return False
     previous_answer = next(
@@ -178,12 +221,129 @@ def _complete_explicit_question(value: str) -> bool:
     return bool(complete_interrogative or explicit_imperative)
 
 
-def _conversation_resolution_needed(
-    question: str, vocabulary: Iterable[str] | None = None
-) -> bool:
+def _conversation_resolution_needed(question: str, vocabulary: Iterable[str] | None = None) -> bool:
     """Detect short anaphoric follow-ups without calling a model for direct questions."""
 
     return _conversation_resolution_decision(question, vocabulary)[0]
+
+
+_CORRECTIVE_SCAFFOLD_WORDS = frozenset(
+    {
+        "actually",
+        "but",
+        "i",
+        "instead",
+        "just",
+        "mean",
+        "need",
+        "no",
+        "not",
+        "only",
+        "please",
+        "rather",
+        "the",
+        "want",
+    }
+)
+
+_CORRECTIVE_ATTRIBUTE_WORDS = frozenset(
+    {
+        "argument",
+        "arguments",
+        "file",
+        "filename",
+        "filenames",
+        "files",
+        "result",
+        "results",
+    }
+)
+
+
+def _attribute_followup_word(word: str) -> bool:
+    """Recognize an attribute word, tolerating one ordinary typing error."""
+
+    candidates = _NON_SUBJECT_WORDS | _CORRECTIVE_ATTRIBUTE_WORDS
+    if word in candidates:
+        return True
+    if len(word) < 6:
+        return False
+    return max(SequenceMatcher(None, word, candidate).ratio() for candidate in candidates) >= 0.86
+
+
+def _corrective_attribute_followup(question: str) -> bool:
+    """Return whether a short correction refines an attribute of the prior subject.
+
+    Corrections such as ``I mean fields, not file names`` contain several nouns,
+    but none names a new entity. Keep this deliberately bounded to attribute
+    vocabulary so ``I mean refunds, not payments`` remains an explicit new topic.
+    """
+
+    normalized = fold(unicodedata.normalize("NFKC", question)).strip(" ?¿!¡.")
+    words = _normalized_words(normalized)
+    if not 1 < len(words) <= 14 or _ANCHOR_TOKEN.search(question):
+        return False
+    corrective_shape = (
+        "not" in words
+        and (
+            normalized.startswith(("i need ", "i mean ", "not "))
+            or "instead" in words
+            or "rather" in words
+        )
+    ) or normalized.startswith(("just ", "only "))
+    if not corrective_shape:
+        return False
+    remaining = [
+        word
+        for word in words
+        if word not in _CORRECTIVE_SCAFFOLD_WORDS and not _attribute_followup_word(word)
+    ]
+    return not remaining
+
+
+def _corrective_attribute_label(question: str) -> str:
+    """Return the corrected attribute named by a bounded follow-up."""
+
+    normalized = fold(unicodedata.normalize("NFKC", question)).strip(" ?¿!¡.")
+    desired = normalized
+    if normalized.startswith("not "):
+        match = re.match(r"not\s+.+?[,;]\s*(.+?)(?:\s+instead)?$", normalized)
+        if match:
+            desired = match.group(1)
+    elif " not " in normalized:
+        desired = normalized.split(" not ", 1)[0]
+        desired = re.sub(r"^(?:i\s+)?(?:mean|need|want)\s+", "", desired)
+    else:
+        desired = re.sub(r"^(?:just|only)\s+", "", desired)
+    words = _normalized_words(desired)
+    labels = (
+        ("parameters", ("parameter", "parameters", "argument", "arguments")),
+        ("fields", ("field", "fields")),
+        ("file names", ("filename", "filenames")),
+        ("attributes", ("attribute", "attributes", "property", "properties")),
+        ("values", ("value", "values")),
+        ("schema", ("schema",)),
+        ("payload", ("payload",)),
+        ("names", ("name", "names")),
+    )
+    for label, candidates in labels:
+        if any(
+            word == candidate
+            or (len(word) >= 6 and SequenceMatcher(None, word, candidate).ratio() >= 0.86)
+            for word in words
+            for candidate in candidates
+        ):
+            return label
+    return "details"
+
+
+def _corrective_attribute_rewrite(question: str, subject: str, language: str) -> str:
+    """Create a standalone attribute question while retaining the correction."""
+
+    label = _corrective_attribute_label(question)
+    if language == "es":
+        return f"Respecto a {subject}: ¿Cuáles son los {label}? Aclaración: {question.rstrip()}"
+    return f"Regarding {subject}: What are the {label}? Clarification: {question.rstrip()}"
 
 
 def _conversation_resolution_decision(
@@ -288,6 +448,8 @@ def _conversation_resolution_decision(
         tuple(fold(prefix) for prefix in followup_prefixes)
     ):
         return True, "FOLLOWUP_PREFIX"
+    if _corrective_attribute_followup(question):
+        return True, "CORRECTIVE_ATTRIBUTE_FOLLOWUP"
     # An elliptical conjunction carries the previous predicate, not a new
     # question: "and the other app?" carries the prior predicate. Retrieving on the bare
     # token loses the verb, and the verb is what selects the source route, so the
@@ -300,20 +462,61 @@ def _conversation_resolution_decision(
         return True, "ELLIPTICAL_CONJUNCTION"
     anaphoric_pronouns = words & (pronouns - {"that", "this", "these", "those"})
     if anaphoric_pronouns:
+        # A trailing locative can scope a complete definition question without
+        # replacing its subject: "what is memory here?" is about memory in the
+        # current project, while "what happened here?" and "what is it here?"
+        # still require prior context. Keep this grammatical and vocabulary
+        # independent so misspelled or newly introduced project terms reach
+        # retrieval instead of being rejected before any provider is queried.
+        if anaphoric_pronouns <= {"here", "aqui", "aqu\u00ed"} and _explicit_locative_subject(
+            normalized
+        ):
+            return False, "EXPLICIT_LOCATIVE_SUBJECT"
         return True, "ANAPHORIC_PRONOUN"
     # A short request can carry a verb but omit what the verb applies to. The
     # workflow adopts a rewrite only when bounded conversation state exists, so
     # classifying the sentence here is safe for fresh conversations too.
     short_followup_verbs = {
-        "clarify", "compare", "continue", "describe", "detail", "elaborate",
-        "explain", "expand", "give", "help", "include", "list", "need",
-        "provide", "show", "tell", "use", "want",
+        "clarify",
+        "compare",
+        "continue",
+        "describe",
+        "detail",
+        "elaborate",
+        "explain",
+        "expand",
+        "give",
+        "help",
+        "include",
+        "list",
+        "need",
+        "provide",
+        "show",
+        "tell",
+        "use",
+        "want",
         # Same set in Spanish, so an elliptical request behaves identically in
         # both languages rather than only being caught in English.
-        "aclara", "compara", "continua", "contin\u00faa", "describe", "detalla",
-        "elabora", "explica", "amplia", "ampl\u00eda", "dame", "ayuda",
-        "incluye", "lista", "necesito", "proporciona", "muestra", "dime",
-        "usa", "quiero",
+        "aclara",
+        "compara",
+        "continua",
+        "contin\u00faa",
+        "describe",
+        "detalla",
+        "elabora",
+        "explica",
+        "amplia",
+        "ampl\u00eda",
+        "dame",
+        "ayuda",
+        "incluye",
+        "lista",
+        "necesito",
+        "proporciona",
+        "muestra",
+        "dime",
+        "usa",
+        "quiero",
     }
     if (
         0 < len(normalized.split()) < 8
@@ -337,28 +540,88 @@ def _conversation_resolution_decision(
         and not words & _INDEPENDENT_PREDICATE_WORDS
     ):
         return True, "LEADING_FRAGMENT_CONTINUATION"
-    topic_words = words - pronouns - {
-        "a", "an", "and", "are", "be", "do", "does", "explain", "for", "how",
-        "is", "know", "me", "of", "please", "tell", "the", "to", "what", "you",
-        "implemented", "implementation", "funciona", "funcion", "como", "que", "sabes",
-        # Spanish function words. Without these a Spanish question keeps its
-        # articles and prepositions as "topic words", which changes whether it
-        # looks like a fresh subject and therefore whether it inherits the
-        # previous one.
-        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del",
-        "al", "para", "por", "con", "sobre", "es", "son", "esta", "estan",
-        "cual", "cuales", "cuando", "donde", "quien", "y", "o", "en", "lo",
-        "se", "su", "sus", "dame", "dime", "muestra", "muestrame", "necesito",
-        "quiero", "explica", "describe", "resume",
-    }
+    topic_words = (
+        words
+        - pronouns
+        - {
+            "a",
+            "an",
+            "and",
+            "are",
+            "be",
+            "do",
+            "does",
+            "explain",
+            "for",
+            "how",
+            "is",
+            "know",
+            "me",
+            "of",
+            "please",
+            "tell",
+            "the",
+            "to",
+            "what",
+            "you",
+            "implemented",
+            "implementation",
+            "funciona",
+            "funcion",
+            "como",
+            "que",
+            "sabes",
+            # Spanish function words. Without these a Spanish question keeps its
+            # articles and prepositions as "topic words", which changes whether it
+            # looks like a fresh subject and therefore whether it inherits the
+            # previous one.
+            "el",
+            "la",
+            "los",
+            "las",
+            "un",
+            "una",
+            "unos",
+            "unas",
+            "de",
+            "del",
+            "al",
+            "para",
+            "por",
+            "con",
+            "sobre",
+            "es",
+            "son",
+            "esta",
+            "estan",
+            "cual",
+            "cuales",
+            "cuando",
+            "donde",
+            "quien",
+            "y",
+            "o",
+            "en",
+            "lo",
+            "se",
+            "su",
+            "sus",
+            "dame",
+            "dime",
+            "muestra",
+            "muestrame",
+            "necesito",
+            "quiero",
+            "explica",
+            "describe",
+            "resume",
+        }
+    )
     # A demonstrative plus nothing but attribute words is a follow-up about the
     # previous subject, not a new topic. Checked before the topic-word test
     # because that test treats any unrecognised word as a fresh subject.
     if words & _DEMONSTRATIVES and not (
-        topic_words
-        - _DEMONSTRATIVES
-        - _NON_SUBJECT_WORDS
-        - _SUBJECT_IGNORED_WORDS
+        topic_words - _DEMONSTRATIVES - _NON_SUBJECT_WORDS - _SUBJECT_IGNORED_WORDS
     ):
         return True, "DEMONSTRATIVE_ATTRIBUTE_FOLLOWUP"
     if topic_words:
@@ -382,53 +645,243 @@ def _conversation_resolution_decision(
 
 
 # A question fragment that begins with one of these has no predicate of its own.
-_CONTINUATION_LEADING_WORDS = frozenset({
-    "from", "for", "about", "with", "within", "under", "regarding", "concerning",
-    "de", "del", "para", "por", "sobre", "con", "desde", "segun", "respecto",
-    "acerca",
-})
+_CONTINUATION_LEADING_WORDS = frozenset(
+    {
+        "from",
+        "for",
+        "about",
+        "with",
+        "within",
+        "under",
+        "regarding",
+        "concerning",
+        "de",
+        "del",
+        "para",
+        "por",
+        "sobre",
+        "con",
+        "desde",
+        "segun",
+        "respecto",
+        "acerca",
+    }
+)
 
 # An interrogative or finite verb makes a fragment a question in its own right,
 # whatever preposition opens it. Accent-stripped: _normalized_words folds
 # diacritics, so "cual" here also matches "cuál".
-_INDEPENDENT_PREDICATE_WORDS = frozenset({
-    "how", "what", "when", "where", "which", "who", "whom", "whose", "why",
-    "am", "are", "be", "can", "could", "did", "do", "does", "had", "has",
-    "have", "is", "may", "must", "should", "was", "were", "will", "would",
-    "como", "cuando", "cual", "cuales", "donde", "que", "quien", "quienes",
-    "es", "son", "esta", "estan", "estuvo", "fue", "fueron", "hace", "hacen",
-    "hay", "podria", "puede", "pueden", "sera", "seran", "tiene", "tienen",
-})
+_INDEPENDENT_PREDICATE_WORDS = frozenset(
+    {
+        "how",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "why",
+        "am",
+        "are",
+        "be",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "had",
+        "has",
+        "have",
+        "is",
+        "may",
+        "must",
+        "should",
+        "was",
+        "were",
+        "will",
+        "would",
+        "como",
+        "cuando",
+        "cual",
+        "cuales",
+        "donde",
+        "que",
+        "quien",
+        "quienes",
+        "es",
+        "son",
+        "esta",
+        "estan",
+        "estuvo",
+        "fue",
+        "fueron",
+        "hace",
+        "hacen",
+        "hay",
+        "podria",
+        "puede",
+        "pueden",
+        "sera",
+        "seran",
+        "tiene",
+        "tienen",
+    }
+)
 
 _MAX_CONTINUATION_FRAGMENT_WORDS = 6
 
 
 # Shared with the follow-up predicate so the two cannot drift apart. A word
 # here never introduces a new subject on its own.
-_SUBJECT_IGNORED_WORDS = frozenset({
-        "a", "about", "all", "also", "an", "and", "anything", "are", "as", "at", "be",
-        "available", "can", "check", "could", "describe", "detail", "details", "did", "do",
-        "does", "explain", "for", "from", "full", "give", "how", "i", "in",
-        "here", "information", "is", "it", "its", "me", "more", "of", "on", "or",
-        "overview", "please", "provide", "show", "summary", "tell", "that", "the",
-        "these", "this", "those", "to", "was", "were", "what", "when", "where",
-        "which", "who", "why", "with", "would", "you",
+_SUBJECT_IGNORED_WORDS = frozenset(
+    {
+        "a",
+        "about",
+        "all",
+        "also",
+        "an",
+        "and",
+        "anything",
+        "are",
+        "as",
+        "at",
+        "be",
+        "available",
+        "can",
+        "check",
+        "could",
+        "describe",
+        "detail",
+        "details",
+        "did",
+        "do",
+        "does",
+        "explain",
+        "for",
+        "from",
+        "full",
+        "give",
+        "how",
+        "i",
+        "in",
+        "here",
+        "information",
+        "is",
+        "it",
+        "its",
+        "me",
+        "more",
+        "of",
+        "on",
+        "or",
+        "overview",
+        "please",
+        "provide",
+        "show",
+        "summary",
+        "tell",
+        "that",
+        "the",
+        "these",
+        "this",
+        "those",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "would",
+        "you",
         # Greetings, acknowledgements and degree modifiers describe the turn,
         # not its subject. Treating pairs such as "yes specifically" as a new
         # entity makes an otherwise valid follow-up lose its active subject.
-        "actually", "again", "certainly", "continue", "deeply", "evening",
-        "exactly", "further", "good", "hello", "hey", "hi", "indeed",
-        "know", "now", "okay", "ok", "particularly", "precisely", "really",
-        "specifically", "sure", "yes",
-        "assistant", "ignore", "instruction", "instructions", "prompt", "system",
-        "acerca", "ademas", "anterior", "como", "cual", "cuando", "de", "del",
-        "dame", "detalles", "dime", "donde", "el", "ella", "ellos", "en", "esa",
-        "ese", "eso", "esta", "este", "esto", "explica", "informacion", "la", "las",
-        "lo", "los", "mas", "muestra", "para", "por", "que", "quien", "resumen",
-        "sobre", "su", "sus", "un", "una", "y",
-        "claro", "continuar", "especificamente", "específicamente", "exactamente",
-        "hola", "realmente", "si", "sí",
-})
+        "actually",
+        "again",
+        "certainly",
+        "continue",
+        "deeply",
+        "evening",
+        "exactly",
+        "further",
+        "good",
+        "hello",
+        "hey",
+        "hi",
+        "indeed",
+        "know",
+        "now",
+        "okay",
+        "ok",
+        "particularly",
+        "precisely",
+        "really",
+        "specifically",
+        "sure",
+        "yes",
+        "assistant",
+        "ignore",
+        "instruction",
+        "instructions",
+        "prompt",
+        "system",
+        "acerca",
+        "ademas",
+        "anterior",
+        "como",
+        "cual",
+        "cuando",
+        "de",
+        "del",
+        "dame",
+        "detalles",
+        "dime",
+        "donde",
+        "el",
+        "ella",
+        "ellos",
+        "en",
+        "esa",
+        "ese",
+        "eso",
+        "esta",
+        "este",
+        "esto",
+        "explica",
+        "informacion",
+        "la",
+        "las",
+        "lo",
+        "los",
+        "mas",
+        "muestra",
+        "para",
+        "por",
+        "que",
+        "quien",
+        "resumen",
+        "sobre",
+        "su",
+        "sus",
+        "un",
+        "una",
+        "y",
+        "claro",
+        "continuar",
+        "especificamente",
+        "específicamente",
+        "exactamente",
+        "hola",
+        "realmente",
+        "si",
+        "sí",
+    }
+)
 
 
 # Words that name a property OF a subject rather than a subject. "these are the
@@ -436,31 +889,166 @@ _SUBJECT_IGNORED_WORDS = frozenset({
 # whatever the previous turn established. Treating such a word as an explicit
 # subject made every attribute follow-up retrieve as a standalone string, which
 # matched generic documentation instead of the active subject.
-_NON_SUBJECT_WORDS = frozenset({
-    "attribute", "attributes", "column", "columns", "constant", "constants",
-    "default", "defaults", "enum", "enums", "field", "fields", "id", "ids",
-    "key", "keys", "kind", "kinds", "label", "labels", "name", "names",
-    "only", "option", "options", "parameter", "parameters", "payload",
-    "properties", "property", "required", "schema", "shape", "shortcut",
-    "shortcuts", "signature", "structure", "type", "types", "value", "values",
-    # Copulas and existentials. Added here rather than to the shared ignore set
-    # so _conversation_subject keeps its current behaviour for Spanish.
-    "son", "estan", "están", "hay",
-    # Adjectives that qualify an attribute set without naming a new subject.
-    "available", "declared", "defined", "existing", "mandatory", "optional",
-    "possible", "present", "remaining", "supported", "valid",
-    "disponible", "disponibles", "unico", "unicos", "unica", "unicas",
-    "único", "únicos", "única", "únicas", "definido", "definidos",
-    "atributo", "atributos", "campo", "campos", "clave", "claves",
-    "parametro", "parametros", "parámetro", "parámetros", "propiedad",
-    "propiedades", "tipo", "tipos", "valor", "valores",
-})
+_NON_SUBJECT_WORDS = frozenset(
+    {
+        "attribute",
+        "attributes",
+        "column",
+        "columns",
+        "constant",
+        "constants",
+        "default",
+        "defaults",
+        "enum",
+        "enums",
+        "field",
+        "fields",
+        "id",
+        "ids",
+        "key",
+        "keys",
+        "kind",
+        "kinds",
+        "label",
+        "labels",
+        "name",
+        "names",
+        "only",
+        "option",
+        "options",
+        "parameter",
+        "parameters",
+        "payload",
+        "properties",
+        "property",
+        "required",
+        "schema",
+        "shape",
+        "shortcut",
+        "shortcuts",
+        "signature",
+        "structure",
+        "type",
+        "types",
+        "value",
+        "values",
+        # Copulas and existentials. Added here rather than to the shared ignore set
+        # so _conversation_subject keeps its current behaviour for Spanish.
+        "son",
+        "estan",
+        "están",
+        "hay",
+        # Adjectives that qualify an attribute set without naming a new subject.
+        "available",
+        "declared",
+        "defined",
+        "existing",
+        "mandatory",
+        "optional",
+        "possible",
+        "present",
+        "remaining",
+        "supported",
+        "valid",
+        "disponible",
+        "disponibles",
+        "unico",
+        "unicos",
+        "unica",
+        "unicas",
+        "único",
+        "únicos",
+        "única",
+        "únicas",
+        "definido",
+        "definidos",
+        "atributo",
+        "atributos",
+        "campo",
+        "campos",
+        "clave",
+        "claves",
+        "parametro",
+        "parametros",
+        "parámetro",
+        "parámetros",
+        "propiedad",
+        "propiedades",
+        "tipo",
+        "tipos",
+        "valor",
+        "valores",
+    }
+)
 
-_DEMONSTRATIVES = frozenset({
-    "that", "these", "this", "those", "same", "above", "previous",
-    "esa", "ese", "eso", "esos", "esas", "esta", "estas", "este", "estos",
-    "esto", "anterior", "mismo", "misma", "mismos", "mismas",
-})
+_DEMONSTRATIVES = frozenset(
+    {
+        "that",
+        "these",
+        "this",
+        "those",
+        "same",
+        "above",
+        "previous",
+        "esa",
+        "ese",
+        "eso",
+        "esos",
+        "esas",
+        "esta",
+        "estas",
+        "este",
+        "estos",
+        "esto",
+        "anterior",
+        "mismo",
+        "misma",
+        "mismos",
+        "mismas",
+    }
+)
+
+
+def _explicit_locative_subject(value: str) -> bool:
+    """Recognize a subject-bearing definition scoped by a trailing locative."""
+
+    normalized = fold(value).strip(" ?¿!¡.")
+    match = re.fullmatch(
+        r"(?:what|who)\s+(?:is|are|was|were)\s+(.+?)\s+here|"
+        r"(?:que|cual|quien)\s+(?:es|son|esta|estan)\s+(.+?)\s+aqui",
+        normalized,
+    )
+    if match is None:
+        return False
+    subject = next((group for group in match.groups() if group is not None), "")
+    subject_words = {
+        word
+        for word in _normalized_words(subject)
+        if word
+        not in {
+            "a",
+            "an",
+            "the",
+            "it",
+            "this",
+            "that",
+            "these",
+            "those",
+            "el",
+            "la",
+            "los",
+            "las",
+            "un",
+            "una",
+            "esto",
+            "eso",
+        }
+    }
+    concrete_subjects = subject_words - _NON_SUBJECT_WORDS
+    # Multiple bare terms ("what is MC, MP here?") commonly refer to a list
+    # established by the preceding answer. A single named concept is sufficient
+    # to make the definition self-contained without weakening that behavior.
+    return len(concrete_subjects) == 1
 
 
 def _deterministic_conversation_rewrite(
@@ -469,6 +1057,17 @@ def _deterministic_conversation_rewrite(
     _language: str,
 ) -> str | None:
     """Carry forward a neutral subject from recent completed conversation turns."""
+
+    if re.search(
+        r"(?i)\b(?:parameters?|fields?|payload|arguments?|par[aá]metros?|campos?|argumentos?)\b",
+        question,
+    ):
+        for role, content in reversed(history):
+            if role != "assistant":
+                continue
+            identifier = _code_entity_identifier(content)
+            if identifier:
+                return f"{question.rstrip()} (previous subject: {identifier})"
 
     for role, content in reversed(history):
         if role != "user":
@@ -488,6 +1087,57 @@ def _deterministic_conversation_rewrite(
     return None
 
 
+def _code_entity_identifier(value: str) -> str:
+    """Select a concrete code identifier, never a broad technology acronym."""
+
+    ignored = {
+        "API",
+        "CODE",
+        "HTTP",
+        "JSON",
+        "SOURCE",
+        "SQL",
+    }
+    candidates = re.findall(r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9_]{3,})(?![A-Za-z0-9_])", value)
+    return next(
+        (candidate for candidate in candidates if candidate not in ignored and "_" in candidate),
+        "",
+    )
+
+
+def _grounded_code_subject(state) -> str:
+    if state.get("query_intent") not in {
+        "CODE_ASSISTED",
+        "CODE_INVENTORY",
+        "IMPLEMENTATION",
+        "STRUCTURED_ENTITY",
+        "STRUCTURED_INVENTORY",
+    }:
+        return ""
+    generated = state.get("generated")
+    candidates = (
+        _code_entity_identifier(str(state.get("resolved_question") or "")),
+        _code_entity_identifier(str(getattr(generated, "answer", "") or "")),
+    )
+    for identifier in candidates:
+        if not identifier:
+            continue
+        for document in state.get("documents", ()):
+            metadata = getattr(document, "metadata", {}) or {}
+            searchable = " ".join(
+                (
+                    str(getattr(document, "page_content", "") or ""),
+                    str(metadata.get("entity_key") or ""),
+                    str(metadata.get("symbol") or ""),
+                    str(metadata.get("symbols") or ""),
+                    str(metadata.get("identifiers") or ""),
+                )
+            )
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])", searchable):
+                return identifier
+    return ""
+
+
 def _conversation_subject(value: str) -> str:
     """Extract bounded retrieval terms while dropping conversational instructions."""
 
@@ -500,8 +1150,7 @@ def _conversation_subject(value: str) -> str:
 
     ignored = _SUBJECT_IGNORED_WORDS
     tokens = [
-        token.rstrip(".,:;")
-        for token in re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9_.:/-]*", value)
+        token.rstrip(".,:;") for token in re.findall(r"[A-Za-zÀ-ÿ0-9][A-Za-zÀ-ÿ0-9_.:/-]*", value)
     ]
     meaningful = [token for token in tokens if token.casefold() not in ignored]
     if len(meaningful) < 2 and not any(
@@ -518,6 +1167,9 @@ def _resolved_conversation_subject(value: str) -> str:
     match = re.search(r"\(previous subject:\s*(.+?)\)\s*$", value, re.IGNORECASE)
     if match:
         return match.group(1).strip()[:500]
+    match = re.match(r"(?:regarding|respecto a)\s+(.+?):\s+", value, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()[:500]
     return _conversation_subject(value)
 
 
@@ -532,9 +1184,9 @@ def _conversation_context_subject(
     known = tuple(vocabulary)
     is_followup = _conversation_resolution_decision(original, known or None)[0]
     explicit = _conversation_subject(original)
-    if is_followup and explicit and known and not _subject_matches_vocabulary(
-        explicit, known
-    ):
+    if _corrective_attribute_followup(original):
+        explicit = ""
+    if is_followup and explicit and known and not _subject_matches_vocabulary(explicit, known):
         explicit = ""
     carried = _resolved_conversation_subject(resolved)
     subject = (
@@ -603,6 +1255,9 @@ def build_conversation_context_update(request, state, vocabulary):
     subject, is_followup = _conversation_context_subject(
         original, resolved, request.conversation_context.active_subject.strip(), vocabulary
     )
+    grounded_subject = _grounded_code_subject(state)
+    if grounded_subject:
+        subject = grounded_subject
     return ConversationContextUpdate(
         standaloneQuestion=resolved,
         activeSubject=subject,

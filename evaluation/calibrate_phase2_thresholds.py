@@ -8,7 +8,7 @@ from app.config import Settings
 from app.reranking import normalized_relevance_score, predict_local_scores
 
 
-REGISTRY = '''LOGIN_POS_EVENT("POS_LOGIN", 101, "0.3"); POS_CLOSE_SHIFT_EVENT("POS_CLOSE_SHIFT", 104, "0.4"); POS_CLOSE_SHIFT_REQUEST_EVENT("POS_CLOSE_SHIFT_REQUEST", 116, "0.1")'''
+REGISTRY = """LOGIN_POS_EVENT("POS_LOGIN", 101, "0.3"); POS_CLOSE_SHIFT_EVENT("POS_CLOSE_SHIFT", 104, "0.4"); POS_CLOSE_SHIFT_REQUEST_EVENT("POS_CLOSE_SHIFT_REQUEST", 116, "0.1")"""
 CLOSE_SHIFT = """POS_CLOSE_SHIFT CloseShiftEvent fields: event_type, event_id, version_number, user, userConfirmedAmountCents, event_datetime, operation_date, folio, store_id, pos_id, shift_id, shift_date, request_id, shift_summary, authorized_by."""
 LOGIN = """POS_LOGIN LoginEvent fields: event_type, event_id, version_number, user, event_datetime, operation_date, store_id, pos_id, status, session_id, message."""
 UNRELATED = "Printer settings configure paper width, margins, and receipt density."
@@ -25,11 +25,27 @@ RERANK_CASES = (
 )
 
 GROUNDING_CASES = (
-    (True, "POS_CLOSE_SHIFT_EVENT has wire name POS_CLOSE_SHIFT, id 104, and version 0.4.", REGISTRY),
+    (
+        True,
+        "POS_CLOSE_SHIFT_EVENT has wire name POS_CLOSE_SHIFT, id 104, and version 0.4.",
+        REGISTRY,
+    ),
     (True, "LOGIN_POS_EVENT has wire name POS_LOGIN, id 101, and version 0.3.", REGISTRY),
-    (True, "POS_CLOSE_SHIFT_EVENT carries user, confirmed amount, folio, shift summary, and authorization.", CLOSE_SHIFT),
-    (True, "El evento POS_CLOSE_SHIFT incluye usuario, monto confirmado, folio, resumen de turno y autorización.", CLOSE_SHIFT),
-    (True, "POS_LOGIN carries user, operation date, store, POS, status, session id, and message.", LOGIN),
+    (
+        True,
+        "POS_CLOSE_SHIFT_EVENT carries user, confirmed amount, folio, shift summary, and authorization.",
+        CLOSE_SHIFT,
+    ),
+    (
+        True,
+        "El evento POS_CLOSE_SHIFT incluye usuario, monto confirmado, folio, resumen de turno y autorización.",
+        CLOSE_SHIFT,
+    ),
+    (
+        True,
+        "POS_LOGIN carries user, operation date, store, POS, status, session id, and message.",
+        LOGIN,
+    ),
     (False, "POS_CLOSE_SHIFT_EVENT has id 999 and version 8.7.", REGISTRY),
     (False, "POS_LOGIN contains a shift summary and an authorized-by field.", LOGIN),
     (False, "The lunar deployment policy requires three satellite approvals.", CLOSE_SHIFT),

@@ -73,9 +73,7 @@ async def main() -> None:
 
     model = arguments.model or get_settings().ollama_model
     if model.endswith(":latest"):
-        raise SystemExit(
-            "Refusing a floating judge tag: pin the model so runs stay comparable."
-        )
+        raise SystemExit("Refusing a floating judge tag: pin the model so runs stay comparable.")
 
     baseline_rows = _load(arguments.baseline)
     candidate_rows = _load(arguments.candidate)
@@ -85,8 +83,7 @@ async def main() -> None:
     style_mismatches = [
         case_id
         for case_id in shared
-        if baseline_rows[case_id].get("answer_style")
-        != candidate_rows[case_id].get("answer_style")
+        if baseline_rows[case_id].get("answer_style") != candidate_rows[case_id].get("answer_style")
     ]
     if style_mismatches:
         raise SystemExit(
@@ -110,12 +107,9 @@ async def main() -> None:
             },
         },
     )
-    chain = (
-        ChatPromptTemplate.from_messages(
-            [("system", PAIRWISE_SYSTEM_PROMPT), ("human", PAIRWISE_HUMAN_PROMPT)]
-        )
-        | judge.with_structured_output(PairwiseVerdict)
-    )
+    chain = ChatPromptTemplate.from_messages(
+        [("system", PAIRWISE_SYSTEM_PROMPT), ("human", PAIRWISE_HUMAN_PROMPT)]
+    ) | judge.with_structured_output(PairwiseVerdict)
 
     results = []
     for position, case_id in enumerate(shared, 1):

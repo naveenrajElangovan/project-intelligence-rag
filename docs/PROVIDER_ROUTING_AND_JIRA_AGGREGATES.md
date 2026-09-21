@@ -129,6 +129,12 @@ attachment, relationship, requirement, and worklog requests still use their
 dedicated paged operations. Project-level “whole Jira” summaries use the
 complete authorized current-state scan rather than an LLM prompt.
 
+When Jira is the only user-selected provider, ordinary project-lead wording
+such as “Summarize project status,” “How is the project doing?”, and their
+Spanish equivalents also selects this complete Jira overview. The same wording
+with multiple providers enabled remains on the established cross-source path,
+so a Jira-only selection does not change GitHub or Confluence summary behavior.
+
 The capability boundary is intentional: deterministic structured operations
 handle complete inventories and exact facts; other Jira questions remain
 scoped to Jira evidence in the established semantic RAG path. This provides a
@@ -148,6 +154,13 @@ expansion requires repeated title evidence, excludes near-global labels, and
 requires one label to score clearly above alternatives. This lets terms such as
 a Spanish summary word reach the same label-backed population as its English
 counterpart without a model-generated translation or a hardcoded project term.
+
+After an exact-ticket section request, a completion follow-up such as “is it
+completed?” or “¿está completado?” retains the issue key, discards the
+historical section filter, and reads the current Jira record. Completion is
+determined from Jira's stable `done` status category, with a legacy status-name
+fallback only for snapshots that predate status-category metadata. The answer
+cites the current issue record rather than changelog text.
 
 The adapter reads only authorized `ISSUE` records and retains only
 `jira_chunk_kind=CURRENT` before applying filters. It deduplicates with the
@@ -395,8 +408,65 @@ selected set is enforced again on retrieval, so this disambiguation never
 widens the authorized provider scope.
 
 Changing the source selection can reset an inherited Jira structured scope when
-Jira is no longer selected. Selecting multiple sources allows the deterministic
-planner to federate only when the question requires cross-provider evidence.
+Jira is no longer selected. An explicitly selected set is an evidence boundary:
+one selected source uses its single-provider route, while two or more selected
+sources use the federated route even when the wording does not name a provider.
+An explicit provider named in the question still narrows the route to that
+provider unless the question asks for a relationship across sources. When the
+client omits `enabledProviders`, the legacy routing behavior remains unchanged.
+
+Federated indexed retrieval embeds each query once and searches provider-scoped
+Chroma windows concurrently. Jira is limited to issue and attachment records,
+GitHub to code records, and Confluence to page and attachment records. The
+existing fusion and reranking stages then combine those candidate windows. This
+prevents a large Jira collection from consuming all candidates while avoiding
+one embedding call per provider. Provider selection remains constrained by the
+backend-authorized catalog and every Chroma search reapplies the project and
+access-policy filters.
+
+For English questions, the Spanish translation is produced while the original
+provider windows are already searching. The translated provider windows begin
+as soon as translation finishes and overlap the remaining original searches.
+The same provider budgets and rank-fusion inputs are retained, so bilingual
+recall is unchanged while the two language passes no longer add their full
+latencies serially.
+
+The lexical companion index uses stale-while-refresh behavior. An expired,
+previously authorized lexical view is served immediately while one bounded
+background worker rebuilds that exact project, policy, collection, schema, and
+source-type view. Dense retrieval continues to query Chroma on every request,
+so newly ingested records remain available while the lexical view refreshes.
+Exact inventories and Jira aggregates deliberately bypass the stale path and
+perform a complete current scan; this keeps counts and complete lists exact.
+The refresh is single-flight per cache key and replaces the cache only after a
+complete rebuild.
+
+When retrieved candidates have zero assessed relevance, they are retained in
+private diagnostics but are not returned as public source cards. The safe
+response generator receives the user's question, response language, and a
+typed failure reason, but no project evidence. It writes a short response that
+fits the question without inventing an answer. A static content-free response
+is used only if that safe-response model call itself fails. This prevents an
+unanswerable question from appearing to be supported by unrelated Jira,
+GitHub, or Confluence sources. Retrieval scores only rank evidence. Every
+populated authorized pool uses the complete generation and verification path;
+only an empty pool may terminate before those gates. If synthesis is rejected,
+a provider-neutral extractive recovery can return strongly matching complete
+source sentences, and the normal grounding and topicality checks still decide
+whether they are safe to show.
+
+Each provider window retains an aligned request identity through reciprocal-rank
+fusion. The number of selected providers can differ from the number of source
+types because attachments can belong to both Jira and Confluence; fusion must
+therefore align results by provider window instead of zipping them to the
+planner's source-type list.
+
+A fresh definition question with one explicit concept and a trailing locative,
+such as `what is memory here?` or `¿qué es memoria aquí?`, is treated as a
+self-contained project query. This grammatical rule also permits an unknown or
+misspelled concept to reach retrieval. Referential questions without a subject,
+such as `what is it here?` or `what happened here?`, continue to require stored
+conversation context and return a clarification when none exists.
 
 ### Jira refresh exclusions
 

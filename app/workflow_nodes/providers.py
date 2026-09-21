@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from app.config import Settings
+from app.llm import refusal_answer
 from app.models import (
     ConversationContextUpdate,
     ConversationEntity,
@@ -9,7 +11,9 @@ from app.models import (
     ResultPage,
     SourceReference,
     StructuredConversationScope,
+    RagRequest,
 )
+from app.retrieval import ChromaAccessRetriever
 from app.providers.contracts import ExecutionMode, ProviderName, StructuredOperation
 from app.providers.registry import ProviderRegistry
 from app.providers.router import select_providers
@@ -107,6 +111,11 @@ def _active_subject(filters: dict[str, tuple[str, ...]], rule: str | None) -> st
 
 
 class ProviderNodesMixin:
+    _provider_registry: ProviderRegistry
+    _request: RagRequest
+    _retriever: ChromaAccessRetriever
+    _settings: Settings
+
     def _create_provider_registry(self) -> ProviderRegistry:
         return ProviderRegistry.indexed(
             project_id=self._request.project_id,
@@ -127,7 +136,12 @@ class ProviderNodesMixin:
             if self._settings.structured_conversation_enabled
             else None
         )
-        selection = select_providers(self._request.question, enabled, scope)
+        selection = select_providers(
+            self._request.question,
+            enabled,
+            scope,
+            explicit_selection=self._request.enabled_providers is not None,
+        )
         if scope is not None:
             if selection.reason == "JIRA_STRUCTURED_CONTEXT_INHERITED":
                 structured_context_decision("inherited_prevented_legacy_fallback")
@@ -378,25 +392,44 @@ class ProviderNodesMixin:
                     if language == "en"
                     else f"No se encontró un issue de Jira coincidente en **{self._request.project_id}**.{snapshot}"
                 )
+            elif query.requested_fact == "COMPLETION":
+                row = parent_rows[0]
+                category = str(row.get("status_category_key") or "").casefold()
+                status = str(row.get("status") or "")
+                legacy_done = status.casefold() in {"done", "closed", "resolved"}
+                completed = category == "done" or (not category and legacy_done)
+                key = str(row.get("key") or "")
+                if language == "es":
+                    answer = (
+                        f"**Sí. {key} está completado.** Su estado actual en Jira es **{status}**."
+                        if completed
+                        else f"**No. {key} no está completado.** Su estado actual en Jira es **{status}**."
+                    ) + snapshot
+                else:
+                    answer = (
+                        f"**Yes. {key} is complete.** Its current Jira status is **{status}**."
+                        if completed
+                        else f"**No. {key} is not complete.** Its current Jira status is **{status}**."
+                    ) + snapshot
             else:
                 rendered_details = []
                 for row in parent_rows:
-                    labels = (
+                    detail_labels = (
                         ("Estado", "Tipo", "Prioridad", "Responsable", "Reportó", "Fecha límite")
                         if language == "es"
                         else ("Status", "Type", "Priority", "Assignee", "Reporter", "Due date")
                     )
                     fields = [
-                        f"**{labels[0]}:** {row['status']}",
-                        f"**{labels[1]}:** {row['issue_type']}",
-                        f"**{labels[2]}:** {row['priority'] or ('No definida' if language == 'es' else 'Not set')}",
+                        f"**{detail_labels[0]}:** {row['status']}",
+                        f"**{detail_labels[1]}:** {row['issue_type']}",
+                        f"**{detail_labels[2]}:** {row['priority'] or ('No definida' if language == 'es' else 'Not set')}",
                     ]
                     if row.get("assignee"):
-                        fields.append(f"**{labels[3]}:** {row['assignee']}")
+                        fields.append(f"**{detail_labels[3]}:** {row['assignee']}")
                     if row.get("reporter"):
-                        fields.append(f"**{labels[4]}:** {row['reporter']}")
+                        fields.append(f"**{detail_labels[4]}:** {row['reporter']}")
                     if row.get("due_date"):
-                        fields.append(f"**{labels[5]}:** {row['due_date']}")
+                        fields.append(f"**{detail_labels[5]}:** {row['due_date']}")
                     if row.get("parent_issue_key"):
                         fields.append(
                             f"**{'Padre' if language == 'es' else 'Parent'}:** {row['parent_issue_key']}"
@@ -443,9 +476,16 @@ class ProviderNodesMixin:
                     if child_rows
                     else ("- Ninguno" if language == "es" else "- None")
                 )
-                answer = "\n\n".join(rendered_details) + f"\n\n{children_heading}\n{children}" + snapshot
+                answer = (
+                    "\n\n".join(rendered_details) + f"\n\n{children_heading}\n{children}" + snapshot
+                )
         elif query.operation == StructuredOperation.SECTION_COUNT:
-            section_kind = _section_label(query.section_kind, language)
+            section_kind = ", ".join(
+                _section_label(kind, language)
+                for kind in (
+                    query.section_kinds or ((query.section_kind,) if query.section_kind else ())
+                )
+            ) or _section_label(None, language)
             answer = (
                 f"**{result.total} indexed Jira {section_kind}** match this authorized scope.{snapshot}"
                 if language == "en"
@@ -453,7 +493,12 @@ class ProviderNodesMixin:
             )
         elif query.operation == StructuredOperation.SECTION:
             rows = result.rows
-            section_kind = _section_label(query.section_kind, language)
+            section_kind = ", ".join(
+                _section_label(kind, language)
+                for kind in (
+                    query.section_kinds or ((query.section_kind,) if query.section_kind else ())
+                )
+            ) or _section_label(None, language)
             if not rows:
                 answer = (
                     f"No indexed Jira {section_kind} match this authorized scope.{snapshot}"
@@ -464,6 +509,8 @@ class ProviderNodesMixin:
                 rendered_sections = []
                 for row in rows:
                     heading_bits = [str(row["key"])]
+                    if len(query.section_kinds) > 1 and row.get("section_kind"):
+                        heading_bits.append(_section_label(str(row["section_kind"]), language))
                     if row.get("event_id"):
                         heading_bits.append(f"#{row['event_id']}")
                     if row.get("author"):
@@ -532,7 +579,7 @@ class ProviderNodesMixin:
         end = query.offset + returned
         subject = _active_subject(query.filters, result.applied_filter_rule)
         context_update = ConversationContextUpdate(
-            standaloneQuestion=self._request.question,
+            standalone_question=self._request.question,
             activeSubject=subject,
             entities=[
                 ConversationEntity(type="jira_issue_set", value=subject, canonicalValue=subject)
@@ -559,20 +606,31 @@ class ProviderNodesMixin:
                 end=end,
                 returned=returned,
                 total=result.total,
-                hasMore=end < result.total,
+                has_more=end < result.total,
             )
+        no_matching_record = (
+            query.operation
+            in {
+                StructuredOperation.DETAIL,
+                StructuredOperation.SECTION,
+            }
+            and not result.rows
+        )
+        if no_matching_record:
+            answer = refusal_answer("INSUFFICIENT_EVIDENCE", language)
         response = RagResponse(
-            status="ANSWERED",
+            status="INSUFFICIENT_EVIDENCE" if no_matching_record else "ANSWERED",
             answer=answer,
-            confidence="HIGH",
+            confidence="NONE" if no_matching_record else "HIGH",
             project_id=self._request.project_id,
             sources=sources,
             missing_information=[],
-            evidence_status="SUFFICIENT",
-            context_quality="SUFFICIENT",
-            context_relevance=1.0,
-            context_completeness=1.0,
-            coverage="COMPLETE",
+            evidence_status="INSUFFICIENT" if no_matching_record else "SUFFICIENT",
+            context_quality="INSUFFICIENT" if no_matching_record else "SUFFICIENT",
+            context_relevance=0.0 if no_matching_record else 1.0,
+            context_completeness=0.0 if no_matching_record else 1.0,
+            coverage="NOT_APPLICABLE" if no_matching_record else "COMPLETE",
+            failureReason="INSUFFICIENT_EVIDENCE" if no_matching_record else None,
             resolved_intent=f"JIRA_{query.operation.value}",
             conversationContextUpdate=context_update,
             resultPage=result_page,

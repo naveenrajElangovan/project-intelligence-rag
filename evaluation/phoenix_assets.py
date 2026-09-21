@@ -69,15 +69,31 @@ def standardize_examples(
             "reviewed_reference": reference,
             "expected_sources": expected_sources,
             "answerability": bool(row.get("answerable", True)),
-            "tags": sorted({str(row.get("suite") or "gold"), language, persona, *(str(tag) for tag in row.get("tags", []))}),
+            "tags": sorted(
+                {
+                    str(row.get("suite") or "gold"),
+                    language,
+                    persona,
+                    *(str(tag) for tag in row.get("tags", [])),
+                }
+            ),
             "dataset_version": dataset_version,
             "schema_version": DATASET_SCHEMA_VERSION,
         }
         examples.append(
             {
                 "example_id": case_id,
-                "inputs": {"question": normalized["question"], "language": language, "persona": persona, "project_id": project_id},
-                "outputs": {"reference": reference, "expected_sources": expected_sources, "answerable": normalized["answerability"]},
+                "inputs": {
+                    "question": normalized["question"],
+                    "language": language,
+                    "persona": persona,
+                    "project_id": project_id,
+                },
+                "outputs": {
+                    "reference": reference,
+                    "expected_sources": expected_sources,
+                    "answerable": normalized["answerability"],
+                },
                 "metadata": {**normalized, "content_hash": canonical_hash(normalized)},
                 "splits": normalized["tags"],
             }
@@ -90,7 +106,13 @@ def git_sha(root: Path) -> str:
 
 
 def prompt_payload(
-    *, name: str, template: str, owner: str, sha: str, tag: str, model_name: str,
+    *,
+    name: str,
+    template: str,
+    owner: str,
+    sha: str,
+    tag: str,
+    model_name: str,
     model_provider: str = "OLLAMA",
 ) -> dict[str, Any]:
     """Build one Git-controlled Phoenix prompt version."""
@@ -99,7 +121,13 @@ def prompt_payload(
         "prompt": {
             "name": name,
             "description": "Git-controlled Project Intelligence prompt",
-            "metadata": {"git_sha": sha, "schema_version": "1", "owner": owner, "release_tag": tag, "content_hash": canonical_hash(template)},
+            "metadata": {
+                "git_sha": sha,
+                "schema_version": "1",
+                "owner": owner,
+                "release_tag": tag,
+                "content_hash": canonical_hash(template),
+            },
         },
         "version": {
             "model_provider": model_provider,
@@ -116,12 +144,18 @@ def prompt_payload(
 
 
 def publish_experiment(
-    client: PhoenixClient, *, dataset_id: str, name: str,
-    candidate: dict[str, Any], rows: Iterable[dict[str, Any]],
+    client: PhoenixClient,
+    *,
+    dataset_id: str,
+    name: str,
+    candidate: dict[str, Any],
+    rows: Iterable[dict[str, Any]],
 ) -> str:
     """Publish per-example outputs and evaluations, never aggregates only."""
 
-    created = client.create_experiment(dataset_id, {"name": name, "metadata": candidate, "repetitions": 1})
+    created = client.create_experiment(
+        dataset_id, {"name": name, "metadata": candidate, "repetitions": 1}
+    )
     experiment_id = str(created.get("data", created)["id"])
     for row in rows:
         now = datetime.now(timezone.utc).isoformat()
@@ -138,7 +172,11 @@ def publish_experiment(
         run = client.create_experiment_run(experiment_id, run_payload)
         run_id = str(run.get("data", run)["id"])
         for evaluation in row.get("evaluations", []):
-            result = {key: evaluation[key] for key in ("label", "score", "explanation") if key in evaluation}
+            result = {
+                key: evaluation[key]
+                for key in ("label", "score", "explanation")
+                if key in evaluation
+            }
             client.upsert_experiment_evaluation(
                 {
                     "experiment_run_id": run_id,
@@ -147,7 +185,10 @@ def publish_experiment(
                     "start_time": evaluation.get("start_time") or now,
                     "end_time": evaluation.get("end_time") or now,
                     "result": result,
-                    "metadata": {"evaluator_suite_version": EVALUATOR_SUITE_VERSION, **evaluation.get("metadata", {})},
+                    "metadata": {
+                        "evaluator_suite_version": EVALUATOR_SUITE_VERSION,
+                        **evaluation.get("metadata", {}),
+                    },
                     **({"trace_id": row["trace_id"]} if row.get("trace_id") else {}),
                 }
             )
@@ -155,15 +196,22 @@ def publish_experiment(
 
 
 def ensure_immutable_dataset(
-    client: PhoenixClient, *, name: str, description: str,
-    metadata: dict[str, Any], examples: list[dict[str, Any]],
+    client: PhoenixClient,
+    *,
+    name: str,
+    description: str,
+    metadata: dict[str, Any],
+    examples: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Create once; a byte-equivalent retry succeeds without a new version."""
 
     try:
         return client.upload_dataset(
-            name=name, description=description, metadata=metadata,
-            examples=examples, action="create",
+            name=name,
+            description=description,
+            metadata=metadata,
+            examples=examples,
+            action="create",
         )
     except HTTPError as failure:
         if failure.code != 409:
@@ -174,7 +222,10 @@ def ensure_immutable_dataset(
         raise RuntimeError(f"Phoenix reported duplicate dataset {name}, but it cannot be read")
     remote = client.get_dataset_examples(str(match["id"])).get("data", {}).get("examples", [])
     remote_identity = sorted(
-        (str((item.get("metadata") or {}).get("case_id") or ""), str((item.get("metadata") or {}).get("content_hash") or ""))
+        (
+            str((item.get("metadata") or {}).get("case_id") or ""),
+            str((item.get("metadata") or {}).get("content_hash") or ""),
+        )
         for item in remote
     )
     expected_identity = sorted(
@@ -182,9 +233,7 @@ def ensure_immutable_dataset(
         for item in examples
     )
     if remote_identity != expected_identity:
-        raise RuntimeError(
-            f"immutable dataset {name} already exists with different content"
-        )
+        raise RuntimeError(f"immutable dataset {name} already exists with different content")
     return {"data": {"dataset_id": match["id"], "idempotent": True}}
 
 
@@ -193,16 +242,26 @@ def main() -> None:
     parser.add_argument("paths", nargs="+", type=Path)
     parser.add_argument("--boundary", required=True, help="For example project:T2.0")
     parser.add_argument("--dataset-version", required=True)
-    parser.add_argument("--phoenix-url", default=os.getenv("PI_RAG_PHOENIX_URL", "http://127.0.0.1:6006"))
+    parser.add_argument(
+        "--phoenix-url", default=os.getenv("PI_RAG_PHOENIX_URL", "http://127.0.0.1:6006")
+    )
     parser.add_argument("--api-key", default=os.getenv("PI_RAG_PHOENIX_API_KEY", ""))
     args = parser.parse_args()
-    examples = standardize_examples(read_jsonl(args.paths), boundary=args.boundary, dataset_version=args.dataset_version)
+    examples = standardize_examples(
+        read_jsonl(args.paths), boundary=args.boundary, dataset_version=args.dataset_version
+    )
     name = f"rag-gold-{args.boundary.replace(':', '-')}-v{args.dataset_version}"
     ensure_immutable_dataset(
         PhoenixClient(args.phoenix_url, args.api_key),
         name=name,
         description="Reviewed, immutable Project Intelligence gold suite",
-        metadata={"policy_boundary": args.boundary, "dataset_version": args.dataset_version, "schema_version": DATASET_SCHEMA_VERSION, "content_hash": canonical_hash(examples), "imported_at": datetime.now(timezone.utc).isoformat()},
+        metadata={
+            "policy_boundary": args.boundary,
+            "dataset_version": args.dataset_version,
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "content_hash": canonical_hash(examples),
+            "imported_at": datetime.now(timezone.utc).isoformat(),
+        },
         examples=examples,
     )
 

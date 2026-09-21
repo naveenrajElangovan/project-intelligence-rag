@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from collections.abc import Awaitable, Callable
 
-from app.models import RagResponse
+from app.config import Settings
+from app.models import RagRequest, RagResponse
+from app.retrieval import ChromaAccessRetriever
 from app.telemetry import started
 from app.workflow_support.execution import invoke_bounded_graph
-from app.workflow_support.fail_closed import clarification_response
+from app.workflow_support.fail_closed import (
+    clarification_response,
+    clarification_response_with_canonical_index,
+)
 from app.workflow_support.json_transform import json_transform_response
 from app.workflow_support.query_analysis import resolve_response_language
+from app.workflow_nodes.state import RagState
+from app.vocabulary import CorpusVocabulary
 
 
 @dataclass(frozen=True)
@@ -31,10 +38,12 @@ class WorkflowEvaluationResult:
 class EvaluationWorkflowMixin:
     """Execute the same graph and final output gate while retaining local evidence."""
 
-    _request: Any
-    _settings: Any
-    _vocabulary: Any
-    _graph: Any
+    _request: RagRequest
+    _settings: Settings
+    _vocabulary: CorpusVocabulary
+    _graph: object
+    _retriever: ChromaAccessRetriever
+    _response_from_state: Callable[[RagState, float], Awaitable[RagResponse]]
 
     async def run_for_evaluation(self) -> WorkflowEvaluationResult:
         began = started()
@@ -48,6 +57,13 @@ class EvaluationWorkflowMixin:
             self._vocabulary.entities,
             getattr(self._vocabulary, "source_types", ()),
         )
+        if clarification is not None:
+            clarification = await clarification_response_with_canonical_index(
+                self._request,
+                self._vocabulary.entities,
+                getattr(self._vocabulary, "source_types", ()),
+                self._retriever,
+            )
         if clarification is not None:
             return WorkflowEvaluationResult(
                 clarification, (), resolve_response_language(self._request.question)
@@ -66,19 +82,14 @@ class EvaluationWorkflowMixin:
                 document.page_content for document in state.get("documents", [])
             ),
             query_language=(
-                state.get("language")
-                or resolve_response_language(self._request.question)
+                state.get("language") or resolve_response_language(self._request.question)
             ),
             uncited_claims_dropped=int(state.get("uncited_claims_dropped", 0)),
             answer_style=str(state.get("answer_style") or ""),
             context_relevance=float(state.get("context_relevance", -1.0)),
             answer_relevance=float(state.get("answer_relevance", -1.0)),
             canonical_fallback_used=bool(state.get("canonical_fallback_used", False)),
-            canonical_fallback_reason=str(
-                state.get("canonical_fallback_reason") or ""
-            ),
+            canonical_fallback_reason=str(state.get("canonical_fallback_reason") or ""),
             generated_outcome=str(state.get("generated_outcome") or ""),
-            generated_refusal_reason=str(
-                state.get("generated_refusal_reason") or ""
-            ),
+            generated_refusal_reason=str(state.get("generated_refusal_reason") or ""),
         )

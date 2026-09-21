@@ -1,6 +1,6 @@
 # Project Intelligence RAG — current architecture
 
-Last verified against the repository code: 2026-08-31.
+Last verified against the repository code and active development topology: 2026-09-15.
 
 This is the single architecture reference for the RAG project. It describes the implemented
 service, its trust boundaries, its retrieval and answer pipeline, its dependencies, and its
@@ -42,6 +42,7 @@ flowchart LR
     R -->|"Local query embeddings"| E["multilingual-e5-large"]
     R -->|"Candidate reranking and grounding"| X["bge-reranker-v2-m3"]
     R -->|"Grounded prompt"| L["Configured answer LLM"]
+    R -->|"fresh authorized Jira/Confluence verification"| A["Atlassian integration service"]
     R -->|"Metrics and content-free events"| O["Observability stack"]
     R -->|"Validated answer + sources"| B
 
@@ -51,7 +52,7 @@ flowchart LR
     classDef private fill:#e8f1ff,stroke:#175cd3,color:#111;
     classDef data fill:#eaf7ea,stroke:#2e7d32,color:#111;
     class U,B public;
-    class R,E,X,L,O,I private;
+    class R,E,X,L,A,O,I private;
     class C data;
 ```
 
@@ -68,7 +69,7 @@ The backend sends an `AnswerRequest` containing:
 | `collectionName` | Logical Chroma collection | Backend control plane |
 | `textField` / `embeddingField` | Evidence and embedding fields | Backend control plane |
 | `embeddingModel` | Required embedding model | Backend control plane |
-| `schemaVersion` | Required indexed-record schema | Backend control plane |
+| `schemaVersion` | Required indexed-record schema; currently exactly `3` | Backend control plane |
 | `accessPolicyIds` | Server-derived access policies | Backend |
 | `question` | User question | User, treated as untrusted input |
 | `modelProfile` | `budget`, `standard`, or `complex` | Backend policy |
@@ -76,6 +77,12 @@ The backend sends an `AnswerRequest` containing:
 
 RAG requires the exact policy `project:<projectId>`. It also derives and validates the physical
 project collection name rather than trusting a client-selected Chroma target.
+
+The application suite has one vector-record schema at a time. RAG configuration rejects an empty
+or multi-version schema allowlist, and the backend, ingestion service, corpus manifests, evaluation
+tools, and mobile request examples all use vector schema `3`. Older numbers may still appear in
+tests for rejection behavior or in unrelated envelope/file-format schemas; they are not supported
+vector-record versions.
 
 The response contains the answer, confidence/outcome information, and structured sources. Source
 objects contain citation-safe metadata such as title, provider, reference, locator, language, and
@@ -169,6 +176,18 @@ The RAG process is read-only toward Chroma. Ingestion is the only vector writer.
 
 ## 7. LangGraph workflow
 
+The current graph adds a provider-planning layer before the legacy retrieval path. Provider
+adapters implement capabilities, exact lookup, structured aggregates, semantic retrieval, health,
+and freshness behind one registry. Explicit source chips are an allowlist: `All` is exclusive,
+while Jira, Confluence, and GitHub can be combined only when the authorized provider catalog permits
+federation. Disabling provider routing sends eligible requests through the legacy pipeline without
+changing its evidence ordering.
+
+Structured Jira requests resolve before provider routing. Conversation context version 3 stores a
+server-owned Jira scope with typed filters, operation, snapshot completeness, and pagination offset.
+Elliptical turns such as “which are in progress?” inherit that scope, reapply authorization, and
+query current-state Jira records; previous assistant prose is never evidence.
+
 ```mermaid
 flowchart TD
     S([Start]) --> P["Plan\nresolve follow-up, intent, language, route"]
@@ -229,8 +248,19 @@ The current hybrid design combines:
 - metadata weighting for titles, paths, references, locators, and indexed keywords;
 - reciprocal-rank fusion so incomparable raw score scales are not mixed directly.
 
-The lexical stage can reorder the authorized candidate window. It cannot recover a record that was
-never returned from the bounded Chroma search; the dense top-k window remains the recall boundary.
+The lexical stage ranks the authorized corpus independently and can recover exact terms that do not
+appear in the dense candidate window. Its cached corpus is keyed by collection, project, access
+scope, schema, embedding model, and source type. After expiry, ordinary semantic requests serve the
+last valid lexical view while one bounded background worker refreshes it; live dense search still
+queries Chroma on every request. Exact inventories and structured Jira aggregates require a fresh,
+complete scan and never use the stale path. This removes cache-expiry latency spikes without making
+exact counts stale or hiding newly indexed content from semantic retrieval.
+
+For bilingual retrieval, translation and the original-language dense request
+start together. Once translation completes, its provider-scoped searches run
+concurrently with the original searches. The candidate identities, provider
+budgets, rank-fusion inputs, and final ordering remain the same as the serial
+execution; only the wait topology changes.
 
 ### Candidate validation and selection
 
@@ -261,6 +291,20 @@ For tasks whose output can be derived safely—such as exact feature lists, path
 well-formed table rows—deterministic Python may render the answer. This reduces hallucination and
 preserves exact values. Normal synthesis uses the configured LLM.
 
+An exact authorized canonical-question declaration may also select its linked answer section.
+This route is language-aware and source-type neutral: the corpus declaration, not a planner guess,
+sets the evidence scope. The resulting answer is normalized and then passes the same citation,
+anchor, completeness, and grounding release checks as every other answer. This is a corpus-level
+capability; no evaluation-question strings are embedded in application code.
+
+Canonical-question index pages are routing control records, never answer evidence. Exact matches
+resolve their declared section identifiers through authorized `structure_path` metadata, prefer
+the request language, and cover each declared identifier before duplicate chunks consume the
+bounded route window. If the bounded lexical cache has not loaded the exact declaration, one
+authorization-filtered exact Chroma read recovers it. Spanish operational question forms use the
+same procedural candidate breadth as English; conceptual forms such as “cómo se aplica” remain on
+the ordinary direct-question path.
+
 ## 8. Generation and release gates
 
 Retrieved documents are treated as untrusted data and placed inside explicit evidence boundaries.
@@ -281,11 +325,29 @@ An answer is released only after these gates:
 Internal `[SOURCE n]` markers survive until validation finishes. They are then removed from visible
 prose while structured source objects remain in the response.
 
+If relevance or grounding is insufficient, the default path constructs a typed, localized static
+abstention without another model call. An optional generated-refusal mode is disabled by default;
+when explicitly enabled, its model receives only the user question, language, and typed failure
+category, never evidence. Candidates assessed at zero relevance remain available to private tracing
+but are omitted from public source cards, so unrelated providers do not appear to support the
+abstention. Retrieval relevance is a ranking signal rather than a truth verdict: every populated
+authorized evidence pool reaches generation and grounding, and only an empty pool may end early.
+If a synthesized paraphrase fails grounding despite strong lexical evidence, a provider-neutral
+recovery path may return complete source sentences with citations after the same authorization,
+anchor, negation, topicality, and grounding checks. A static content-free response is the last
+fallback when the safe responder is also unavailable.
+
 The local grounding verifier uses multilingual BGE similarity plus deterministic exact-value,
 negation, and citation checks. A project-overview answer may remove only unsupported sentences and
 reverify the remainder; it cannot invent replacement facts.
 
 ## 9. Model architecture
+
+Model access is routed through the LiteLLM SDK. `app/model_gateway.py` builds a bounded LiteLLM
+router from models configured in the environment and exposes it to LangChain through
+`ChatLiteLLMRouter`. Model groups, fallback behavior, and routing strategy are configuration data.
+Provider routing and model routing are independent: the former chooses evidence sources, while the
+latter chooses an LLM deployment after evidence has been selected.
 
 The service has three distinct model jobs:
 
@@ -295,9 +357,9 @@ The service has three distinct model jobs:
 | Candidate reranking/grounding | Local `bge-reranker-v2-m3` | More precise pairwise relevance/support |
 | Planning and answering | Configured Ollama, OpenAI, or Azure OpenAI model | Produces structured plans and language |
 
-Development can use a local Ollama model. Production may use an explicitly configured provider.
-There is no automatic provider fallback. Model profiles change cost/latency selection but never
-change project access.
+Development can use a local Ollama model or configured hosted deployments. LiteLLM may perform
+explicitly configured fallback within a model group. Model profiles and fallback order change
+cost/latency selection but never change project access.
 
 Factual operations use temperature `0`. Bounded overview synthesis may use a small configured
 temperature, capped at `0.2`. Retrieval, authorization, reranking, citation validation, and exact
@@ -344,6 +406,10 @@ but are never evidence. Every answer performs fresh authorized retrieval.
 
 RAG may return a private context update. The backend decides whether to persist it and protects
 against an older concurrent response overwriting newer state.
+
+Structured scope contains normalized routing state only: provider, resource type, typed filters,
+operation, grouping, snapshot timestamp/completeness, page size/offset, and active subject. It is
+validated on every turn and cleared when the project, provider, filters, or subject changes.
 
 ## 14. Failure behavior
 
@@ -466,3 +532,122 @@ not import the composition root. Architecture tests enforce these boundaries.
 8. Missing evidence produces abstention, not general-knowledge completion.
 9. Ingestion is the only vector writer; RAG remains read-only.
 10. Telemetry never contains questions, answers, evidence, credentials, or raw identity values.
+11. Store operations, developer implementation, Jira, Confluence, GitHub, English, and Spanish
+    questions use the same provider-neutral answer-quality contracts.
+12. Incident fixes may add typed capabilities, but never question-specific routes, vocabulary,
+    thresholds, or canned answers. Every such change covers positive, negative, bilingual,
+    authorization, provider-scope, and legacy-provider regressions.
+13. Authorization and explicit source selection constrain evidence before ranking. Retrieval scores
+    order authorized evidence; generation explains it; grounding decides whether claims are released.
+14. The whole application suite supports exactly one vector-record schema version at a time; the
+    current version is `3`.
+15. Optional cache warm-up never marks the whole RAG service unavailable. Required dependencies stay
+    in readiness checks, while cold caches populate in the background or on the authorized query path.
+
+The following operational detail is part of this architecture and supersedes the
+former standalone provider, Phoenix, Atlassian-event, incident, and runbook files.
+
+## 19. Active collection routing
+
+`PI_RAG_CHROMA_COLLECTION` is the primary serving route. The backend supplies that
+logical name with each authorized project request, and the RAG accepts it only when
+it is the primary route or an operator-approved entry in
+`PI_RAG_ADDITIONAL_CHROMA_COLLECTIONS`. `project_collection_name()` derives the
+physical per-project name, while `verify_project_collection()` verifies its
+project, logical route, and cosine metric metadata before reads.
+
+Live evaluation tools default to the same primary setting. An explicit collection
+flag is an operator override, not an independent default. The Phase 4 gate prints
+both logical and physical names before scanning so a missing or stale target is
+self-diagnosing.
+
+## 20. Provider routing and structured Jira operations
+
+The deterministic provider planner selects from the project-authorized provider
+set. CODE-assisted questions prefer repository evidence, delivery/status questions
+prefer Jira, documentation questions prefer Confluence, and cross-source questions
+may federate. Provider adapters expose semantic retrieval, exact lookup, structured
+aggregates, health, and freshness without widening the project boundary.
+
+Structured Jira reads use complete authorized snapshots for counts, distributions,
+current issue details, child items, comments, changelog, worklogs, attachments, and
+relationships. Stable issue and section identities are retained through retrieval.
+Conversation context can retain a previously established provider subject, but an
+explicit subject overrides it. Disablement and provider allow-lists remain
+configuration, not question-text exceptions.
+
+The LiteLLM gateway routes among configured Ollama, OpenAI, or Azure OpenAI
+providers. Local factual calls pin deterministic sampler options. Provider/model,
+latency, retry count, operation, filters, and result counts are observable; prompt,
+answer, source content, credentials, and raw URLs are not logged.
+
+## 21. Atlassian MCP and event ingestion boundary
+
+The separate Atlassian service is read-only. The backend owns user and project
+authorization; ingestion uses service identity for configured completeness scans.
+Webhook events are authenticated by timestamped HMAC, deduplicated by event ID,
+validated against the connected cloud and configured Jira project or Confluence
+space, then queued for ingestion. Differential replacement reuses unchanged
+vectors, embeds changed chunks, removes obsolete chunks only after successful
+replacement, and leaves the prior valid version available on failure.
+
+Cloud-qualified source identities prevent collisions. The service never accepts a
+client-selected project scope, arbitrary Atlassian URL, unrestricted JQL, or write
+operation. Rollback is configuration-driven: disable event processing, preserve
+the durable queue, and use scheduled reconciliation to restore completeness.
+
+## 22. Phoenix quality control plane
+
+Phoenix stores traces, dataset versions, experiment results, and evaluator output;
+it does not authorize requests or supply runtime prompts. Runtime prompts are
+versioned in Git and bundled with the release. Evaluation publishing uses immutable
+dataset, prompt, model, schema, collection, and commit identifiers so results are
+comparable. Content-bearing traces are opt-in and restricted to an already
+authorized project boundary; metadata-only tracing is the default.
+
+The release sequence is: build an immutable dataset, run deterministic retrieval
+gates, run generation and optional judge lanes, publish aggregate results, compare
+against declared gates, then promote or reject. Phoenix availability never changes
+the user-facing answer path.
+
+## 23. Operations
+
+### Startup and readiness
+
+Liveness does not wait for lexical-corpus or model warm-up. Background warm-up is
+bounded and retried; `/health` shows the process is serving, while `/ready` reports
+whether required dependencies and caches are ready. A slow accelerator request is
+not blindly replayed because cancelled native inference may continue consuming the
+shared device.
+
+### Department onboarding
+
+Add a department through backend project `sourceAccessRules`, Entra membership, and
+department-specific evaluation data. Ingestion stamps the configured policy; the
+backend mints authorized scopes; retrieval intersects those scopes with document
+metadata. No department or project identifier belongs in routing code.
+
+### Chroma backup and restore
+
+Back up from a quiesced or consistently snapshotted Chroma volume. Record the image
+version, collection names/counts, volume identity, SQLite integrity result, and
+backup SHA-256. Restore into an isolated volume first, verify every collection
+count and project metadata, then exercise a real filtered read before promotion.
+The 2026-09-13 local drill recreated and restored all 13 then-existing collections
+with matching counts and `integrity_check = ok`; it did not prove a separate
+production environment, because none exists.
+
+## 24. Engineering and documentation governance
+
+- Authorization, truth thresholds, project isolation, and citation validation
+  outrank latency optimizations.
+- Performance work may remove duplicated or serialized work but may not lower a
+  truth gate or reduce the evidence contract without a measured quality decision.
+- Public functions explain their purpose, inputs, outputs, failure behavior, and
+  security boundary in plain language where those facts are not obvious.
+- `docs/CURRENT_ARCHITECTURE.md` is the architecture source of truth;
+  `docs/QUALITY_STATUS.md` is the current measured status; `evaluation/README.md`
+  is the evaluation entrypoint. Dated implementation prompts and incident reports
+  are working history, not maintained architecture.
+- Generated decks, caches, run artifacts, archives, and agent scratch stay outside
+  the source tree or under ignored working directories.

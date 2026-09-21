@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import re
 
+from app.config import Settings
 from app.llm import BilingualQueryPlanner, ConversationQueryResolver, TokenUsage
+from app.models import RagRequest
 from app.telemetry import stage_complete, started
 from app.grounding_contract import resolve_request
 from app.source_policy import SourcePolicyRegistry
 from app.workflow_support.identifiers import member_identifiers
-from app.workflow_support.inventory_intent import is_exhaustive_entity_detail_question
+from app.workflow_support.inventory_intent import (
+    is_exhaustive_entity_detail_question,
+    is_inventory_question,
+)
 from app.workflow_support.language import resolve_conversation_response_language
 from app.workflow_nodes.state import RagState
 from app.workflow_support.conversation import (
     _bounded_history,
     conversation_anchor_terms,
+    _corrective_attribute_rewrite,
     _contextual_subtopic_followup,
     _conversation_resolution_decision,
     _conversation_subject,
@@ -38,6 +44,7 @@ from app.workflow_support.query_analysis import (
     retrieval_terminology_variant,
     uncertain_entity_token,
 )
+from app.vocabulary import CorpusVocabulary
 
 
 def _combined_usage(first: TokenUsage, second: TokenUsage) -> TokenUsage:
@@ -50,9 +57,7 @@ def _combined_usage(first: TokenUsage, second: TokenUsage) -> TokenUsage:
     )
 
 
-def _narrow_source_types(
-    requested: tuple[str, ...], available: tuple[str, ...]
-) -> tuple[str, ...]:
+def _narrow_source_types(requested: tuple[str, ...], available: tuple[str, ...]) -> tuple[str, ...]:
     """Limit a planned source scope to families present in this project."""
 
     if not available:
@@ -105,27 +110,59 @@ def _implementation_flow_queries(question: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
-def _structured_inventory_requested(value: str) -> bool:
+def _entity_contract_identity_requested(value: str) -> bool:
+    """Recognize a single member's stable wire identity or contract version."""
+
+    if len(member_identifiers(value)) != 1:
+        return False
     normalized = re.sub(r"\s+", " ", value).strip().casefold()
     return bool(
+        re.search(
+            r"\b(?:identifier|identificador|wire name|nombre (?:de )?wire|"
+            r"event id|id (?:de )?evento|numeric id|id num[eé]rico|"
+            r"version|versi[oó]n)\b",
+            normalized,
+        )
+    )
+
+
+def _structured_inventory_requested(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value).strip().casefold()
+    explicitly_exhaustive = bool(
         re.search(
             r"\b(?:list|show|give|provide|return|enumerate|inventory|catalog|"
             r"catalogue|need|want|request|lista|listar|muestra|mostrar|dame|"
             r"proporciona|devuelve|enumera|inventario|catálogo|catalogo|necesito|quiero)\b",
             normalized,
         )
-        and re.search(r"\b(?:all|every|complete|full|todos?|todas?|cada|completo|completa)\b", normalized)
+        and re.search(
+            r"\b(?:all|every|complete|full|todos?|todas?|cada|completo|completa)\b", normalized
+        )
     )
+    # Interrogative inventories ("which events ...?", "what values are
+    # available?") request the same population contract even without saying
+    # "all". Routing them as an entity overview made synonymous questions take
+    # unrelated generation paths and fail grounding inconsistently.
+    typed_population = bool(
+        re.search(
+            r"\b(?:events?|messages?|topics?|values?|options?|fields?|parameters?|"
+            r"eventos?|mensajes?|temas?|valores?|opciones?|campos?|par[aá]metros?)\b",
+            normalized,
+        )
+    )
+    return explicitly_exhaustive or (is_inventory_question(normalized) and typed_population)
 
 
 def _structured_inventory_subject(value: str) -> str:
     normalized = re.sub(r"\s+", " ", value).strip().casefold()
     subject = re.sub(
-        r"\b(?:can|could|would|you|please|me|i|list|show|give|provide|return|"
+        r"\b(?:what|which|can|could|would|does|do|did|use|uses|using|are|available|"
+        r"you|please|me|i|list|show|give|provide|return|"
         r"enumerate|need|want|request|all|every|complete|full|inventory|catalog|"
         r"catalogue|the|a|an|of|in|from|for|with|details|only|puedes|podrías|"
         r"podrias|por\s+favor|lista|listar|muestra|mostrar|dame|proporciona|devuelve|"
-        r"enumera|necesito|quiero|todos?|todas?|cada|completo|completa|inventario|"
+        r"enumera|necesito|quiero|cu[aá]les|qu[eé]|usa|usan|utiliza|utilizan|son|"
+        r"disponibles|todos?|todas?|cada|completo|completa|inventario|"
         r"catálogo|catalogo|el|la|los|las|de|en|desde|para|con|detalles|solo)\b",
         " ",
         normalized,
@@ -171,9 +208,7 @@ def _single_record_canonical_question(subject: str, language: str) -> str:
     if language == "es":
         if not subject:
             return "Proporciona un ejemplo con sus detalles respaldados por la evidencia."
-        return (
-            f"Proporciona un ejemplo de {subject} con sus detalles respaldados por la evidencia."
-        )
+        return f"Proporciona un ejemplo de {subject} con sus detalles respaldados por la evidencia."
     if not subject:
         return "Provide one record with its details supported by the evidence."
     return f"Provide one {subject} record with its details supported by the evidence."
@@ -203,6 +238,12 @@ def _entity_attribute_value_requested(value: str) -> bool:
 class PlanningNodesMixin:
     """PlanningNodes responsibilities."""
 
+    _conversation_resolver_factory: type[ConversationQueryResolver]
+    _query_planner_factory: type[BilingualQueryPlanner]
+    _request: RagRequest
+    _settings: Settings
+    _vocabulary: CorpusVocabulary
+
     async def _plan_queries(self, state: RagState) -> RagState:
         planned = await self._plan_queries_core(state)
         source_types = planned.get("source_types", ())
@@ -213,31 +254,38 @@ class PlanningNodesMixin:
                 "GITHUB": ("CODE",),
                 "CONFLUENCE": ("PAGE", "ATTACHMENT"),
             }
-            selected_types = tuple(dict.fromkeys(
-                source_type
-                for provider in selection.providers
-                for source_type in provider_types[provider.value]
-            ))
-            source_types = tuple(
-                value for value in source_types if value in selected_types
-            ) or selected_types
+            selected_types = tuple(
+                dict.fromkeys(
+                    source_type
+                    for provider in selection.providers
+                    for source_type in provider_types[provider.value]
+                )
+            )
+            source_types = (
+                tuple(value for value in source_types if value in selected_types) or selected_types
+            )
             planned["source_types"] = source_types
         elif selection and {provider.value for provider in selection.available_providers} != {
-            "JIRA", "GITHUB", "CONFLUENCE"
+            "JIRA",
+            "GITHUB",
+            "CONFLUENCE",
         }:
-            provider_types = {
-                "JIRA": ("ISSUE",), "GITHUB": ("CODE",), "CONFLUENCE": ("PAGE",)
-            }
-            enabled_types = tuple(dict.fromkeys(
-                source_type
-                for provider in selection.available_providers
-                for source_type in provider_types[provider.value]
-            ))
-            source_types = tuple(value for value in source_types if value in enabled_types) or enabled_types
+            provider_types = {"JIRA": ("ISSUE",), "GITHUB": ("CODE",), "CONFLUENCE": ("PAGE",)}
+            enabled_types = tuple(
+                dict.fromkeys(
+                    source_type
+                    for provider in selection.available_providers
+                    for source_type in provider_types[provider.value]
+                )
+            )
+            source_types = (
+                tuple(value for value in source_types if value in enabled_types) or enabled_types
+            )
             planned["source_types"] = source_types
         if planned.get("query_intent") == "DELIVERY" and re.search(
             r"\b(?:attachments?|attached|adjuntos?|adjuntad[oa]s?|anexos?)\b",
-            planned.get("resolved_question", self._request.question), re.I,
+            planned.get("resolved_question", self._request.question),
+            re.I,
         ):
             # Record the same explicit scope used by Jira attachment retrieval
             # before resolving the request, so the final gate can validate it.
@@ -252,9 +300,7 @@ class PlanningNodesMixin:
         registry = SourcePolicyRegistry.from_categories(
             (*getattr(self._vocabulary, "source_types", ()), *source_types)
         )
-        selected = registry.select(
-            planned.get("query_intent", "DIRECT"), source_types
-        )
+        selected = registry.select(planned.get("query_intent", "DIRECT"), source_types)
         planned["resolved_request"] = resolve_request(
             planned.get("resolved_question", self._request.question),
             intent=planned.get("query_intent", "DIRECT"),
@@ -273,11 +319,13 @@ class PlanningNodesMixin:
         # and never touches identifiers, acronyms or project entities.
         original_question = autocorrect_question(
             self._request.question,
-            vocabulary=(*getattr(self._vocabulary, "entities", ()), *getattr(self._vocabulary, "jira_terms", ())),
+            vocabulary=(
+                *getattr(self._vocabulary, "entities", ()),
+                *getattr(self._vocabulary, "jira_terms", ()),
+            ),
         )
         history = [
-            (message.role, message.content)
-            for message in self._request.conversation_history[-6:]
+            (message.role, message.content) for message in self._request.conversation_history[-6:]
         ]
         language = resolve_conversation_response_language(
             original_question,
@@ -295,18 +343,14 @@ class PlanningNodesMixin:
         )
         if contextual_parent:
             subtopic = original_question.strip().rstrip("?¿!¡.").strip()
-            focused_question = (
-                f"{subtopic} specifically within {contextual_parent}?"
-            )
+            focused_question = f"{subtopic} specifically within {contextual_parent}?"
             query_intent = _source_route_intent(
                 focused_question,
                 self._vocabulary.source_types,
                 dict(self._vocabulary.intent_terms),
             )
             source_types, source_route = _intent_source_scope(query_intent)
-            source_types = _narrow_source_types(
-                source_types, self._vocabulary.source_types
-            )
+            source_types = _narrow_source_types(source_types, self._vocabulary.source_types)
             planned = (
                 focused_question,
                 f"{contextual_parent} {subtopic} relationship steps conditions rules",
@@ -340,13 +384,13 @@ class PlanningNodesMixin:
                 "query_quality": query_quality,
                 "query_quality_reason": quality_reason,
             }
-        code_sources_available = (
-            not self._vocabulary.source_types
-            or "CODE" in {
-                value.upper() for value in self._vocabulary.source_types
-            }
-        )
-        if _code_inventory_requested(question) and code_sources_available:
+        code_sources_available = not self._vocabulary.source_types or "CODE" in {
+            value.upper() for value in self._vocabulary.source_types
+        }
+        if (
+            _code_inventory_requested(question, tuple(self._vocabulary.entities))
+            and code_sources_available
+        ):
             planned = (
                 question,
                 "project source code modules classes functions files tests configuration",
@@ -376,9 +420,9 @@ class PlanningNodesMixin:
                 "query_quality": query_quality,
                 "query_quality_reason": quality_reason,
             }
-        if _single_record_details_requested(
+        if _single_record_details_requested(question) and not is_exhaustive_entity_detail_question(
             question
-        ) and not is_exhaustive_entity_detail_question(question):
+        ):
             subject = _single_record_subject(question)
             canonical_question = _single_record_canonical_question(subject, language)
             search_subject = subject or ("registro" if language == "es" else "record")
@@ -413,6 +457,43 @@ class PlanningNodesMixin:
                 "query_quality": query_quality,
                 "query_quality_reason": quality_reason,
                 "reconstruct_parent_records": True,
+            }
+        if _entity_contract_identity_requested(question):
+            identifier = member_identifiers(question)[0]
+            semantic_name = " ".join(
+                part.casefold()
+                for part in identifier.split("_")
+                if part.casefold() not in {"event"}
+            )
+            planned = (
+                question,
+                f"{identifier} {semantic_name} wire name numeric event id version",
+                f"{identifier} EventType enum registry contract",
+            )[: self._settings.max_query_variants]
+            stage_complete(
+                "plan_queries",
+                self._request.project_id,
+                began,
+                input_count=1,
+                output_count=len(planned),
+                reason_code="STRUCTURED_ENTITY_IDENTITY",
+                language=language,
+                model_provider="deterministic",
+                model_name="structured-entity-identity-planner",
+                model_profile="retrieval",
+                extra={"query_intent": "STRUCTURED_ENTITY", "source_route": "MIXED"},
+            )
+            return {
+                "queries": planned,
+                "language": language,
+                "retrieval_attempt": 1,
+                "query_intent": "STRUCTURED_ENTITY",
+                "rerank_query": f"{identifier} wire name numeric event id version",
+                "source_types": (),
+                "source_route": "MIXED",
+                "resolved_question": question,
+                "query_quality": query_quality,
+                "query_quality_reason": quality_reason,
             }
         if is_exhaustive_entity_detail_question(question):
             identifier = member_identifiers(question)[0]
@@ -534,9 +615,7 @@ class PlanningNodesMixin:
             )
             == "CODE_ASSISTED"
         ):
-            planned = _implementation_flow_queries(question)[
-                : self._settings.max_query_variants
-            ]
+            planned = _implementation_flow_queries(question)[: self._settings.max_query_variants]
             stage_complete(
                 "plan_queries",
                 self._request.project_id,
@@ -600,9 +679,7 @@ class PlanningNodesMixin:
         # conversational wording ("yes, specifically", "tell me more") must not
         # dilute a clear product/entity established by the previous turn.
         carried_subject = (
-            _resolved_conversation_subject(question)
-            if question != original_question
-            else ""
+            _resolved_conversation_subject(question) if question != original_question else ""
         )
         overview_entity = _entity_overview_entity(
             carried_subject, self._vocabulary.entities
@@ -644,9 +721,7 @@ class PlanningNodesMixin:
             project = self._request.project_id
             entity_queries = tuple(
                 f"{entity} application overview features workflows architecture"
-                for entity in self._vocabulary.entities[
-                    : self._settings.max_entity_expansions
-                ]
+                for entity in self._vocabulary.entities[: self._settings.max_entity_expansions]
             )
             planned = (
                 question,
@@ -671,9 +746,7 @@ class PlanningNodesMixin:
                 extra={
                     "query_intent": "PROJECT_OVERVIEW",
                     "entity_vocabulary_size": len(self._vocabulary.entities),
-                    "entity_capability": (
-                        "enabled" if self._vocabulary.entities else "disabled"
-                    ),
+                    "entity_capability": ("enabled" if self._vocabulary.entities else "disabled"),
                 },
             )
             return {
@@ -695,9 +768,7 @@ class PlanningNodesMixin:
             dict(self._vocabulary.intent_terms),
         )
         source_types, source_route = _intent_source_scope(query_intent)
-        source_types = _narrow_source_types(
-            source_types, self._vocabulary.source_types
-        )
+        source_types = _narrow_source_types(source_types, self._vocabulary.source_types)
         queries = [question]
         rerank_queries = [question]
         # A follow-up inherits the previous subject but not the identifiers the
@@ -768,9 +839,7 @@ class PlanningNodesMixin:
             and not defer_english_translation
         ):
             try:
-                planner = self._query_planner_factory(
-                    self._settings, self._request.model_profile
-                )
+                planner = self._query_planner_factory(self._settings, self._request.model_profile)
                 translated = (
                     await planner.translate_to_english(question)
                     if detected_language == "es"
@@ -778,9 +847,7 @@ class PlanningNodesMixin:
                 )
                 usage = _combined_usage(usage, planner.last_usage)
                 if (
-                    _safe_translation_variant(
-                        question, translated, self._vocabulary.entities
-                    )
+                    _safe_translation_variant(question, translated, self._vocabulary.entities)
                     and translated not in queries
                 ):
                     queries.append(translated)
@@ -798,10 +865,7 @@ class PlanningNodesMixin:
         # Retrieval-first avoids an LLM round trip for ordinary direct questions.
         # Spanish translation and true multi-part decomposition justify one bounded
         # planner call because they materially improve recall before generation.
-        needs_planner = (
-            (detected_language == "es" and not translation_used)
-            or expansion_needed
-        )
+        needs_planner = (detected_language == "es" and not translation_used) or expansion_needed
         if needs_planner:
             try:
                 planner = planner or self._query_planner_factory(
@@ -810,10 +874,7 @@ class PlanningNodesMixin:
                 plan = await planner.plan(question)
                 usage = _combined_usage(usage, planner.last_usage)
                 for candidate in (*plan.search_queries, plan.translated_query):
-                    if (
-                        _safe_query_variant(question, candidate)
-                        and candidate not in queries
-                    ):
+                    if _safe_query_variant(question, candidate) and candidate not in queries:
                         queries.append(candidate)
                 if (
                     self._settings.hyde_enabled
@@ -852,7 +913,9 @@ class PlanningNodesMixin:
             reason_code=reason_code,
             language=language,
             model_provider=self._settings.llm_provider,
-            model_name=self._settings.ollama_planner_model if self._settings.llm_provider == "ollama" else self._settings.model_for_profile(self._request.model_profile),
+            model_name=self._settings.ollama_planner_model
+            if self._settings.llm_provider == "ollama"
+            else self._settings.model_for_profile(self._request.model_profile),
             model_profile=self._request.model_profile,
             extra={
                 "query_intent": query_intent,
@@ -878,9 +941,7 @@ class PlanningNodesMixin:
             "translation_slot": translation_slot,
         }
 
-    async def _resolve_conversation_question(
-        self, question: str, language: str
-        ) -> str:
+    async def _resolve_conversation_question(self, question: str, language: str) -> str:
         """Rewrite only ambiguous follow-ups; direct questions incur no model call."""
 
         history = _bounded_history(
@@ -891,9 +952,7 @@ class PlanningNodesMixin:
             self._settings.max_conversation_history_tokens,
         )
         began = started()
-        vocabulary = tuple(
-            getattr(getattr(self, "_vocabulary", None), "entities", ()) or ()
-        )
+        vocabulary = tuple(getattr(getattr(self, "_vocabulary", None), "entities", ()) or ())
         resolution_needed, predicate_reason = _conversation_resolution_decision(
             question, vocabulary or None
         )
@@ -925,7 +984,7 @@ class PlanningNodesMixin:
             and not self._request.conversation_context.active_subject.strip()
         ):
             fragment = question.strip().rstrip("?.!")
-            resolved = (
+            standalone_resolved = (
                 f"¿Cuál es el procedimiento {fragment}?"
                 if language == "es"
                 else f"What is the procedure {fragment}?"
@@ -947,7 +1006,7 @@ class PlanningNodesMixin:
                     "predicate_reason": predicate_reason,
                 },
             )
-            return resolved
+            return standalone_resolved
         # A new explicit subject wins even when the sentence also contains a
         # pronoun (for example, "How does authentication work and where is it used?").
         # When the project publishes a vocabulary, require the extracted subject
@@ -955,10 +1014,12 @@ class PlanningNodesMixin:
         # masquerade as subjects and replace the active conversation topic.
         candidate_subject = _conversation_subject(question)
         explicit_subject = bool(candidate_subject)
+        if predicate_reason == "CORRECTIVE_ATTRIBUTE_FOLLOWUP":
+            explicit_subject = False
         if candidate_subject and vocabulary:
-            explicit_subject = _subject_matches_vocabulary(
-                candidate_subject, vocabulary
-            )
+            explicit_subject = _subject_matches_vocabulary(candidate_subject, vocabulary)
+            if predicate_reason == "CORRECTIVE_ATTRIBUTE_FOLLOWUP":
+                explicit_subject = False
         if explicit_subject and predicate_reason != "CONTEXTUAL_SUBTOPIC":
             stage_complete(
                 "resolve_conversation",
@@ -1002,7 +1063,9 @@ class PlanningNodesMixin:
             )
             return question
         resolved = (
-            f"{question.rstrip()} (previous subject: {active_subject})"
+            _corrective_attribute_rewrite(question, active_subject, language)
+            if active_subject and predicate_reason == "CORRECTIVE_ATTRIBUTE_FOLLOWUP"
+            else f"{question.rstrip()} (previous subject: {active_subject})"
             if active_subject
             else None
             if predicate_reason == "SHORT_VERB_ELLIPSIS"
@@ -1058,14 +1121,15 @@ class PlanningNodesMixin:
 
     async def _recover_query(self, state: RagState) -> RagState:
         began = started()
-        planner = self._query_planner_factory(
-            self._settings, self._request.model_profile
-        )
+        planner = self._query_planner_factory(self._settings, self._request.model_profile)
         query = ""
         reason_code = "RECOVERY_QUERY_REJECTED"
         try:
             candidate = await planner.recover(self._request.question, state["queries"])
-            if _safe_query_variant(self._request.question, candidate) and candidate not in state["queries"]:
+            if (
+                _safe_query_variant(self._request.question, candidate)
+                and candidate not in state["queries"]
+            ):
                 query = candidate
                 reason_code = "RECOVERY_QUERY_CREATED"
         except Exception:
@@ -1074,9 +1138,7 @@ class PlanningNodesMixin:
         # A recovery query may improve wording but may never broaden the source
         # policy selected during request resolution. An empty result is evidence
         # insufficiency inside that scope, not permission to search elsewhere.
-        scoped = tuple(
-            str(source_type).upper() for source_type in state.get("source_types", ())
-        )
+        scoped = tuple(str(source_type).upper() for source_type in state.get("source_types", ()))
         available = tuple(
             str(source_type).upper()
             for source_type in getattr(self._vocabulary, "source_types", ())

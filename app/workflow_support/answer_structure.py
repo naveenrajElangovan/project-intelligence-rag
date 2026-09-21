@@ -151,7 +151,11 @@ def prune_unsupported_claims(answer: str, unsupported_claims: set[str]) -> tuple
     cleaned: list[str] = []
     index = 0
     while index < len(output):
-        if index + 1 < len(output) and _is_pipe_row(output[index]) and _TABLE_SEPARATOR.fullmatch(output[index + 1]):
+        if (
+            index + 1 < len(output)
+            and _is_pipe_row(output[index])
+            and _TABLE_SEPARATOR.fullmatch(output[index + 1])
+        ):
             cursor = index + 2
             while cursor < len(output) and _is_pipe_row(output[cursor]):
                 cursor += 1

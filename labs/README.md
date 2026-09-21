@@ -32,4 +32,5 @@ Expected: document instructions remain delimited untrusted data, control charact
 
 Exercises: add injection text in Spanish; cite a missing source; remove all evidence and inspect the safe route.
 
-Automated coverage: `tests/test_learning_labs.py`, `tests/test_bilingual_workflow.py`, and `tests/test_retrieval.py`.
+Automated coverage: `tests/labs/test_learning_labs.py`,
+`tests/app/test_bilingual_workflow.py`, and `tests/app/test_retrieval.py`.

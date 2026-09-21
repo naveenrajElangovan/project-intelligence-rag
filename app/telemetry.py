@@ -1,10 +1,12 @@
 """Content-free stage telemetry suitable for Loki and OpenTelemetry collection."""
 
 from contextvars import ContextVar
+import hashlib
 import json
 import logging
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from prometheus_client import Counter, Gauge, Histogram
@@ -21,7 +23,7 @@ _STAGES = Counter(
 _STAGE_DURATION = Histogram(
     "pi_rag_stage_duration_seconds",
     "RAG stage duration.",
-    ("stage",),
+    ("stage", "outcome"),
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 60),
 )
 _TOKENS = Counter(
@@ -180,6 +182,78 @@ def request_id() -> str:
     return _REQUEST_ID.get()
 
 
+def ollama_payload_fingerprint(request: object) -> dict[str, Any]:
+    """Describe an Ollama request without logging prompts or evidence bodies."""
+
+    raw = bytes(getattr(request, "content", b"") or b"")
+    payload = json.loads(raw) if raw else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    options = payload.get("options")
+    if not isinstance(options, dict):
+        options = {}
+    messages = payload.get("messages")
+    prompt = payload.get("prompt")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    messages_canonical = json.dumps(
+        messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    sampler_keys = (
+        "mirostat",
+        "mirostat_eta",
+        "mirostat_tau",
+        "num_ctx",
+        "num_gpu",
+        "num_predict",
+        "num_thread",
+        "repeat_last_n",
+        "repeat_penalty",
+        "seed",
+        "temperature",
+        "tfs_z",
+        "top_k",
+        "top_p",
+    )
+    return {
+        "event": "ollama_request_fingerprint",
+        "request_id": request_id(),
+        "payload_sha256": hashlib.sha256(raw).hexdigest(),
+        "canonical_payload_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+        "messages_sha256": hashlib.sha256(messages_canonical.encode()).hexdigest(),
+        "prompt_sha256": hashlib.sha256(str(prompt or "").encode()).hexdigest(),
+        "payload_bytes": len(raw),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "model": str(payload.get("model") or ""),
+        "method": str(getattr(request, "method", "")),
+        "path": str(getattr(getattr(request, "url", None), "path", "")),
+        "stream": bool(payload.get("stream")),
+        "think": str(payload.get("think")),
+        "format_sha256": hashlib.sha256(
+            json.dumps(
+                payload.get("format"),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest(),
+        "options": {key: options[key] for key in sampler_keys if key in options},
+    }
+
+
+def log_ollama_request(request: object) -> None:
+    LOGGER.info(
+        json.dumps(
+            ollama_payload_fingerprint(request),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+async def log_ollama_request_async(request: object) -> None:
+    log_ollama_request(request)
+
+
 def started() -> float:
     return time.perf_counter()
 
@@ -187,10 +261,8 @@ def started() -> float:
 def admission_capacity(capacity: int) -> None:
     """Publish the capacity actually in force.
 
-    `max_inflight_requests` is clamped by `local_max_concurrency` when local
-    inference is on, so the configured value can differ from the enforced one.
-    An operator tuning a setting that silently does nothing is worse than a
-    lower limit, so the effective number is exported.
+    Model and accelerator calls are bounded separately, so this gauge reports
+    only whole-request admission capacity.
     """
 
     _ADMISSION_CAPACITY.set(capacity)
@@ -226,6 +298,11 @@ def request_released() -> None:
     _INFLIGHT_REQUESTS.dec()
 
 
+def _metric_int(value: object) -> int:
+    """Convert scalar telemetry fields while rejecting nested diagnostics."""
+    return int(value) if isinstance(value, (bool, int, float, str)) else 0
+
+
 def stage_complete(
     stage: str,
     project_id: str,
@@ -243,7 +320,7 @@ def stage_complete(
     model_name: str = "none",
     model_profile: str = "none",
     language: str = "und",
-    extra: dict[str, int | float | str] | None = None,
+    extra: Mapping[str, object] | None = None,
 ) -> None:
     duration_seconds = time.perf_counter() - began
     payload: dict[str, Any] = {
@@ -270,7 +347,7 @@ def stage_complete(
         payload.update(extra)
     labels = (stage, reason_code, model_provider, model_profile, language)
     _STAGES.labels(*labels).inc()
-    _STAGE_DURATION.labels(stage).observe(duration_seconds)
+    _STAGE_DURATION.labels(stage, reason_code).observe(duration_seconds)
     _STAGE_ITEMS.labels(stage, "input").observe(max(0, input_count))
     _STAGE_ITEMS.labels(stage, "output").observe(max(0, output_count))
     if extra and stage == "plan_queries":
@@ -285,10 +362,10 @@ def stage_complete(
             ("ISSUE", "issue_candidates"),
             ("ATTACHMENT", "attachment_candidates"),
         ):
-            count = max(0, int(extra.get(field) or 0))
+            count = max(0, _metric_int(extra.get(field)))
             if count:
                 _RETRIEVAL_CANDIDATES.labels(source_type).inc(count)
-        if bool(extra.get("code_required")) and int(extra.get("code_candidates") or 0) == 0:
+        if bool(extra.get("code_required")) and _metric_int(extra.get("code_candidates")) == 0:
             _CODE_REQUIRED_ZERO.labels(str(extra.get("query_intent") or "DIRECT")).inc()
     if extra and stage == "rerank":
         for source_type, field in (
@@ -297,7 +374,7 @@ def stage_complete(
             ("ISSUE", "issue_selected"),
             ("ATTACHMENT", "attachment_selected"),
         ):
-            count = max(0, int(extra.get(field) or 0))
+            count = max(0, _metric_int(extra.get(field)))
             if count:
                 _EVIDENCE_SELECTED.labels(source_type).inc(count)
     if input_tokens:

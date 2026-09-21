@@ -32,7 +32,10 @@ class Settings(BaseSettings):
     chroma_collection: str = "project-intelligence"
     additional_chroma_collections: tuple[str, ...] = ()
     supported_embedding_models: tuple[str, ...] = ("multilingual-e5-large",)
-    supported_schema_versions: tuple[str, ...] = ("4", "3")
+    # The whole application suite uses one vector contract. Multiple accepted
+    # versions hide route drift and make an apparently valid request query an
+    # incompatible corpus.
+    supported_schema_versions: tuple[str, ...] = ("3",)
     llm_provider: str = "ollama"
     model_gateway: Literal["native", "litellm"] = "litellm"
     litellm_fallbacks_enabled: bool = True
@@ -80,6 +83,9 @@ class Settings(BaseSettings):
     accelerator_max_concurrency: int = 1
     warm_local_models_on_startup: bool = True
     local_max_concurrency: int = 1
+    # Refusal reasons are a closed, localized set. Deterministic templates avoid
+    # an extra serialized model turn on the failure path and cannot introduce
+    # unsupported project facts. Keep the model path as an explicit opt-in only.
     generated_refusals_enabled: bool = False
     max_inflight_requests: int = 4
     provider_router_enabled: bool = True
@@ -93,6 +99,9 @@ class Settings(BaseSettings):
     )
     provider_timeout_seconds: float = 20.0
     provider_max_list_items: int = 50
+    atlassian_service_url: str = "http://atlassian:8000"
+    atlassian_service_internal_api_key: str = ""
+    atlassian_live_verification_enabled: bool = False
     admission_capacity_override: int | None = None
     load_shed_wait_seconds: float = 0.05
     openai_api_key: str = ""
@@ -320,8 +329,8 @@ class Settings(BaseSettings):
             raise ValueError("PI_RAG_OPENINFERENCE_SUCCESS_SAMPLE_RATE must be between 0 and 1")
         if not self.supported_embedding_models or not all(self.supported_embedding_models):
             raise ValueError("PI_RAG_SUPPORTED_EMBEDDING_MODELS must not be empty")
-        if not self.supported_schema_versions or not all(self.supported_schema_versions):
-            raise ValueError("PI_RAG_SUPPORTED_SCHEMA_VERSIONS must not be empty")
+        if len(self.supported_schema_versions) != 1 or not self.supported_schema_versions[0]:
+            raise ValueError("PI_RAG_SUPPORTED_SCHEMA_VERSIONS must contain exactly one version")
         if self.ollama_context_tokens < 4_096 or self.ollama_context_tokens > 262_144:
             raise ValueError(
                 "PI_RAG_OLLAMA_CONTEXT_TOKENS must be between 4096 and the model's native 262144"

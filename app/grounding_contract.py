@@ -53,7 +53,9 @@ class ValidationReport(BaseModel):
 
 
 _SOURCE_MARKER = re.compile(r"\[SOURCE (\d+)\]")
-_IDENTIFIER = re.compile(r"(?<![\w])(?=[A-Za-z0-9._:/-]*[A-Za-z])(?=[A-Za-z0-9._:/-]*\d)[A-Za-z0-9]+(?:[._:/-][A-Za-z0-9]+)+(?![\w])")
+_IDENTIFIER = re.compile(
+    r"(?<![\w])(?=[A-Za-z0-9._:/-]*[A-Za-z])(?=[A-Za-z0-9._:/-]*\d)[A-Za-z0-9]+(?:[._:/-][A-Za-z0-9]+)+(?![\w])"
+)
 _INFERENCE = re.compile(r"^\s*(?:[-*]\s*)?Inference\s*\(([^)]+)\)\s*:", re.IGNORECASE)
 
 
@@ -98,19 +100,19 @@ def resolve_request(
             rf"(?<![\w]){re.escape(candidate)}(?![\w])", normalized, re.IGNORECASE
         ):
             canonical = candidate.casefold()
-            entities[canonical] = ResolvedEntity(
-                value=candidate, canonicalId=canonical
-            )
+            entities[canonical] = ResolvedEntity(value=candidate, canonical_id=canonical)
     for candidate in _IDENTIFIER.findall(normalized):
         canonical = candidate.casefold()
         entities.setdefault(
             canonical,
-            ResolvedEntity(type="identifier", value=candidate, canonicalId=canonical),
+            ResolvedEntity(type="identifier", value=candidate, canonical_id=canonical),
         )
     exhaustive = is_inventory_question(normalized)
     exhaustive_fields = is_exhaustive_entity_detail_question(normalized)
     latest = bool(re.search(r"\b(?:latest|current|newest|most recent|actual|reciente)\b", lower))
-    compare = bool(re.search(r"\b(?:compare|comparison|versus|vs\.?|differ|comparar|comparacion)\b", lower))
+    compare = bool(
+        re.search(r"\b(?:compare|comparison|versus|vs\.?|differ|comparar|comparacion)\b", lower)
+    )
     if compare:
         shape = "COMPARISON"
     elif re.search(r"\b(?:schema|fields?|parameters?|columns?|table|tabla)\b", lower):
@@ -120,7 +122,7 @@ def resolve_request(
     else:
         shape = "NARRATIVE"
     return ResolvedRequest(
-        standaloneRequest=normalized,
+        standalone_request=normalized,
         intent=intent or "DIRECT",
         operation="ANSWER",
         referencedEntities=list(entities.values()),
@@ -147,7 +149,10 @@ def evidence_facts(documents: Sequence[Document]) -> list[EvidenceFact]:
     for index, document in enumerate(documents, start=1):
         metadata = document.metadata
         source_id = str(
-            metadata.get("source_id") or metadata.get("reference") or metadata.get("chunk_id") or index
+            metadata.get("source_id")
+            or metadata.get("reference")
+            or metadata.get("chunk_id")
+            or index
         )
         entity_id = str(
             metadata.get("canonical_entity_id")
@@ -166,7 +171,8 @@ def evidence_facts(documents: Sequence[Document]) -> list[EvidenceFact]:
                 factId=f"fact:{digest}",
                 canonicalEntityId=entity_id,
                 fieldPath=str(metadata.get("field_path") or "") or None,
-                sourceSpan=str(metadata.get("source_span") or metadata.get("locator") or "") or None,
+                sourceSpan=str(metadata.get("source_span") or metadata.get("locator") or "")
+                or None,
                 normalizedValue=value.casefold(),
                 sourceId=source_id,
                 sourceCategory=str(metadata.get("source_type") or "DOCUMENT").upper(),
@@ -253,8 +259,7 @@ def validate_output(
     )
     allowed = set(resolved_request.allowed_source_categories)
     scope_ok = not allowed or all(
-        fact.source_category == "DOCUMENT" or fact.source_category in allowed
-        for fact in facts
+        fact.source_category == "DOCUMENT" or fact.source_category in allowed for fact in facts
     )
     # An answer that parses to no material claim asserts nothing, so there is
     # nothing here that could be unsupported. Requiring at least one claim made
@@ -265,39 +270,28 @@ def validate_output(
     claim_support_ok = all(claim.supporting_fact_ids for claim in claims)
     derivations_ok = all(
         claim.claim_type == "DIRECT"
-        or (
-            bool(claim.derivation_rule)
-            and bool(claim.supporting_fact_ids)
-        )
+        or (bool(claim.derivation_rule) and bool(claim.supporting_fact_ids))
         for claim in claims
     )
 
     conflict_candidates: dict[tuple[str, str], list[EvidenceFact]] = {}
     for fact in facts:
         if fact.field_path:
-            conflict_candidates.setdefault(
-                (fact.canonical_entity_id, fact.field_path), []
-            ).append(fact)
+            conflict_candidates.setdefault((fact.canonical_entity_id, fact.field_path), []).append(
+                fact
+            )
     unresolved_conflict = False
     for candidates in conflict_candidates.values():
         highest_authority = max(fact.authority for fact in candidates)
-        authoritative = [
-            fact for fact in candidates if fact.authority == highest_authority
-        ]
+        authoritative = [fact for fact in candidates if fact.authority == highest_authority]
         newest = max(_fact_freshness(fact) for fact in authoritative)
-        current = [
-            fact
-            for fact in authoritative
-            if _fact_freshness(fact) == newest
-        ]
+        current = [fact for fact in authoritative if _fact_freshness(fact) == newest]
         if len({fact.normalized_value for fact in current}) > 1:
             unresolved_conflict = True
             break
 
     expected = tuple(
-        dict.fromkeys(
-            value.strip() for value in expected_identifiers if value.strip()
-        )
+        dict.fromkeys(value.strip() for value in expected_identifiers if value.strip())
     )
     expected_field_names = tuple(
         dict.fromkeys(value.strip() for value in expected_fields if value.strip())
@@ -322,8 +316,7 @@ def validate_output(
         coverage_ok = True
     else:
         coverage_ok = all(
-            _answer_contains_identifier(generated.answer, identifier)
-            for identifier in expected
+            _answer_contains_identifier(generated.answer, identifier) for identifier in expected
         )
     freshness_ok = not resolved_request.completeness.latest or all(
         fact.version or fact.observed_at for fact in facts

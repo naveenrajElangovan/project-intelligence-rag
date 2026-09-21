@@ -18,6 +18,14 @@ from app.workflow_support.language import (
 from app.workflow_support.language import detect_query_language as _detect_query_language
 from app.workflow_support.identifiers import member_identifiers
 
+__all__ = [
+    "autocorrect_question",
+    "correction_count",
+    "is_unclassifiable",
+    "language_name",
+    "resolve_response_language",
+]
+
 
 def detect_query_language(value: str) -> str:
     """Classify a question as 'en', 'es', or 'mixed'.
@@ -72,17 +80,68 @@ def _safe_translation_variant(
 
 _QUERY_LEXICON_EN = frozenset(
     {
-        "a", "about", "all", "an", "and", "answer", "application", "are",
-        "can", "check", "code", "details", "do", "does", "event", "events",
-        "find", "for", "from", "get", "give", "how", "i", "in", "is", "it",
-        "list", "look", "of", "on", "print", "process", "reprint", "show",
-        "status", "the", "this", "to", "what", "where", "which", "with",
+        "a",
+        "about",
+        "all",
+        "an",
+        "and",
+        "answer",
+        "application",
+        "are",
+        "can",
+        "check",
+        "code",
+        "details",
+        "do",
+        "does",
+        "event",
+        "events",
+        "find",
+        "for",
+        "from",
+        "get",
+        "give",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "list",
+        "look",
+        "of",
+        "on",
+        "print",
+        "process",
+        "reprint",
+        "show",
+        "status",
+        "the",
+        "this",
+        "to",
+        "what",
+        "where",
+        "which",
+        "with",
     }
 )
 _QUERY_LEXICON_ES = frozenset(
     {
-        "como", "cual", "de", "detalles", "el", "en", "estado", "eventos",
-        "imprimir", "la", "los", "precio", "que", "revisar", "reviso", "todos",
+        "como",
+        "cual",
+        "de",
+        "detalles",
+        "el",
+        "en",
+        "estado",
+        "eventos",
+        "imprimir",
+        "la",
+        "los",
+        "precio",
+        "que",
+        "revisar",
+        "reviso",
+        "todos",
     }
 )
 
@@ -116,24 +175,21 @@ def _damerau_levenshtein(left: str, right: str) -> int:
     return distance[-1][-1]
 
 
-def corrected_query_variant(
-    value: str, known_entities: tuple[str, ...] = ()
-) -> str:
+def corrected_query_variant(value: str, known_entities: tuple[str, ...] = ()) -> str:
     """Build one conservative spelling variant; never replace recognized entities."""
 
     letter_tokens = re.findall(r"[A-Za-zÀ-ÿ]+", value)
-    uppercase_heavy = bool(letter_tokens) and sum(
-        token.isupper() for token in letter_tokens
-    ) / len(letter_tokens) >= 0.6
+    uppercase_heavy = (
+        bool(letter_tokens)
+        and sum(token.isupper() for token in letter_tokens) / len(letter_tokens) >= 0.6
+    )
     if not uppercase_heavy:
         return ""
     entities = {str(entity).casefold() for entity in known_entities if str(entity).strip()}
     folded_tokens = {token.casefold() for token in letter_tokens}
     english_matches = len(folded_tokens & _QUERY_LEXICON_EN)
     spanish_matches = len(folded_tokens & _QUERY_LEXICON_ES)
-    language_lexicon = (
-        _QUERY_LEXICON_ES if spanish_matches > english_matches else _QUERY_LEXICON_EN
-    )
+    language_lexicon = _QUERY_LEXICON_ES if spanish_matches > english_matches else _QUERY_LEXICON_EN
     lexicon = language_lexicon | entities
     protected_spans = [match.span() for match in re.finditer(r"`[^`]+`|['\"][^'\"]+['\"]", value)]
     changed = False
@@ -164,7 +220,11 @@ def corrected_query_variant(
         if not scored or scored[0][0] > threshold:
             return token
         best_key = scored[0][:2]
-        best = [candidate for distance, length_delta, candidate in scored if (distance, length_delta) == best_key]
+        best = [
+            candidate
+            for distance, length_delta, candidate in scored
+            if (distance, length_delta) == best_key
+        ]
         if len(best) != 1:
             return token
         changed = True
@@ -184,6 +244,12 @@ def retrieval_terminology_variant(value: str) -> str:
         value,
         flags=re.IGNORECASE,
     )
+    normalized = re.sub(
+        r"\b(?:cannot|can't|does not|doesn't)\s+(?:see|find)\b|\bnot\s+detected\b",
+        "does not detect",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     if re.search(
         r"\b(?:priority|priorities|prioritized?|prioridad|prioridades|prioritarios?)\b",
         normalized,
@@ -196,9 +262,7 @@ def retrieval_terminology_variant(value: str) -> str:
     return normalized if normalized.casefold() != value.strip().casefold() else ""
 
 
-def uncertain_entity_token(
-    value: str, known_entities: tuple[str, ...] = ()
-) -> str:
+def uncertain_entity_token(value: str, known_entities: tuple[str, ...] = ()) -> str:
     """Find one identifier-like unknown token close to corpus-owned entities."""
 
     entities = {str(entity).casefold() for entity in known_entities if str(entity).strip()}
@@ -220,9 +284,14 @@ def _multi_part_question(value: str) -> bool:
     if len(_normalized_words(normalized)) < 8:
         return False
     return bool(
-        re.search(r"[;]|\b(?:compare|versus|vs\.?|difference between|diferencia entre)\b", normalized)
+        re.search(
+            r"[;]|\b(?:compare|versus|vs\.?|difference between|diferencia entre)\b", normalized
+        )
         or len(re.findall(r"\b(?:and|also|as well as|y|también)\b", normalized)) >= 2
-        or len(re.findall(r"\b(?:what|how|which|where|when|qué|cómo|cuál|dónde|cuándo)\b", normalized)) >= 2
+        or len(
+            re.findall(r"\b(?:what|how|which|where|when|qué|cómo|cuál|dónde|cuándo)\b", normalized)
+        )
+        >= 2
     )
 
 
@@ -233,8 +302,21 @@ def _query_quality(value: str) -> tuple[str, str]:
     if len(words) < 2:
         return "WEAK", "TOO_SHORT"
     generic = {
-        "why", "what", "how", "when", "where", "tell", "explain", "more",
-        "details", "please", "help", "it", "that", "this", "something",
+        "why",
+        "what",
+        "how",
+        "when",
+        "where",
+        "tell",
+        "explain",
+        "more",
+        "details",
+        "please",
+        "help",
+        "it",
+        "that",
+        "this",
+        "something",
     }
     meaningful = [word for word in words if word not in generic]
     if not meaningful:
@@ -301,7 +383,7 @@ def _add_usage(first: TokenUsage, second: TokenUsage) -> TokenUsage:
 def _dedupe_source_documents(documents: list[Document]) -> list[Document]:
     unique: dict[tuple[str, ...], Document] = {}
     for document in documents:
-        identity = (
+        identity: tuple[str, ...] = (
             str(document.metadata.get("source_type") or "DOCUMENT"),
             str(document.metadata.get("reference") or ""),
             str(document.metadata.get("source_url") or ""),
@@ -504,6 +586,13 @@ def _source_route_intent(
             for term in terms
             if _normalized_words(term)
         )
+
+    # Stable documentation section identifiers share the same broad shape as
+    # Jira keys (UPPERCASE-123). An explicit “section” noun is authoritative
+    # context: route it to indexed documentation/code instead of interpreting
+    # it as a work item and querying Jira.
+    if re.search(r"(?i)\b(?:section|secci[oó]n)\s+[A-Z][A-Z0-9]+-\d+\b", question):
+        return "CODE_ASSISTED"
     if issue_sources_available and re.search(
         r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]+-\d+(?![A-Za-z0-9])", question
     ):
@@ -548,9 +637,7 @@ def _source_route_intent(
         r"differ|differs|difference|architecture|architectural|compara|comparar|"
         r"comparacion|contra|coincide|alineacion|diferencia|arquitectura)\b",
     )
-    if cross_source_signal and (
-        not source_types or {"PAGE", "CODE"} <= source_types
-    ):
+    if cross_source_signal and (not source_types or {"PAGE", "CODE"} <= source_types):
         return "CROSS_SOURCE"
     if matches(
         "IMPLEMENTATION",
@@ -623,18 +710,27 @@ def _source_authority_valid(
         valid = bool(cited_types) and cited_types <= {"PAGE", "CODE"}
         return valid, "PROJECT_AUTHORITY_VERIFIED" if valid else "PROJECT_AUTHORITY_REQUIRED"
     if intent == "DELIVERY":
-        cited = [documents[index - 1] for index in generated.citations
-                 if 1 <= index <= len(documents)]
+        cited = [
+            documents[index - 1] for index in generated.citations if 1 <= index <= len(documents)
+        ]
+
         # Jira attachment evidence has its own source type but remains issue
         # evidence when ingestion recorded the owning issue in the same cloud.
         def issue_attachment(document):
             metadata = document.metadata
             source = str(metadata.get("source_id") or "").split(":")
             parent = str(metadata.get("parent_issue_source_id") or "").split(":")
-            return (metadata.get("provider") == "JIRA" and len(source) == 4
-                    and len(parent) == 4 and source[:2] == parent[:2]
-                    and source[0] == "jira" and source[2] == "attachment"
-                    and parent[2] == "issue" and bool(source[3]) and bool(parent[3]))
+            return (
+                metadata.get("provider") == "JIRA"
+                and len(source) == 4
+                and len(parent) == 4
+                and source[:2] == parent[:2]
+                and source[0] == "jira"
+                and source[2] == "attachment"
+                and parent[2] == "issue"
+                and bool(source[3])
+                and bool(parent[3])
+            )
 
         valid = bool(cited) and all(
             _document_source_type(document) == "ISSUE"
@@ -657,9 +753,7 @@ def _entity_overview_entity(question: str, entities: tuple[str, ...] = ()) -> st
         return ""
     entity = next(iter(matches))
     remaining = [
-        word
-        for word in words
-        if word != entity and word not in _ENTITY_OVERVIEW_FILLER_WORDS
+        word for word in words if word != entity and word not in _ENTITY_OVERVIEW_FILLER_WORDS
     ]
     has_overview_phrase = bool(
         re.search(
@@ -700,8 +794,39 @@ def _feature_inventory_entity(question: str, entities: tuple[str, ...] = ()) -> 
     return next(iter(matches)) if asks_for_features and asks_for_exhaustive_list else ""
 
 
-def _code_inventory_requested(question: str) -> bool:
-    normalized = " ".join(_normalized_words(question))
+def _recognized_code_references(
+    question: str, recognized_entities: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return code identifiers whose internal words must not drive intent."""
+
+    references = list(member_identifiers(question))
+    for entity in recognized_entities:
+        candidate = str(entity).strip()
+        if not candidate or not (
+            "_" in candidate
+            or re.search(r"(?<=[a-z0-9])(?=[A-Z])", candidate)
+            or (candidate.isupper() and len(candidate) > 2)
+        ):
+            continue
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(candidate)}(?![A-Za-z0-9_])",
+            question,
+        ):
+            references.append(candidate)
+    return tuple(dict.fromkeys(references))
+
+
+def _code_inventory_requested(question: str, recognized_entities: tuple[str, ...] = ()) -> bool:
+    request_text = question
+    for identifier in sorted(
+        _recognized_code_references(question, recognized_entities), key=len, reverse=True
+    ):
+        request_text = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])",
+            " ",
+            request_text,
+        )
+    normalized = " ".join(_normalized_words(request_text))
     exhaustive = bool(
         re.search(
             r"\b(?:all|every|complete|full|entire|list|enumerate|todos|todas|"
@@ -749,7 +874,12 @@ def _project_overview_requested(question: str, project_id: str) -> bool:
             lowered,
         )
     )
-    return project_mentioned and overview_phrase and not specific_scope and len(_normalized_words(lowered)) <= 14
+    return (
+        project_mentioned
+        and overview_phrase
+        and not specific_scope
+        and len(_normalized_words(lowered)) <= 14
+    )
 
 
 def _normalized_identifier(value: str) -> str:
@@ -760,9 +890,7 @@ def _low_information_project_document(document: Document) -> bool:
     content = re.sub(r"\s+", " ", document.page_content).strip()
     marked = document.metadata.get("low_information")
     score = document.metadata.get("information_score")
-    return not content or marked is True or (
-        isinstance(score, (int, float)) and float(score) <= 0
-    )
+    return not content or marked is True or (isinstance(score, (int, float)) and float(score) <= 0)
 
 
 def _project_overview_topic(document: Document) -> str:
@@ -826,7 +954,10 @@ def _feature_title_anchor(title: str, entity: str = "") -> tuple[str, ...]:
 def _contains_ordered_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
     if not phrase or len(phrase) > len(words):
         return False
-    return any(words[index : index + len(phrase)] == phrase for index in range(len(words) - len(phrase) + 1))
+    return any(
+        words[index : index + len(phrase)] == phrase
+        for index in range(len(words) - len(phrase) + 1)
+    )
 
 
 def _exact_feature_title_match(question: str, document: Document) -> bool:

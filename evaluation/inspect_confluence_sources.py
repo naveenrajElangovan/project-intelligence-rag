@@ -90,9 +90,7 @@ def main() -> None:
                 count += 1
                 if count >= arguments.limit:
                     break
-    missing = wanted - {
-        str(page.get("title")) for page in pages if isinstance(page, dict)
-    }
+    missing = wanted - {str(page.get("title")) for page in pages if isinstance(page, dict)}
     if missing:
         raise SystemExit(f"Missing requested pages: {sorted(missing)}")
     if matched != len(wanted):

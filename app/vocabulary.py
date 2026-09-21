@@ -60,25 +60,25 @@ class CorpusVocabulary:
 
         vocabularies = tuple(values)
         merged = {
-                field: tuple(
-                    dict.fromkeys(
-                        item
-                        for vocabulary in vocabularies
-                        for item in getattr(vocabulary, field)
-                    )
+            field: tuple(
+                dict.fromkeys(
+                    item for vocabulary in vocabularies for item in getattr(vocabulary, field)
                 )
-                for field in (
-                    "entities",
-                    "doc_categories",
-                    "providers",
-                    "source_types",
-                    "code_extensions",
-                    "languages",
-                    "jira_terms",
-                )
-            }
+            )
+            for field in (
+                "entities",
+                "doc_categories",
+                "providers",
+                "source_types",
+                "code_extensions",
+                "languages",
+                "jira_terms",
+            )
+        }
         intent_names = tuple(
-            dict.fromkeys(name for vocabulary in vocabularies for name, _ in vocabulary.intent_terms)
+            dict.fromkeys(
+                name for vocabulary in vocabularies for name, _ in vocabulary.intent_terms
+            )
         )
         merged["intent_terms"] = tuple(
             (
@@ -111,6 +111,7 @@ def _intent_terms(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
         for intent, terms in sorted(value.items())
         if str(intent).strip() and _normalized_values(terms, casefold=True)
     )
+
 
 def _raw_values(value: Any) -> Iterable[Any]:
     if isinstance(value, str):

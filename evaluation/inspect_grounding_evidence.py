@@ -54,7 +54,9 @@ async def main() -> None:
         required=True,
         help="A sentence the answer would assert. Repeat for several claims.",
     )
-    parser.add_argument("--source-type", action="append", choices=("CODE", "PAGE", "ISSUE"), default=[])
+    parser.add_argument(
+        "--source-type", action="append", choices=("CODE", "PAGE", "ISSUE"), default=[]
+    )
     parser.add_argument("--limit", type=int, default=25)
     arguments = parser.parse_args()
 
@@ -75,9 +77,7 @@ async def main() -> None:
         # Match the production local embedding path exactly.
         embedder=build_embedder(settings),
     )
-    documents = await retriever.ainvoke_scoped(
-        arguments.question, tuple(arguments.source_type)
-    )
+    documents = await retriever.ainvoke_scoped(arguments.question, tuple(arguments.source_type))
     tabular = sum(1 for document in documents if contains_table(document.page_content))
     threshold = settings.grounding_score_threshold
     table_threshold = settings.grounding_table_evidence_score_threshold
@@ -85,7 +85,9 @@ async def main() -> None:
     print(f"question        : {arguments.question}")
     print(f"retrieved       : {len(documents)} chunks, {tabular} containing a table")
     print(f"threshold       : {threshold}")
-    print(f"table threshold : {table_threshold if table_threshold is not None else 'unset (uses the normal threshold)'}")
+    print(
+        f"table threshold : {table_threshold if table_threshold is not None else 'unset (uses the normal threshold)'}"
+    )
     print(f"linearisation   : {'on' if settings.linearize_table_evidence else 'off'}")
     if not documents:
         print("\nNothing was retrieved, so grounding never ran. This is an indexing problem.")
@@ -100,7 +102,9 @@ async def main() -> None:
             [(claim, linearize_tables(sanitize_evidence(d.page_content))) for d in documents],
         )
         ranked = sorted(
-            zip(documents, raw, flat, strict=True), key=lambda row: max(row[1], row[2]), reverse=True
+            zip(documents, raw, flat, strict=True),
+            key=lambda row: max(row[1], row[2]),
+            reverse=True,
         )
         print(f"\n=== claim: {claim}")
         print(f"{'raw':>7} {'linear':>7} {'delta':>7}  table  title")
@@ -112,18 +116,16 @@ async def main() -> None:
             )
         best_raw = max(raw)
         best_flat = max(flat)
-        applied = (
-            table_threshold
-            if table_threshold is not None and tabular
-            else threshold
-        )
+        applied = table_threshold if table_threshold is not None and tabular else threshold
         if best_flat >= applied and best_raw < applied:
             verdict = "linearisation is what this claim was missing"
         elif best_flat >= applied:
             verdict = "supported either way"
         else:
             verdict = "still short of the threshold -- check the evidence, not the threshold"
-        print(f"  best raw {best_raw:.3f} | best linearised {best_flat:.3f} | applied {applied} -> {verdict}")
+        print(
+            f"  best raw {best_raw:.3f} | best linearised {best_flat:.3f} | applied {applied} -> {verdict}"
+        )
 
 
 if __name__ == "__main__":

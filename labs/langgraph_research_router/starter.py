@@ -6,8 +6,6 @@ import asyncio
 import re
 from typing import Literal, TypedDict
 
-from langgraph.graph import END, START, StateGraph
-
 
 Source = Literal["github", "jira", "confluence", "unknown"]
 
@@ -27,9 +25,7 @@ EVIDENCE: dict[Source, tuple[str, ...]] = {
         "Authentication login is implemented in app/security.py by InternalCallerGuard.",
         "The LangGraph workflow is assembled in app/workflow_graph.py.",
     ),
-    "jira": (
-        "Issue PI-42 has status In Progress and is blocked by identity approval.",
-    ),
+    "jira": ("Issue PI-42 has status In Progress and is blocked by identity approval.",),
     "confluence": (
         "The architecture uses a public backend and a private RAG service.",
         "Project requirements require answers to include citations.",
@@ -85,9 +81,7 @@ async def _search_one(source: Source, query: str) -> tuple[str, ...]:
 
     await asyncio.sleep(0)
     query_tokens = _tokens(query)
-    return tuple(
-        item for item in EVIDENCE[source] if query_tokens & _tokens(item)
-    )
+    return tuple(item for item in EVIDENCE[source] if query_tokens & _tokens(item))
 
 
 async def search(state: ResearchState) -> ResearchState:
