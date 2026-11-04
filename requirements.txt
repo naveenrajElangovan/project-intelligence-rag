@@ -3,7 +3,7 @@ httpx==0.28.1
 langchain-core==1.5.5
 langchain-ollama==1.1.0
 langchain-openai==1.5.1
-langgraph==1.2.11
+langgraph==1.2.14
 langchain-litellm==0.6.6
 litellm==1.100.0
 chromadb-client==1.5.2
